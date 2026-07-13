@@ -84,6 +84,25 @@ class Visualizer:
         xs = [p[0] for p in path]
         ys = [p[1] for p in path]
         self.ax.plot(xs, ys, color="red", linewidth=2.0, label="Path")
+        # Draw waypoint markers
+        self.ax.plot(xs, ys, "o", color="red", markersize=5, zorder=5)
+
+    def draw_hop_circles(self, path: list[tuple[float, float]], hop_radius: float):
+        """Draw the reachable ring at each waypoint to visualise hop coverage."""
+        if not path:
+            return
+        for i, (x, y) in enumerate(path):
+            circle = mpatches.Circle(
+                (x, y),
+                radius=hop_radius,
+                fill=False,
+                edgecolor="deepskyblue",
+                linewidth=0.8,
+                linestyle="--",
+                alpha=0.6,
+                label="Hop radius" if i == 0 else None,
+            )
+            self.ax.add_patch(circle)
 
     def draw_start_goal(self, start: tuple[float, float], goal: tuple[float, float]):
         """Draw start and goal markers."""

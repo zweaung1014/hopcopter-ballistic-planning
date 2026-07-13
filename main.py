@@ -48,6 +48,7 @@ def main():
     vis = Visualizer(env_map)
     vis.draw_map()
     if path:
+        vis.draw_hop_circles(path, config.HOP_RADIUS)
         vis.draw_path(path)
     vis.draw_start_goal(config.START, config.GOAL)
     vis.show()

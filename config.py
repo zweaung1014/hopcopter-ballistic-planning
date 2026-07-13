@@ -20,8 +20,8 @@ GOAL_TOLERANCE = 0.1  # meters
 
 # Height-aware planning parameters
 MAX_JUMP_HEIGHT = 0.5  # meters; edges with dz > this are impassable
-ALPHA_UPHILL = 5.0  # cost weight for uphill elevation changes
-ALPHA_DOWNHILL = 2.0  # cost weight for downhill elevation changes (landing)
+ALPHA_UPHILL = 100.0  # cost weight for uphill elevation changes
+ALPHA_DOWNHILL = 0.0  # cost weight for downhill elevation changes (landing)
 
 # Hopping-robot A* parameters
 HOP_RADIUS = 1.0  # meters; the robot hops to points on a circle of this radius
