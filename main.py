@@ -2,7 +2,7 @@
 
 import config
 from map2d5 import Map2D5
-from astar_planner import AStarPlanner
+from hopping_astar_planner import HoppingAStarPlanner
 from visualizer import Visualizer
 
 
@@ -27,10 +27,12 @@ def main():
     env_map.grid[r_min:r_max + 1, c_min:c_max + 1] = 0.2
 
     # Plan path
-    planner = AStarPlanner(
+    planner = HoppingAStarPlanner(
         map_env=env_map,
         start=config.START,
         goal=config.GOAL,
+        hop_radius=config.HOP_RADIUS,
+        n_angles=config.HOP_N_ANGLES,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         alpha_uphill=config.ALPHA_UPHILL,
         alpha_downhill=config.ALPHA_DOWNHILL,
