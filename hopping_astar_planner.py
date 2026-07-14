@@ -17,10 +17,12 @@ class HoppingAStarPlanner:
 
     Every expansion generates candidate landing cells by sampling `n_angles`
     evenly spaced points on a circle of radius `hop_radius` around the current
-    cell. The robot is treated as airborne between takeoff and landing, so
-    obstacles/terrain between start and landing are ignored -- only the
-    landing cell must be a valid, non-obstacle cell whose elevation is within
-    `max_jump_height` of the takeoff cell.
+    cell. A hop is accepted only when:
+      * the landing cell is inside the map and is not marked as an obstacle,
+      * the elevation change |z_land - z_start| is within `max_jump_height`,
+      * every intermediate cell along the hop line has elevation no more than
+        `max_jump_height` above the takeoff (so tall terrain acts as a wall,
+        while short bumps can be flown over and landed on).
 
     A "goal-snap" edge is added whenever the goal lies within `hop_radius` of
     the current cell, so the planner can land exactly on the goal without
@@ -149,12 +151,59 @@ class HoppingAStarPlanner:
         if neighbor_z == Map2D5.OBSTACLE:
             return None
 
-        # Hard jump height constraint
+        # Hard jump height constraint on landing
         dz = neighbor_z - current_z
         if abs(dz) > self.max_jump_height:
             return None
 
+        # Arc-clearance: intermediate terrain taller than what the robot can
+        # clear from takeoff blocks the hop (acts as a wall).
+        if not self._arc_is_clear(current, neighbor, current_z):
+            return None
+
         return self._edge_cost(current, neighbor, dz)
+
+    def _arc_is_clear(
+        self,
+        current: tuple[int, int],
+        neighbor: tuple[int, int],
+        current_z: float,
+    ) -> bool:
+        """Return True if no intermediate cell on the hop line is too tall.
+
+        An intermediate cell blocks the hop when its elevation exceeds
+        `current_z + max_jump_height`. The takeoff and landing cells are
+        excluded (they are validated separately). Samples are taken at half a
+        cell resolution so every cell the straight line passes through is
+        checked at least once. Cells marked as OBSTACLE (z = -1) are treated
+        as flyable (holes rather than walls).
+        """
+        cx, cy = self.map_env.grid_to_world(current[0], current[1])
+        nx, ny = self.map_env.grid_to_world(neighbor[0], neighbor[1])
+
+        hop_len = float(np.hypot(nx - cx, ny - cy))
+        if hop_len == 0.0:
+            return True
+
+        step = self.map_env.resolution * 0.5
+        n_samples = max(2, int(np.ceil(hop_len / step)) + 1)
+        max_clearable = current_z + self.max_jump_height
+        checked: set[tuple[int, int]] = {current, neighbor}
+
+        for i in range(1, n_samples - 1):  # skip endpoints
+            t = i / (n_samples - 1)
+            sx = cx + t * (nx - cx)
+            sy = cy + t * (ny - cy)
+            if not self.map_env.is_within_bounds(sx, sy):
+                continue
+            cell = self.map_env.world_to_grid(sx, sy)
+            if cell in checked:
+                continue
+            checked.add(cell)
+            cell_z = self.map_env.grid[cell[0], cell[1]]
+            if cell_z != Map2D5.OBSTACLE and cell_z > max_clearable:
+                return False
+        return True
 
     def _edge_cost(
         self,
