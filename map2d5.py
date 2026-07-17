@@ -46,6 +46,60 @@ class Map2D5:
         row, col = self.world_to_grid(x, y)
         return self.grid[row, col]
 
+    def get_elevation_bilinear(
+        self,
+        x: float,
+        y: float,
+        obstacle_fill: float | None = None,
+    ) -> float:
+        """Bilinearly interpolate the elevation at continuous world (x, y).
+
+        `grid_to_world(row, col)` places cell centers at `((col+0.5)*res,
+        (row+0.5)*res)`, so the continuous grid coordinate for (x, y) is:
+            cx = x / resolution - 0.5   (column axis)
+            cy = y / resolution - 0.5   (row axis)
+        Neighbour cell indices are clamped to the map, so queries near the
+        border degrade to nearest-edge rather than raising.
+
+        `obstacle_fill` (if given) is substituted for any of the four corner
+        cells whose stored value equals `OBSTACLE` before mixing. This lets
+        the ballistic clearance check treat obstacle cells as tall walls
+        without mutating the underlying grid.
+        """
+        res = self.resolution
+        cx = x / res - 0.5
+        cy = y / res - 0.5
+
+        c0 = int(np.floor(cx))
+        r0 = int(np.floor(cy))
+        c1 = c0 + 1
+        r1 = r0 + 1
+
+        # Clamp to valid grid range (edge samples degrade gracefully).
+        c0_c = max(0, min(c0, self.cols - 1))
+        c1_c = max(0, min(c1, self.cols - 1))
+        r0_c = max(0, min(r0, self.rows - 1))
+        r1_c = max(0, min(r1, self.rows - 1))
+
+        z00 = self.grid[r0_c, c0_c]
+        z10 = self.grid[r0_c, c1_c]
+        z01 = self.grid[r1_c, c0_c]
+        z11 = self.grid[r1_c, c1_c]
+
+        if obstacle_fill is not None:
+            if z00 == self.OBSTACLE: z00 = obstacle_fill
+            if z10 == self.OBSTACLE: z10 = obstacle_fill
+            if z01 == self.OBSTACLE: z01 = obstacle_fill
+            if z11 == self.OBSTACLE: z11 = obstacle_fill
+
+        # Fractional offsets, clamped in case (x, y) fell outside the grid.
+        fx = min(1.0, max(0.0, cx - c0))
+        fy = min(1.0, max(0.0, cy - r0))
+
+        z0 = (1.0 - fx) * z00 + fx * z10  # bottom edge (row r0)
+        z1 = (1.0 - fx) * z01 + fx * z11  # top edge    (row r1)
+        return float((1.0 - fy) * z0 + fy * z1)
+
     def set_obstacle(self, x: float, y: float):
         """Mark the cell at world position (x, y) as an obstacle."""
         row, col = self.world_to_grid(x, y)

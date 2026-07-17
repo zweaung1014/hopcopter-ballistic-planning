@@ -36,6 +36,14 @@ def main():
         max_jump_height=config.MAX_JUMP_HEIGHT,
         alpha_uphill=config.ALPHA_UPHILL,
         alpha_downhill=config.ALPHA_DOWNHILL,
+        g=config.G_ACCEL,
+        V_max=config.V_MAX,
+        robot_radius=config.ROBOT_RADIUS,
+        clearance_margin=config.CLEARANCE_MARGIN,
+        clearance_weight=config.CLEARANCE_WEIGHT,
+        arc_max_step=config.ARC_SAMPLE_MAX_STEP,
+        arc_endpoint_epsilon=config.ARC_ENDPOINT_EPSILON,
+        obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
     )
     path = planner.plan()
 
