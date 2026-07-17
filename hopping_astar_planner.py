@@ -282,6 +282,12 @@ class HoppingAStarPlanner:
         arc_max_step: float = 0.05,
         arc_endpoint_epsilon: float = 0.05,
         obstacle_wall_extra: float = 1.0,
+        # Demo/analysis flag: when True, skip the arc-vs-terrain clearance
+        # rejection AND set the proximity penalty to zero. The Campana Eq. 4
+        # + `v_s <= V_max` feasibility gate still runs (it guards physics,
+        # not clearance). Intended for A/B baselines that isolate what the
+        # clearance term contributes; do NOT use for real planning.
+        disable_clearance: bool = False,
     ):
         self.map_env = map_env
         self.start_world = start
@@ -302,6 +308,7 @@ class HoppingAStarPlanner:
         self.clearance_weight = clearance_weight
         self.arc_max_step = arc_max_step
         self.arc_endpoint_epsilon = arc_endpoint_epsilon
+        self.disable_clearance = disable_clearance
 
         # Height used in place of OBSTACLE sentinels when the arc-clearance
         # check bilinearly samples the terrain. Setting it well above the
@@ -452,13 +459,17 @@ class HoppingAStarPlanner:
             self.arc_max_step,
             self._obstacle_fill,
         )
-        if mc < 0.0:
+        if not self.disable_clearance and mc < 0.0:
             return None  # arc intersects terrain -> untraversable
 
         # (e) Base cost + smooth proximity penalty. Penalty is 0 when
         # clearance is ample and grows linearly as it shrinks toward 0.
+        # When `disable_clearance` is set (A/B baseline), the penalty is
+        # suppressed too so the base cost is what A* minimises.
         base = self._edge_cost(current, neighbor, Z)
-        if mc < self.clearance_margin:
+        if self.disable_clearance:
+            penalty = 0.0
+        elif mc < self.clearance_margin:
             penalty = (
                 self.clearance_weight
                 * (self.clearance_margin - mc)
