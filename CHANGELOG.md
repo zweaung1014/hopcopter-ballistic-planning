@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Variable-radius neighbor generation** in
+  [hopping_astar_planner.py](hopping_astar_planner.py): replaces the
+  fixed-radius ring sampler with a per-direction ray search.
+  - For each of the `n_angles` directions, the planner scans radii from
+    `hop_radius` down to `min_hop_radius` (default `hop_radius / 2`) in
+    steps of `map.resolution`, adding **every** valid (ballistically
+    feasible, clearance-passing) landing cell it finds.
+  - Generating all valid radii per direction — not just the farthest —
+    allows A* to consider shorter landings in the same direction. A
+    full-radius hop may deposit the robot too close to an obstacle for the
+    next arc to clear it, while a shorter hop along the same ray gives
+    sufficient launch distance.
+  - Two deduplication sets (`attempted`, `in_results`) prevent redundant
+    validation calls and duplicate result entries while allowing different
+    directions to scan past a previously-failed cell to shorter radii.
+  - `min_hop_radius` constructor parameter (default `hop_radius / 2`)
+    prevents degenerate sub-cell hops that would make perimeter-walking
+    artificially cheap relative to direct wall-crossing arcs.
+  - Admissibility of the Euclidean heuristic is preserved: shorter hops
+    only add valid candidates with higher-or-equal g-cost per unit
+    distance, so the heuristic never over-estimates.
+
 - `HoppingAStarPlanner` in [hopping_astar_planner.py](hopping_astar_planner.py):
   a new A*-based planner tailored for a hopping robot. Instead of stepping to
   one of 8 adjacent grid cells, the robot hops to points sampled on a circle

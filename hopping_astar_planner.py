@@ -282,6 +282,13 @@ class HoppingAStarPlanner:
         arc_max_step: float = 0.05,
         arc_endpoint_epsilon: float = 0.05,
         obstacle_wall_extra: float = 1.0,
+        # Minimum allowed hop distance for the inward ray-search. When the
+        # full-radius hop along a direction is blocked, the planner scans inward
+        # in steps of `resolution` but stops at this floor. Setting it to a
+        # meaningful fraction of `hop_radius` (default: half) prevents the
+        # planner from degenerating into tiny-step perimeter-walking when the
+        # clearance penalty on large arcs makes many micro-hops look cheaper.
+        min_hop_radius: float | None = None,
         # Demo/analysis flag: when True, skip the arc-vs-terrain clearance
         # rejection AND set the proximity penalty to zero. The Campana Eq. 4
         # + `v_s <= V_max` feasibility gate still runs (it guards physics,
@@ -320,6 +327,9 @@ class HoppingAStarPlanner:
         # Convert start/goal to grid coordinates
         self.start_cell = map_env.world_to_grid(start[0], start[1])
         self.goal_cell = map_env.world_to_grid(goal[0], goal[1])
+
+        # Minimum hop radius for the inward ray-search (see parameter docs above).
+        self._min_hop_radius = hop_radius / 2.0 if min_hop_radius is None else min_hop_radius
 
         # Precompute unit-vector directions for ring sampling
         angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
@@ -368,38 +378,75 @@ class HoppingAStarPlanner:
     ) -> list[tuple[tuple[int, int], float]]:
         """Yield (neighbor_cell, edge_cost) pairs reachable from `current` in one hop.
 
-        Neighbors are grid cells whose centers are ~hop_radius away in xy,
-        found by sampling `n_angles` directions on the ring. A "goal-snap"
-        edge is also added when the goal lies within hop_radius, so the goal
-        can be landed on exactly regardless of angular alignment.
+        For each of the `n_angles` sampled directions, a ray-search scans from
+        `hop_radius` down to `_min_hop_radius` in steps of `resolution`, adding
+        every valid (ballistically feasible, clearance-passing) landing cell it
+        finds. Generating all valid radii per direction — not just the farthest —
+        lets A* consider shorter landings in the same direction: a full-radius hop
+        may succeed but deposit the robot too close to an obstacle for the next
+        hop, while a shorter hop along the same ray gives a better launch distance
+        for the clearance arc.
+
+        A "goal-snap" edge is also added whenever the goal lies within
+        `hop_radius`, so the goal can be reached regardless of angular
+        alignment.
         """
         cx, cy = self.map_env.grid_to_world(current[0], current[1])
         current_z = self.map_env.grid[current[0], current[1]]
 
         results: list[tuple[tuple[int, int], float]] = []
-        seen: set[tuple[int, int]] = {current}
+        # Two sets with distinct roles:
+        #   attempted  — cells whose validity has already been checked; we never
+        #                re-call _validate_and_cost for the same cell twice.
+        #   in_results — cells successfully added to `results`; when hit from a
+        #                new direction we stop scanning inward (already covered).
+        # Keeping them separate is important: a cell that was *attempted and
+        # failed* from one direction should NOT block a different direction from
+        # scanning past it to a shorter-radius landing — only a *successful* cell
+        # should terminate the inward search for another direction.
+        attempted: set[tuple[int, int]] = {current}
+        in_results: set[tuple[int, int]] = set()
 
-        # Ring samples at radius = hop_radius
+        step = self.map_env.resolution  # inward scan step size (one grid cell)
+
+        # For each direction: scan all radii from hop_radius down to min_hop_radius
+        # and add every valid landing cell. Not stopping at the first valid is
+        # crucial: a full-radius hop may succeed but land too close to an obstacle
+        # to allow a clearing arc on the *next* hop, while a shorter hop (still in
+        # the same direction) places the robot at a better launch distance. A* then
+        # picks the optimal combination across all valid landings.
         for dx, dy in self._hop_dirs:
-            tx = cx + self.hop_radius * dx
-            ty = cy + self.hop_radius * dy
+            r = self.hop_radius
+            while r >= self._min_hop_radius - 1e-9:
+                tx = cx + r * dx
+                ty = cy + r * dy
 
-            # Reject candidates outside the map
-            if not self.map_env.is_within_bounds(tx, ty):
-                continue
+                if not self.map_env.is_within_bounds(tx, ty):
+                    r -= step
+                    continue
 
-            neighbor = self.map_env.world_to_grid(tx, ty)
-            if neighbor in seen:
-                continue
-            seen.add(neighbor)
+                neighbor = self.map_env.world_to_grid(tx, ty)
 
-            edge = self._validate_and_cost(current, current_z, neighbor)
-            if edge is not None:
-                results.append((neighbor, edge))
+                if neighbor not in in_results and neighbor not in attempted:
+                    attempted.add(neighbor)
+                    edge = self._validate_and_cost(current, current_z, neighbor)
+                    if edge is not None:
+                        in_results.add(neighbor)
+                        results.append((neighbor, edge))
+                    # Whether valid or not, continue to shorter radii: a shorter
+                    # hop in the same direction lands on a different grid cell and
+                    # may open up a better multi-hop sequence.
 
-        # Goal-snap edge: allow landing exactly on the goal when it's in range
+                r -= step
+
+        # Goal-snap edge: allow landing exactly on the goal when it's in range.
+        # Only attempt if the goal hasn't already been added by the ring search.
         gx, gy = self.map_env.grid_to_world(self.goal_cell[0], self.goal_cell[1])
-        if np.hypot(gx - cx, gy - cy) <= self.hop_radius and self.goal_cell not in seen:
+        if (
+            np.hypot(gx - cx, gy - cy) <= self.hop_radius
+            and self.goal_cell not in in_results
+            and self.goal_cell not in attempted
+        ):
             edge = self._validate_and_cost(current, current_z, self.goal_cell)
             if edge is not None:
                 results.append((self.goal_cell, edge))
