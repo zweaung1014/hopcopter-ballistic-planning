@@ -335,10 +335,21 @@ class HoppingAStarPlanner:
         angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
         self._hop_dirs = [(float(np.cos(a)), float(np.sin(a))) for a in angles]
 
+        # Instrumentation counters, reset at the top of every plan() call.
+        self.n_expansions = 0
+        self.n_edge_checks = 0
+        self.n_edges_accepted = 0
+
     def plan(self) -> list[tuple[float, float]] | None:
         """Run A* and return the path as a list of (x, y) world coords, or None."""
         start = self.start_cell
         goal = self.goal_cell
+
+        # Instrumentation counters (reset per plan() call; see class docstring
+        # users like test/benchmark_tall_stairs.py for how these are consumed).
+        self.n_expansions = 0
+        self.n_edge_checks = 0
+        self.n_edges_accepted = 0
 
         # Priority queue: (f_cost, counter, (row, col))
         open_set = []
@@ -360,6 +371,7 @@ class HoppingAStarPlanner:
             if f > g_cost.get(current, float("inf")) + self._heuristic(current):
                 continue
 
+            self.n_expansions += 1
             for neighbor, edge_cost in self._generate_hop_neighbors(current):
                 tentative_g = g_cost[current] + edge_cost
 
@@ -473,6 +485,7 @@ class HoppingAStarPlanner:
               is 0 when clearance >= clearance_margin and grows linearly up
               to `clearance_weight` at zero clearance.
         """
+        self.n_edge_checks += 1
         neighbor_z = self.map_env.grid[neighbor[0], neighbor[1]]
 
         # (a) Landing must not be on an obstacle.
@@ -524,6 +537,7 @@ class HoppingAStarPlanner:
             )
         else:
             penalty = 0.0
+        self.n_edges_accepted += 1
         return base + penalty
 
     def _edge_cost(
