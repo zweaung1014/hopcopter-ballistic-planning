@@ -25,17 +25,17 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 
 import config
-from hopping_astar_planner import (
-    HoppingAStarPlanner,
-    feasible_alpha_interval,
-    min_clearance,
+from demo_common import (
+    HOP_RADIUS, N_ANGLES, V_MAX,
+    PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
+    make_planner, diagnose_edge, param_caption, save,
 )
+from hopping_astar_planner import HoppingAStarPlanner
 from map2d5 import Map2D5
 from maps.barely_jumpable_wall import (
     build as build_map,
@@ -45,13 +45,11 @@ from visualizer import Visualizer, draw_arc_side_view
 
 
 # ---------------------------------------------------------------------------
-# Scenario knobs
+# Scenario knobs (HOP_RADIUS / N_ANGLES / V_MAX come from demo_common so every
+# figure in the deck quotes the same physics)
 # ---------------------------------------------------------------------------
-START      = (0.5, 2.4)
-GOAL       = (4.5, 2.4)
-HOP_RADIUS = 1.5
-N_ANGLES   = 16
-V_MAX      = 6.0
+START = (0.5, 2.4)
+GOAL  = (4.5, 2.4)
 
 # Height the arc centre must clear: wall top + robot body radius.
 H_CLEAR = WALL_HEIGHT + config.ROBOT_RADIUS   # 0.32 m
@@ -60,53 +58,6 @@ H_CLEAR = WALL_HEIGHT + config.ROBOT_RADIUS   # 0.32 m
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def make_planner(m: Map2D5, disable_clearance: bool) -> HoppingAStarPlanner:
-    return HoppingAStarPlanner(
-        map_env=m,
-        start=START,
-        goal=GOAL,
-        hop_radius=HOP_RADIUS,
-        n_angles=N_ANGLES,
-        max_jump_height=config.MAX_JUMP_HEIGHT,
-        alpha_uphill=config.ALPHA_UPHILL,
-        alpha_downhill=config.ALPHA_DOWNHILL,
-        g=config.G_ACCEL,
-        V_max=V_MAX,
-        robot_radius=config.ROBOT_RADIUS,
-        clearance_margin=config.CLEARANCE_MARGIN,
-        clearance_weight=config.CLEARANCE_WEIGHT,
-        arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        arc_endpoint_epsilon=config.ARC_ENDPOINT_EPSILON,
-        obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
-        disable_clearance=disable_clearance,
-    )
-
-
-def diagnose_edge(
-    ballistic_planner: HoppingAStarPlanner,
-    m: Map2D5,
-    p0: tuple[float, float],
-    p1: tuple[float, float],
-) -> dict:
-    z0 = float(m.get_elevation(*p0))
-    z1 = float(m.get_elevation(*p1))
-    X  = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
-    Z  = z1 - z0
-    iv = feasible_alpha_interval(X, Z, V_MAX, config.G_ACCEL)
-    if iv is None:
-        return {"feasible": False, "X": X, "Z": Z, "alpha_s": None,
-                "mc": -math.inf, "z0": z0, "z1": z1}
-    a  = 0.5 * (iv[0] + iv[1])
-    mc = min_clearance(
-        (p0[0], p0[1], z0), (p1[0], p1[1], z1), a,
-        m, config.G_ACCEL, config.ROBOT_RADIUS,
-        config.ARC_ENDPOINT_EPSILON, config.ARC_SAMPLE_MAX_STEP,
-        ballistic_planner._obstacle_fill,
-    )
-    return {"feasible": True, "X": X, "Z": Z, "alpha_s": a, "mc": mc,
-            "z0": z0, "z1": z1}
-
 
 def distance_to_wall(p: tuple[float, float]) -> float:
     dx = max(WALL_XMIN - p[0], 0.0, p[0] - WALL_XMAX)
@@ -225,8 +176,7 @@ def draw_topdown(
         fontsize=11,
     )
     fig.tight_layout()
-    fig.savefig(save_path, dpi=110)
-    print(f"Saved: {save_path}")
+    save(fig, save_path)
     plt.close(fig)
 
 
@@ -304,46 +254,13 @@ def draw_arc_strip(
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.91))
-    fig.savefig(save_path, dpi=110)
-    print(f"Saved: {save_path}")
+    save(fig, save_path)
     plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
 # Figure 3: focused side view of the wall-crossing hop (baseline vs ballistic)
 # ---------------------------------------------------------------------------
-
-def _add_wall_markings(
-    ax,
-    p0: tuple[float, float],
-    hop_X: float,
-    hop_Z: float,
-) -> None:
-    """Overlay wall-height, clearance-threshold, and wall-span markings."""
-    # Horizontal reference lines
-    ax.axhline(
-        WALL_HEIGHT, color="#e65100", linewidth=1.6, linestyle="--", zorder=5,
-        label=f"Wall top  z = {WALL_HEIGHT:.2f} m",
-    )
-    ax.axhline(
-        H_CLEAR, color="#f57f17", linewidth=1.2, linestyle=":", zorder=5,
-        label=f"H_clear = {H_CLEAR:.2f} m  (wall + robot radius)",
-    )
-
-    # Shade the wall's u-range on this hop's u-axis (east-only projection).
-    # For purely east hops (cos_t = 1) this is exact; for diagonal hops it is
-    # the x-projected shadow, which is the relevant constraint plane.
-    dx_hop = p0[0]   # takeoff x — used to compute u offsets
-    if hop_X > 1e-9:
-        # Approximate horizontal-distance coordinates of wall entry / exit
-        # assuming the hop direction has a positive x component (east or NE).
-        # We project by X / dx_physical which equals 1 / cos_theta.
-        dx_physical = abs(p0[0])  # not needed — easier:
-        # u at which world-x equals WALL_XMIN / WALL_XMAX along this segment:
-        # u = (target_x - p0_x) / cos_theta = (target_x - p0_x) * X / dx_hop
-        # We already have p0 as the raw p0 tuple passed in below; reuse directly.
-    pass  # markings added by caller using the p0 arg
-
 
 def draw_crossing_comparison(
     m: Map2D5,
@@ -470,8 +387,7 @@ def draw_crossing_comparison(
         fontsize=12,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.88))
-    fig.savefig(save_path, dpi=130)
-    print(f"Saved: {save_path}")
+    save(fig, save_path)
     plt.close(fig)
 
 
@@ -482,8 +398,8 @@ def draw_crossing_comparison(
 def main() -> int:
     m = build_map()
 
-    planner_base = make_planner(m, disable_clearance=True)
-    planner_ball = make_planner(m, disable_clearance=False)
+    planner_base = make_planner(m, True, START, GOAL)
+    planner_ball = make_planner(m, False, START, GOAL)
 
     path_base = planner_base.plan()
     path_ball = planner_ball.plan()

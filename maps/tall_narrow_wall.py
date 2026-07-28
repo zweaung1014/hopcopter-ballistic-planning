@@ -6,14 +6,18 @@ Wall dimensions:
   z = 0.15 m      (low enough to arc over from the right takeoff distance,
                    too high for a hop that starts too close to the wall)
 
+Parameters below are the DEMO's values (`test/demo_narrow_wall_showcase.py`,
+which takes them from `test/demo_common.py`), not `config.py`'s — config ships
+`HOP_RADIUS = 1.0` and `V_MAX = 4.5`.
+
 With hop_radius = 1.5 m and the 0.2 m grid resolution, the east ring
 candidate from a node at x ≈ 2.1 enters the wall at u ≈ 0.2 m where the
 arc is only 0.175 m above ground — below the clearance threshold of 0.25 m.
-The 22.5° ring candidate from the same start ends up at x ≈ 1.9 m, which
-enters the wall at u ≈ 0.4 m where the arc is 0.30 m — above the threshold.
-The ballistic planner therefore shifts the intermediate waypoint 0.2 m
-(one grid cell) to the left so the arc peaks over the wall instead of
-clipping it on the way up.
+Backing the takeoff off moves the wall further along the arc's rise, so the
+ballistic planner shifts the intermediate waypoint west until the arc peaks
+over the wall instead of clipping it on the way up.  In the current demo it
+takes off at x = 1.50 m against the baseline's x = 2.10 m — a 0.60 m shift
+(three grid cells).
 
 The wall y-span is chosen so the robot cannot bypass it north or south
 in a single hop (max Δy per hop = 1.5 m puts the nearest off-wall y at

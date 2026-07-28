@@ -1,10 +1,33 @@
 """Tall-stairs robustness demo: ballistic planner climbs to the top platform.
 
-Goal is placed on the 1.8 m top platform.  The robot must ascend three
-0.6 m risers.  At certain takeoff positions the arc would clip a riser face
-(negative clearance); the ballistic planner rejects those candidates and
-adjusts its takeoff position.  The baseline planner (clearance OFF) charges
-through, leaving arcs that intersect the terrain.
+Goal is placed on the 1.2 m top platform.  The robot must ascend three 0.4 m
+risers (see `maps/tall_stairs.py` for the exact column layout).
+
+What this demo does and does not show
+-------------------------------------
+It shows the planner ascending three risers to the goal.  It does NOT show
+either rejection gate firing.  Sweeping all 625 cells at full hop radius with
+HOP_RADIUS=1.5 m and V_MAX=6.0 m/s gives:
+
+    accept 6518 · off-map 3482 · physics 0 · clearance 0
+
+Two separate reasons, both worth knowing before you present this:
+
+* Clearance never fires because `min_clearance` discards any arc sample that has
+  not risen `robot_radius` above BOTH endpoints.  A hop climbing onto a riser
+  rises only ~0.07-0.24 m above its landing, so nearly every interior sample is
+  skipped and the function returns `+inf`.
+* Physics never fires because 0.4 m risers are comfortably inside the leg's
+  budget at these parameters — `feasible_alpha_interval` returns a valid interval
+  for every in-bounds candidate.
+
+So the baseline/ballistic path difference here comes from *cost shaping* — the
+smooth clearance proximity penalty and the uphill elevation penalty — rather than
+from any hop being ruled out.  That is a legitimate result, but state it as such.
+
+For a genuine clearance *rejection* on stairs use `test/demo_stairs_curb.py`,
+where the curbs are local maxima and finite negative `mc` values appear.
+`test/demo_barely_jumpable.py` is the other clearance-driven case.
 
 Figures produced
 ----------------
@@ -25,17 +48,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import numpy as np
 
 import config
-from hopping_astar_planner import (
-    HoppingAStarPlanner,
-    feasible_alpha_interval,
-    min_clearance,
+from demo_common import (
+    HOP_RADIUS, N_ANGLES, V_MAX,
+    PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
+    make_planner, diagnose_edge,
+    enumerate_ring_candidates, find_interesting_cells, gate_counts,
+    path_cells_of, param_caption, save,
 )
+from hopping_astar_planner import HoppingAStarPlanner
 from map2d5 import Map2D5
 from maps.tall_stairs import (
     build as build_map,
@@ -46,13 +70,11 @@ from visualizer import Visualizer, draw_arc_side_view
 
 
 # ---------------------------------------------------------------------------
-# Scenario knobs
+# Scenario knobs (HOP_RADIUS / N_ANGLES / V_MAX come from demo_common so every
+# figure in the deck quotes the same physics)
 # ---------------------------------------------------------------------------
-START      = (0.5, 2.5)
-GOAL       = (4.0, 2.5)   # on top platform (z = 1.2 m)
-HOP_RADIUS = 1.5
-N_ANGLES   = 16
-V_MAX      = 6.0
+START = (0.5, 2.5)
+GOAL  = (4.0, 2.5)   # on top platform (z = 1.2 m)
 
 # Step-height reference lines used in arc plots
 STEP_ZS = [STEP1_Z, STEP2_Z, TOP_Z]
@@ -62,147 +84,9 @@ STEP_ZS = [STEP1_Z, STEP2_Z, TOP_Z]
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_planner(m: Map2D5, disable_clearance: bool) -> HoppingAStarPlanner:
-    return HoppingAStarPlanner(
-        map_env=m,
-        start=START,
-        goal=GOAL,
-        hop_radius=HOP_RADIUS,
-        n_angles=N_ANGLES,
-        max_jump_height=config.MAX_JUMP_HEIGHT,
-        alpha_uphill=config.ALPHA_UPHILL,
-        alpha_downhill=config.ALPHA_DOWNHILL,
-        g=config.G_ACCEL,
-        V_max=V_MAX,
-        robot_radius=config.ROBOT_RADIUS,
-        clearance_margin=config.CLEARANCE_MARGIN,
-        clearance_weight=config.CLEARANCE_WEIGHT,
-        arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        arc_endpoint_epsilon=config.ARC_ENDPOINT_EPSILON,
-        obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
-        disable_clearance=disable_clearance,
-    )
-
-
-def diagnose_edge(
-    planner: HoppingAStarPlanner,
-    m: Map2D5,
-    p0: tuple[float, float],
-    p1: tuple[float, float],
-) -> dict:
-    z0 = float(m.get_elevation(*p0))
-    z1 = float(m.get_elevation(*p1))
-    X  = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
-    Z  = z1 - z0
-    iv = feasible_alpha_interval(X, Z, V_MAX, config.G_ACCEL)
-    if iv is None:
-        return {"feasible": False, "X": X, "Z": Z, "alpha_s": None,
-                "mc": -math.inf, "z0": z0, "z1": z1}
-    a  = 0.5 * (iv[0] + iv[1])
-    mc = min_clearance(
-        (p0[0], p0[1], z0), (p1[0], p1[1], z1), a,
-        m, config.G_ACCEL, config.ROBOT_RADIUS,
-        config.ARC_ENDPOINT_EPSILON, config.ARC_SAMPLE_MAX_STEP,
-        planner._obstacle_fill,
-    )
-    return {"feasible": True, "X": X, "Z": Z, "alpha_s": a, "mc": mc,
-            "z0": z0, "z1": z1}
-
-
-def enumerate_ring_candidates(
-    planner: HoppingAStarPlanner,
-    cell: tuple[int, int],
-) -> list[dict]:
-    """All 16 full-radius ring candidates from `cell`, with accept/reject verdict.
-
-    Scans only the full hop_radius (not inward), matching the original ring
-    visualisation.  Out-of-bounds and physics-infeasible candidates are
-    included so their red arrows appear in the top-down figure.
-    """
-    m   = planner.map_env
-    px, py = m.grid_to_world(*cell)
-    pz  = float(m.grid[cell[0], cell[1]])
-    obs = planner._obstacle_fill
-
-    seen: set = {cell}
-    out: list[dict] = []
-    for dx, dy in planner._hop_dirs:
-        tx = px + planner.hop_radius * dx
-        ty = py + planner.hop_radius * dy
-        if not m.is_within_bounds(tx, ty):
-            out.append({
-                "cell": None, "c_s": (px, py, pz), "c_g": None,
-                "X": None, "Z": None, "r": planner.hop_radius,
-                "alpha_s": None, "mc": None,
-                "accepted": False, "reason": "out of bounds",
-            })
-            continue
-
-        nb = m.world_to_grid(tx, ty)
-        if nb in seen:
-            continue
-        seen.add(nb)
-
-        nx, ny = m.grid_to_world(*nb)
-        nz = float(m.grid[nb[0], nb[1]])
-        X  = math.hypot(nx - px, ny - py)
-        Z  = nz - pz
-        c_s = (px, py, pz)
-        c_g = (nx, ny, nz)
-
-        entry: dict = {
-            "cell": nb, "c_s": c_s, "c_g": c_g,
-            "X": X, "Z": Z, "r": planner.hop_radius,
-            "alpha_s": None, "mc": None,
-            "accepted": False, "reason": "",
-        }
-        if nz == Map2D5.OBSTACLE:
-            entry["reason"] = "OBSTACLE landing"
-            out.append(entry)
-            continue
-        iv = feasible_alpha_interval(X, Z, planner.V_max, planner.g)
-        if iv is None:
-            entry["reason"] = "infeasible (V_max / geometry)"
-            out.append(entry)
-            continue
-        a  = 0.5 * (iv[0] + iv[1])
-        mc = min_clearance(
-            c_s, c_g, a, m, planner.g, planner.robot_radius,
-            planner.arc_endpoint_epsilon, planner.arc_max_step, obs,
-        )
-        entry["alpha_s"] = a
-        entry["mc"]      = mc
-        if mc < 0:
-            entry["reason"] = f"arc clips terrain  mc={mc:+.3f} m"
-        else:
-            entry["accepted"] = True
-            entry["reason"]   = f"clears  mc={mc:+.3f} m"
-        out.append(entry)
-
-    return out
-
-
 def _n_clearance_rejects(cands: list[dict]) -> int:
     """Count candidates rejected specifically due to arc-terrain clearance (mc < 0)."""
     return sum(1 for c in cands if c["mc"] is not None and c["mc"] < 0)
-
-
-def find_interesting_cells(
-    planner: HoppingAStarPlanner,
-    path_cells: list[tuple[int, int]],
-) -> list[tuple[tuple[int, int], list[dict]]]:
-    """Return (cell, candidates) pairs where ≥1 candidate is rejected
-    (any reason: out-of-bounds, infeasible physics, or mc < 0)."""
-    results = []
-    for cell in path_cells[:-1]:   # skip goal (no outgoing hops)
-        cands = enumerate_ring_candidates(planner, cell)
-        if any(not c["accepted"] for c in cands):
-            results.append((cell, cands))
-    return results
-
-
-def path_cells_of(planner: HoppingAStarPlanner, path) -> list[tuple[int, int]]:
-    return [planner.map_env.world_to_grid(x, y) for x, y in path]
 
 
 # ---------------------------------------------------------------------------
@@ -365,14 +249,23 @@ def draw_topdown(
     ax.legend(handles + extra_h, labels + [h.get_label() for h in extra_h],
               loc="upper left", fontsize=7)
 
+    tally = {"accept": 0, "bounds": 0, "obstacle": 0, "physics": 0, "clearance": 0}
+    for _, cands in interesting:
+        for key, val in gate_counts(cands).items():
+            tally[key] += val
+
     ax.set_title(
-        f"tall_stairs: ballistic planner climbs to z={TOP_Z:.1f} m platform\n"
-        f"Baseline's low-mc hops (orange) incur clearance penalty → ballistic chose safer step-by-step route",
-        fontsize=10,
+        f"tall_stairs: ballistic planner climbs to the z={TOP_Z:.1f} m platform\n"
+        f"Ring rejections at these waypoints: clearance {tally['clearance']} · "
+        f"physics {tally['physics']} · off-map {tally['bounds']}  →  neither gate "
+        f"fires on plain risers;\nthe path difference comes from the clearance "
+        f"PENALTY shaping cost, not from hops being ruled out. "
+        f"See demo_stairs_curb.py for a real clearance rejection.\n"
+        f"{param_caption()}",
+        fontsize=TITLE_FS - 3,
     )
     fig.tight_layout()
-    fig.savefig(save_path, dpi=110)
-    print(f"Saved: {save_path}")
+    save(fig, save_path)
     plt.close(fig)
 
 
@@ -412,7 +305,6 @@ def draw_ring_panels(
         rows_data.append((label, cell, cands, chosen_next))
 
     # One sub-block of panels per interesting cell, separated by thin hlines
-    total_panels = sum(len(rd[2]) for rd in rows_data)
     nrows_total  = sum(math.ceil(len(rd[2]) / NCOLS) for rd in rows_data)
     ymax_arc     = TOP_Z + 0.5
 
@@ -425,10 +317,15 @@ def draw_ring_panels(
     panel_row = 0
     for row_label, cell, cands, chosen_next in rows_data:
         nrows_block = math.ceil(len(cands) / NCOLS)
-        # Label the first panel of this block
-        all_axes[panel_row, 0].set_title(row_label, fontsize=8,
-                                         loc="left", pad=3,
-                                         color="#1a237e", fontweight="bold")
+        # Label the first panel of this block. Using a text artist rather than
+        # set_title(loc="left"): draw_arc_side_view sets its own centered title,
+        # and matplotlib draws left- and center-aligned titles at the same
+        # height, so the two would overlap.
+        all_axes[panel_row, 0].text(
+            0.0, 1.34, row_label, transform=all_axes[panel_row, 0].transAxes,
+            fontsize=9, color="#1a237e", fontweight="bold",
+            va="bottom", ha="left",
+        )
 
         for k, cand in enumerate(cands):
             ax = all_axes[panel_row + k // NCOLS, k % NCOLS]
@@ -479,9 +376,8 @@ def draw_ring_panels(
         "Dotted lines = step elevations",
         fontsize=11,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(save_path, dpi=100)
-    print(f"Saved: {save_path}")
+    fig.tight_layout(rect=(0, 0, 1, 0.96), h_pad=3.2)
+    save(fig, save_path, dpi=110)
     plt.close(fig)
 
 
@@ -552,8 +448,7 @@ def draw_arc_strip(
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.91))
-    fig.savefig(save_path, dpi=110)
-    print(f"Saved: {save_path}")
+    save(fig, save_path)
     plt.close(fig)
 
 
@@ -564,8 +459,8 @@ def draw_arc_strip(
 def main() -> int:
     m = build_map()
 
-    planner_base = make_planner(m, disable_clearance=True)
-    planner_ball = make_planner(m, disable_clearance=False)
+    planner_base = make_planner(m, True, START, GOAL)
+    planner_ball = make_planner(m, False, START, GOAL)
 
     path_base = planner_base.plan()
     path_ball = planner_ball.plan()

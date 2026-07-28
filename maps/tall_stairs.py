@@ -12,15 +12,23 @@ must ascend the stairs in the x direction to reach any cell on the top platform.
 
 Physics note (HOP_RADIUS=1.5 m, V_MAX=6.0 m/s)
 ------------------------------------------------
-With 0.4 m risers each hop that tries to skip two or more steps at full radius
-has K > 1 (Campana infeasibility) or goes out of the map in backward
-directions.  The ring visualisation highlights these rejected candidates at
-the most-constrained node (usually the start or a near-step node).
+Neither rejection gate ever fires on this map.  Enumerating the full-radius ring
+at all 625 cells gives: accept 6518, off-map 3482, physics 0, clearance 0.
 
-For steep uphill arcs (large Δz) the planner's min_clearance body-guard
-skips most interior samples (z_arc stays below z_g + robot_radius), so
-these hops produce mc = +∞ rather than mc < 0.  The “readjustment” shown
-here is therefore physics-infeasibility driven, not terrain-clearance driven.
+* Clearance cannot fire: for steep uphill arcs the `min_clearance` body-guard
+  skips almost every interior sample (`z_arc` stays below `z_g + robot_radius`),
+  so these hops return `mc = +inf` rather than `mc < 0`.
+* Physics does not fire either: 0.4 m risers sit well inside the leg's budget at
+  these parameters, so `feasible_alpha_interval` returns a valid interval for
+  every in-bounds candidate.
+
+The path difference between the baseline and ballistic planners on this map is
+therefore produced by *cost shaping* — the smooth clearance proximity penalty
+plus the uphill elevation penalty — not by any candidate being ruled out.
+
+For a stair scenario where the clearance gate genuinely rejects hops, see
+`maps/stairs_with_curb.py`, whose curbs are local maxima that survive the
+body-guard.
 """
 
 import config

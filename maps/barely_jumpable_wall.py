@@ -8,6 +8,10 @@ Wall dimensions
 
 Physics (HOP_RADIUS = 1.5 m, V_MAX = 6.0 m/s, flat terrain, g = 9.81 m/s²)
 ----------------------------------------------------------------------------
+These are the DEMO's parameters (`test/demo_barely_jumpable.py`, sourced from
+`test/demo_common.py`), not `config.py`'s — config ships `HOP_RADIUS = 1.0` and
+`V_MAX = 4.5`, under which the numbers below do not hold.
+
 The midpoint angle for a flat hop is always α_s = 45°.  Due to grid snapping,
 a 1.5 m ring hop in the east direction gives an effective cell-to-cell distance
 X = 1.6 m (both takeoff and landing sit on cell centres).  The arc equation is:
