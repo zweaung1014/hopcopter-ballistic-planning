@@ -167,9 +167,10 @@ def main() -> int:
             p0, p1 = path[hi], path[hi + 1]
             draw_arc_side_view(
                 axb, (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
-                d["alpha_s"], m, config.G_ACCEL, config.ROBOT_RADIUS,
-                planner._obstacle_fill, config.ARC_ENDPOINT_EPSILON,
-                config.ARC_SAMPLE_MAX_STEP,
+                d["alpha_s"], m, config.ROBOT_RADIUS, config.LEG_LENGTH,
+                planner._obstacle_fill, config.ARC_SAMPLE_MAX_STEP,
+                min_clearance_gate=config.MIN_CLEARANCE,
+                n_lateral=config.ARC_LATERAL_SAMPLES,
             )
             axb.set_ylim(-0.1, max(HEIGHTS) + 0.5)
             axb.axhline(h, color="#e65100", linewidth=1.4, linestyle="--",

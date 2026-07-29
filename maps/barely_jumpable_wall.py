@@ -1,49 +1,45 @@
-"""Barely-jumpable wall: a narrow ridge tuned to the ballistic planner's arc apex.
+"""Barely-jumpable wall: a narrow ridge tuned so exactly one takeoff cell clears it.
 
 Wall dimensions
 ---------------
-  x ∈ [2.3, 2.7]  (0.4 m centre-to-centre span — 3 grid cells at resolution 0.2 m)
+  x ∈ [2.3, 2.7]  (0.4 m thick)
   y ∈ [0.8, 4.2]  (3.4 m — spans almost the full map in y)
-  z = 0.22 m
+  z = 1.00 m
 
-Physics (HOP_RADIUS = 1.5 m, V_MAX = 6.0 m/s, flat terrain, g = 9.81 m/s²)
-----------------------------------------------------------------------------
+Painted from world-metre bounds via `Map2D5.paint_region`, so the physical wall
+is the same at any `CELL_RESOLUTION`. The taller sibling of
+`maps/tall_narrow_wall.py` (0.70 m), which leaves a comfortable band of working
+takeoffs; this one leaves a single cell.
+
+Calibration (HOP_RADIUS = 1.5 m, V_MAX = 4.85 m/s, LEG_LENGTH = 0.40 m,
+ROBOT_RADIUS = 0.20 m, MIN_CLEARANCE = 0.15 m)
+-----------------------------------------------------------------------------
 These are the DEMO's parameters (`test/demo_barely_jumpable.py`, sourced from
-`test/demo_common.py`), not `config.py`'s — config ships `HOP_RADIUS = 1.0` and
-`V_MAX = 4.5`, under which the numbers below do not hold.
+`test/demo_common.py`), not `config.py`'s — config ships `HOP_RADIUS = 1.0`.
 
-The midpoint angle for a flat hop is always α_s = 45°.  Due to grid snapping,
-a 1.5 m ring hop in the east direction gives an effective cell-to-cell distance
-X = 1.6 m (both takeoff and landing sit on cell centres).  The arc equation is:
+Clearance of a 1.5 m hop crossing the wall, by takeoff x:
 
-    z(u) = u − 0.625 u²,    apex at u = 0.8 m → z_apex = 0.400 m
+    1.3 → -0.38  REJECT   (wall under the descending limb)
+    1.5 → -0.01  REJECT   (marginal — clips the far face)
+    1.7 → +0.15  accept   ← the only takeoff that works
+    1.9 → +0.12  REJECT   (arc still rising at the near face)
+    2.1 → -0.18  REJECT   (much too close)
 
-The minimum arc height over the wall cells (centres at x = 2.3 and x = 2.7)
-occurs at the entry and exit faces:
+Only the hop from x = 1.7 m clears both wall faces, so the planner has to work
+its way to that cell before attempting the crossing rather than approaching as
+close as it can. The accepted hop reads exactly `+0.15` because the default
+max-margin takeoff angle does not clear and `alpha_for_clearance` escalates to
+the shallowest steeper angle that does — this wall demands a near-maximal leg
+effort, which the demo plots as leg-energy utilisation.
 
-    From takeoff cx = 1.7 m:
-        u_entry = 0.6 m,  z(0.6) = 0.375 m,  clearance = 0.375 − 0.22 − 0.10 = +0.055 m  ✓
-
-Shifting the takeoff by ±0.2 m (one grid cell) moves the wall to u = 0.4 m or
-u = 0.8/1.2 m, where:
-
-    From cx = 1.9 m:  u_entry = 0.4,  z(0.4) = 0.300 m,  clearance = −0.020 m  ✗
-    From cx = 1.5 m:  u_entry = 0.8 (apex),  z(0.8) = 0.400 m,
-                       but u_exit = 1.2,       z(1.2) = 0.300 m,  clearance = −0.020 m  ✗
-
-Only the hop from cx = 1.7 m clears both wall faces.  The planner must
-navigate to x ≈ 1.7 m before attempting the crossing — two grid cells further
-west than the greedy straight-line approach would land (cx ≈ 2.1 m).
-
-Wall y-span prevents bypass in a single 1.5 m hop: the nearest wall edges
-(y = 0.8 m and y = 4.2 m) are 1.6 m and 1.8 m away from the default path
-y = 2.4 m, both beyond a single hop.
+Wall y-span prevents bypass in a single 1.5 m hop: from the default path at
+y = 2.4, the nearest wall edges (y = 0.8 and y = 4.2) are 1.6 m and 1.8 m away.
 """
 
 import config
 from map2d5 import Map2D5
 
-WALL_HEIGHT = 0.22   # m
+WALL_HEIGHT = 1.00   # m (calibrated — see module docstring)
 WALL_XMIN   = 2.3    # m
 WALL_XMAX   = 2.7    # m
 WALL_YMIN   = 0.8    # m
@@ -56,7 +52,9 @@ def build() -> Map2D5:
         size_y=config.MAP_SIZE_Y,
         resolution=config.CELL_RESOLUTION,
     )
-    r_min, c_min = env_map.world_to_grid(WALL_XMIN, WALL_YMIN)
-    r_max, c_max = env_map.world_to_grid(WALL_XMAX, WALL_YMAX)
-    env_map.grid[r_min:r_max + 1, c_min:c_max + 1] = WALL_HEIGHT
+    env_map.paint_region(
+        WALL_HEIGHT,
+        x_min=WALL_XMIN, x_max=WALL_XMAX,
+        y_min=WALL_YMIN, y_max=WALL_YMAX,
+    )
     return env_map

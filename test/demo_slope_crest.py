@@ -1,13 +1,15 @@
 """Slope demo: the ballistic planner climbs a graded ramp and clears a convex crest.
 
-The terrain rises continuously from x=1.6 m to a crest at z=1.05 m, then settles
-onto a summit plateau at z=0.80 m.  Because the crest is a local maximum standing
-0.25 m above the plateau, a hop launched from partway up the ramp straight at the
-plateau cuts the corner and clips the brow.
+The terrain rises continuously from the ramp toe to a crest at z=1.05 m, then
+drops to a far shelf at z=0.20 m.  Because the crest is a local maximum standing
+0.85 m above the shelf, a hop that comes in too flat catches the brow on the
+descending part of its arc.
 
-The baseline planner (clearance OFF) does exactly that — its hop from x=2.5 m to
-x=3.7 m has mc = -0.124 m.  The ballistic planner instead climbs onto the crest
-itself at x=3.3 m and drops onto the plateau from there, clearing everything.
+The baseline planner (clearance and stance OFF) picks a route whose hops the
+ballistic gate rejects; the ballistic planner commits to a longer launch from
+further back on the ramp so its arc peaks over the crest instead.  The exact
+takeoff/landing cells are printed at run time rather than asserted here — they
+move whenever the ramp geometry or `HOP_SCAN_STEP` changes.
 
 This is the one map in the suite whose elevation varies continuously rather than
 in constant-z blocks, so the arcs are checked against a genuinely graded surface.
@@ -54,7 +56,9 @@ START = (0.5, 2.5)
 GOAL  = (4.5, 2.5)   # on the summit plateau (z = 0.80 m)
 
 # Height an arc must reach to pass over the crest with the body clear.
-H_CLEAR = CREST_Z + config.ROBOT_RADIUS   # 1.15 m
+H_CLEAR = CREST_Z + config.ROBOT_RADIUS + config.MIN_CLEARANCE
+# Lowest the CoM may pass over the crest: crest top, plus the body's radius,
+# plus the clearance the gate demands.
 
 
 def terrain_profile(m: Map2D5, y: float, n: int = 400):
@@ -82,7 +86,7 @@ def crest_hop(path: list) -> int | None:
 # Figure 1: top-down A/B overlay
 # ---------------------------------------------------------------------------
 
-def draw_topdown(m, path_base, path_ball, diags_base, save_path):
+def draw_topdown(m, path_base, path_ball, diags_base, n_base_bad, save_path):
     fig, ax = plt.subplots(figsize=(11, 9))
     draw_topdown_base(m, fig, ax)
 
@@ -114,9 +118,10 @@ def draw_topdown(m, path_base, path_ball, diags_base, save_path):
     add_collision_legend(ax)
 
     ax.set_title(
-        f"slope_crest: continuous {RAMP_GRADE:.2f}-grade ramp to a convex crest\n"
-        f"Baseline cuts the corner and clips the brow · "
-        f"ballistic climbs onto the crest (x={CREST_X1:.1f}) first\n"
+        f"slope_crest: continuous {RAMP_GRADE:.2f}-grade ramp to a convex crest "
+        f"standing {CREST_Z - TOP_Z:.2f} m above the far shelf\n"
+        f"Baseline route contains {n_base_bad} hop(s) the ballistic gate rejects; "
+        f"ballistic launches from further back so its arc peaks over the brow\n"
         f"{param_caption()}",
         fontsize=TITLE_FS - 2,
     )
@@ -155,9 +160,10 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
                 p0, p1 = path[i], path[i + 1]
                 draw_arc_side_view(
                     ax, (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
-                    d["alpha_s"], m, config.G_ACCEL, config.ROBOT_RADIUS,
-                    obs_fill, config.ARC_ENDPOINT_EPSILON,
-                    config.ARC_SAMPLE_MAX_STEP,
+                    d["alpha_s"], m, config.ROBOT_RADIUS, config.LEG_LENGTH,
+                    obs_fill, config.ARC_SAMPLE_MAX_STEP,
+                    min_clearance_gate=config.MIN_CLEARANCE,
+                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.1, ymax)
                 ax.axhline(CREST_Z, color="#bf360c", linewidth=1.0,
@@ -176,8 +182,8 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
     fig.suptitle(
         "Per-hop side view — baseline (top) vs ballistic (bottom)\n"
         f"Dotted: crest z={CREST_Z} m · plateau z={TOP_Z} m · "
-        "Red arc = clips terrain (mc<0) · Green = clears · "
-        "Faded arc = samples excluded by the body-guard",
+        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate · "
+        "Green = clears · Dashed = underside of the robot's body",
         fontsize=TITLE_FS - 2,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.90))
@@ -205,7 +211,7 @@ def draw_profile(m, path_base, diags_base, path_ball, diags_ball, save_path):
         ax.axhline(CREST_Z, color="#bf360c", linewidth=1.3, linestyle="--",
                    zorder=4, label=f"Crest z = {CREST_Z:.2f} m")
         ax.axhline(H_CLEAR, color="#f57f17", linewidth=1.1, linestyle=":",
-                   zorder=4, label=f"H_clear = {H_CLEAR:.2f} m (crest + robot radius)")
+                   zorder=4, label=f"H_clear = {H_CLEAR:.2f} m (crest + radius + min_clearance)")
         ax.axvspan(RAMP_X1, CREST_X1, alpha=0.12, color="#ff8f00", zorder=1,
                    label=f"Crest span x=[{RAMP_X1}, {CREST_X1}] m")
 
@@ -219,16 +225,25 @@ def draw_profile(m, path_base, diags_base, path_ball, diags_ball, save_path):
             k = (X * tan_a - Z) / (X * X)          # == g / (2 * xdot^2)
             t = np.linspace(0.0, 1.0, 120)
             u = t * X
-            z_arc = d["z0"] + u * tan_a - k * u * u
+            # The parabola is the CoM trajectory, which starts LEG_LENGTH above
+            # the terrain — not on it. Omitting the offset draws every arc
+            # 0.4 m too low and makes clearing hops look like they clip.
+            z_arc = d["z0"] + config.LEG_LENGTH + u * tan_a - k * u * u
             x_arc = p0[0] + t * (p1[0] - p0[0])
 
-            clips = d["mc"] < 0.0
+            clips = d["mc"] < config.MIN_CLEARANCE
             ax.plot(x_arc, z_arc,
                     color=(C_COLLIDE if clips else "#2e7d32"),
                     linewidth=(3.0 if clips else 2.0),
                     zorder=6,
                     label=None if i else ("Hop arc" if not clips else "Hop arc"))
-            ax.plot([p0[0]], [d["z0"]], "o", color="#37474f", markersize=6, zorder=7)
+            # The leg: foot on the terrain, body centre LEG_LENGTH above it.
+            ax.plot([p0[0], p0[0]], [d["z0"], d["z0"] + config.LEG_LENGTH],
+                    color="#37474f", linewidth=1.0, alpha=0.55, zorder=6.5)
+            ax.plot([p0[0]], [d["z0"] + config.LEG_LENGTH], "o",
+                    color="#37474f", markersize=6, zorder=7)
+            ax.plot([p0[0]], [d["z0"]], "|", color="#37474f",
+                    markersize=7, zorder=7)
             ax.annotate(f"{i}", (p0[0], d["z0"]), xytext=(0, -14),
                         textcoords="offset points", ha="center",
                         fontsize=ANNOT_FS, color="#37474f")
@@ -301,9 +316,9 @@ def main() -> int:
               f"{path_ball[ai+1][0]:.2f}, mc={diags_ball[ai]['mc']:+.4f} m")
 
     print(f"\nGoal elevation reached: {m.get_elevation(*path_ball[-1]):.2f} m "
-          f"(summit plateau z={TOP_Z} m)")
+          f"(far shelf z={TOP_Z} m)")
 
-    draw_topdown(m, path_base, path_ball, diags_base,
+    draw_topdown(m, path_base, path_ball, diags_base, n_base_bad,
                  out_path("slope_crest_topdown.png"))
     draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball,
                    out_path("slope_crest_arcs.png"))

@@ -11,12 +11,7 @@ def build() -> Map2D5:
         resolution=config.CELL_RESOLUTION,
     )
 
-    r_min, c_min = env_map.world_to_grid(2.0, 2.4)
-    r_max, c_max = env_map.world_to_grid(3.0, 3.0)
-    env_map.grid[r_min:r_max + 1, c_min:c_max + 1] = 0.4
-
-    r_min, c_min = env_map.world_to_grid(2.0, 1.8)
-    r_max, c_max = env_map.world_to_grid(3.0, 2.4)
-    env_map.grid[r_min:r_max + 1, c_min:c_max + 1] = 0.2
+    env_map.paint_region(0.4, x_min=2.0, x_max=3.0, y_min=2.4, y_max=3.0)
+    env_map.paint_region(0.2, x_min=2.0, x_max=3.0, y_min=1.8, y_max=2.4)
 
     return env_map

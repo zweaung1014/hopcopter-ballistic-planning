@@ -32,40 +32,51 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 import config
+from demo_common import out_path
 from hopping_astar_planner import (
+    alpha_for_clearance,
     feasible_alpha_interval,
-    min_clearance,
+    terrain_profile,
 )
 from map2d5 import Map2D5
 from visualizer import Visualizer, draw_arc_side_view
 
 
 # --- Demo geometry (tuned to give a mix of ACCEPT and REJECT) ------------ #
-MAP_X = 6.0          # m; map width
+# Spans are sized for the derived V_MAX, whose longest feasible flat hop is
+# V_MAX^2 / g = 2.40 m. The four takeoffs give X = 2.1 / 1.8 / 1.3 / 0.8 m, so
+# the physics gate never fires and every verdict here is genuinely about
+# clearance. Matches test/test_clearance_rejection.py, which asserts the
+# numbers this demo draws.
+MAP_X = 4.0          # m; map width
 MAP_Y = 3.0          # m; map height (narrow, we only need y ~ 1.5 corridor)
-RES = 0.1            # m; cell resolution
-PILLAR_X = 3.0       # m; pillar center x
+RES = config.CELL_RESOLUTION
+PILLAR_X = 2.7       # m; pillar center x
 PILLAR_Y = 1.5       # m; pillar center y
-PILLAR_HALF = 0.15   # m; pillar half-size in x and y (~3 cells wide)
-PILLAR_H = 0.6       # m; pillar height
-GOAL_X = 5.0         # m; landing x is fixed
+PILLAR_HALF = 0.15   # m; pillar half-size in x and y
+PILLAR_H = 0.9       # m; pillar height (calibrated for the leg/body geometry)
+GOAL_X = 3.2         # m; landing x is fixed
 Y_CORRIDOR = 1.5     # m; takeoff/landing y are on this line, z=0
-TAKEOFF_XS = [1.0, 1.7, 2.4, 2.9]  # sweep values, closer -> shorter X
+TAKEOFF_XS = [1.1, 1.4, 1.9, 2.4]  # sweep values, closer -> shorter X
 
-# Robot / physics for the demo (higher V_max so 4 m hops are feasible).
+# Robot / physics for the demo — all from config now that V_MAX is derived
+# from the robot's stated jump height rather than tuned per demo.
 G = config.G_ACCEL
-V_MAX = 7.0          # m/s; overrides config default for the demo
+V_MAX = config.V_MAX
 ROBOT_R = config.ROBOT_RADIUS
-EPS = config.ARC_ENDPOINT_EPSILON
+LEG = config.LEG_LENGTH
+GATE = config.MIN_CLEARANCE
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
 WALL_EXTRA = config.OBSTACLE_WALL_EXTRA
 
 
 def build_map() -> Map2D5:
     m = Map2D5(size_x=MAP_X, size_y=MAP_Y, resolution=RES)
-    r0, c0 = m.world_to_grid(PILLAR_X - PILLAR_HALF, PILLAR_Y - PILLAR_HALF)
-    r1, c1 = m.world_to_grid(PILLAR_X + PILLAR_HALF, PILLAR_Y + PILLAR_HALF)
-    m.grid[r0:r1 + 1, c0:c1 + 1] = PILLAR_H
+    m.paint_region(
+        PILLAR_H,
+        x_min=PILLAR_X - PILLAR_HALF, x_max=PILLAR_X + PILLAR_HALF,
+        y_min=PILLAR_Y - PILLAR_HALF, y_max=PILLAR_Y + PILLAR_HALF,
+    )
     return m
 
 
@@ -107,19 +118,23 @@ def main() -> int:
             n_reject += 1
             continue
         alpha_min, alpha_max = iv
-        alpha_s = 0.5 * (alpha_min + alpha_max)
-
-        mc = min_clearance(
-            c_s, c_g, alpha_s, m, G, ROBOT_R, EPS, MAX_STEP, obs_fill,
+        profile = terrain_profile(
+            c_s, c_g, m, ROBOT_R, LEG, MAX_STEP, obs_fill,
+            config.ARC_LATERAL_SAMPLES,
         )
-        verdict = "ACCEPT" if mc >= 0.0 else "REJECT"
+        # Same rule the planner uses: start at the max-margin angle and only
+        # escalate to a steeper one if the gate demands it.
+        alpha_s, mc = alpha_for_clearance(
+            profile, alpha_min, alpha_max, GATE, config.ALPHA_MARGIN_FRAC,
+        )
+        verdict = "ACCEPT" if mc >= GATE else "REJECT"
         print(
             f"takeoff_x={xs:.2f}  X={X:.2f}  "
             f"alpha=[{math.degrees(alpha_min):.1f}, {math.degrees(alpha_max):.1f}] "
-            f"mid={math.degrees(alpha_s):.1f}°   "
+            f"chosen={math.degrees(alpha_s):.1f}°   "
             f"mc={mc:+.3f} m   {verdict}"
         )
-        if mc >= 0.0:
+        if mc >= GATE:
             n_accept += 1
         else:
             n_reject += 1
@@ -153,8 +168,10 @@ def main() -> int:
 
         # --- side-view panel ---
         draw_arc_side_view(
-            axes_side[i], c_s, c_g, alpha_s, m, G, ROBOT_R,
-            obs_fill, EPS, MAX_STEP,
+            axes_side[i], c_s, c_g, alpha_s, m, ROBOT_R, LEG,
+            obs_fill, MAX_STEP,
+            min_clearance_gate=GATE,
+            n_lateral=config.ARC_LATERAL_SAMPLES,
         )
         # Y range harmonised so panels are comparable.
         axes_side[i].set_ylim(-0.05, max(PILLAR_H + 0.4, 1.2))
@@ -169,9 +186,9 @@ def main() -> int:
     )
     fig.tight_layout(rect=(0, 0, 1, 0.96))
 
-    out_path = os.path.join(os.path.dirname(__file__), "clearance_sweep.png")
-    fig.savefig(out_path, dpi=110)
-    print(f"Saved figure: {out_path}")
+    fig_path = out_path("clearance_sweep.png")
+    fig.savefig(fig_path, dpi=110)
+    print(f"Saved figure: {fig_path}")
 
     if matplotlib.get_backend().lower() != "agg":
         plt.show()

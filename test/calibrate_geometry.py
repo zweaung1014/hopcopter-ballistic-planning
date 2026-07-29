@@ -30,11 +30,15 @@ import numpy as np
 
 import config
 from demo_common import HOP_RADIUS, V_MAX, make_planner
-from hopping_astar_planner import feasible_alpha_interval, min_clearance
+from hopping_astar_planner import (
+    alpha_for_clearance,
+    feasible_alpha_interval,
+    terrain_profile,
+)
 from map2d5 import Map2D5
 
 
-RES = config.CELL_RESOLUTION   # 0.2 m
+RES = config.CELL_RESOLUTION
 PROBE_Y = 2.5                  # centre row for all probes
 
 
@@ -70,15 +74,21 @@ def build_slope(
 
 
 def build_curbed_stairs(curb1: float, curb2: float, curb3: float) -> Map2D5:
-    """`tall_stairs` columns, with a one-cell raised curb at each tread's edge."""
+    """`tall_stairs` geometry, with a raised curb at each tread's leading edge.
+
+    Boundaries are world metres, matching `maps/stairs_with_curb.py`, so the
+    physical staircase is the same at any resolution. (Column slices would tie
+    the curb width to the cell size and silently halve the whole staircase when
+    the grid is refined.)
+    """
     m = Map2D5(size_x=config.MAP_SIZE_X, size_y=config.MAP_SIZE_Y, resolution=RES)
-    m.grid[:, 0:10]  = 0.0
-    m.grid[:, 10]    = curb1
-    m.grid[:, 11:13] = 0.40
-    m.grid[:, 13]    = curb2
-    m.grid[:, 14:16] = 0.80
-    m.grid[:, 16]    = curb3
-    m.grid[:, 17:25] = 1.20
+    m.paint_region(0.0,   x_max=2.0)
+    m.paint_region(curb1, x_min=2.0, x_max=2.2)
+    m.paint_region(0.40,  x_min=2.2, x_max=2.6)
+    m.paint_region(curb2, x_min=2.6, x_max=2.8)
+    m.paint_region(0.80,  x_min=2.8, x_max=3.2)
+    m.paint_region(curb3, x_min=3.2, x_max=3.4)
+    m.paint_region(1.20,  x_min=3.4)
     return m
 
 
@@ -111,16 +121,18 @@ def probe(m: Map2D5, x_takeoff: float, x_landing: float, planner) -> dict:
         res.update(gate="physics", mc=None, alpha_s=None)
         return res
 
-    a = 0.5 * (iv[0] + iv[1])
-    mc = min_clearance(
-        (p0[0], p0[1], z0), (p1[0], p1[1], z1), a,
-        m, planner.g, planner.robot_radius,
-        planner.arc_endpoint_epsilon, planner.arc_max_step,
-        planner._obstacle_fill,
+    profile = terrain_profile(
+        (p0[0], p0[1], z0), (p1[0], p1[1], z1),
+        m, planner.robot_radius, planner.leg_length,
+        planner.arc_max_step, planner._obstacle_fill, planner.n_lateral,
+    )
+    a, mc = alpha_for_clearance(
+        profile, iv[0], iv[1],
+        planner.min_clearance_gate, planner.alpha_margin_frac,
     )
     if math.isinf(mc):
-        gate = "SKIPPED (+inf)" if mc > 0 else "off-map"
-    elif mc < 0:
+        gate = "off-map"
+    elif mc < planner.min_clearance_gate:
         gate = "clearance"
     else:
         gate = "accept"

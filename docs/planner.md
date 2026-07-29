@@ -1,5 +1,13 @@
 # Height-Aware A* Planner
 
+> **Scope note.** This document describes `astar_planner.py`, the 8-connected grid A*
+> that was the original planner. It is retained as a reference implementation and is
+> **not** what `main.py` runs. The active planner is `HoppingAStarPlanner` in
+> `hopping_astar_planner.py`, which models each move as a ballistic hop and replaces the
+> hard `MAX_JUMP_HEIGHT` cutoff described below with a physics feasibility gate, a
+> stance check and an arc-clearance gate. See `CLAUDE.md` for the current design and
+> `CHANGELOG.md` for how it got there.
+
 ## Overview
 
 This planner implements A* (A-Star) with elevation-aware cost computation, designed for a hopping robot navigating a 2.5D terrain map.
@@ -12,7 +20,10 @@ The key insight is that a hopping robot can traverse elevated terrain (unlike a 
 A* is used instead of sampling-based planners (e.g. RRT*) because the terrain is a fully known discrete grid. A* on a grid is:
 - **Guaranteed optimal** — finds the globally best path every time
 - **Deterministic** — same map, same result
-- **Fast** — a 50×50 grid (5m map, 0.1m cells) solves in under 1ms, well within a 1 Hz replanning budget
+- **Fast** — a 50×50 grid (5 m map, 0.1 m cells) solves in under 1 ms, well within a 1 Hz
+  replanning budget. (This figure is for *this* 8-connected planner. The ballistic planner
+  on the same grid takes ~2.5 s, because every edge requires validating a parabola against
+  the terrain rather than reading one neighbouring cell — see `results/*/timings.md`.)
 
 ## Algorithm
 

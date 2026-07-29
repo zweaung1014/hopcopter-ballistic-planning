@@ -7,6 +7,12 @@ statistics plus internal counters (node expansions, edge/clearance checks)
 so the numbers can be checked against the algorithm's expected O(N*A*R*S)
 scaling rather than trusted on wall-clock alone.
 
+Note what the A/B measures. Clearance is a pure feasibility gate — it no longer
+shapes edge cost — so `disable_clearance=True` differs by exactly which
+candidate landings exist, not by how they are priced. The gap between the two
+runs is therefore the cost of *pruning*, and the difference in expansions is
+how much of the search space the gate removes.
+
 Run:
     python test/benchmark_tall_stairs.py
 """
@@ -28,10 +34,12 @@ START = (0.5, 2.5)
 GOAL = (4.0, 2.5)
 HOP_RADIUS = 1.5
 N_ANGLES = 16
-V_MAX = 6.0
+V_MAX = config.V_MAX
 
-N_TRIALS = 30
-N_WARMUP = 3
+# A plan() call is ~2 s at the shipped 0.1 m resolution (it was ~0.3 s at 0.2 m),
+# so the trial count is sized to keep the whole benchmark around a minute.
+N_TRIALS = 5
+N_WARMUP = 1
 
 
 def make_planner(m: Map2D5, disable_clearance: bool) -> HoppingAStarPlanner:
@@ -47,11 +55,14 @@ def make_planner(m: Map2D5, disable_clearance: bool) -> HoppingAStarPlanner:
         g=config.G_ACCEL,
         V_max=V_MAX,
         robot_radius=config.ROBOT_RADIUS,
-        clearance_margin=config.CLEARANCE_MARGIN,
-        clearance_weight=config.CLEARANCE_WEIGHT,
+        leg_length=config.LEG_LENGTH,
+        min_clearance_gate=config.MIN_CLEARANCE,
+        alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        arc_endpoint_epsilon=config.ARC_ENDPOINT_EPSILON,
+        n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
+        hop_fixed_cost=config.HOP_FIXED_COST,
+        hop_scan_step=config.HOP_SCAN_STEP,
         disable_clearance=disable_clearance,
     )
 

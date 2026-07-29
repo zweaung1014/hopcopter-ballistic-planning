@@ -1,4 +1,4 @@
-"""Professor showcase — narrow wall: ballistic planner shifts takeoff left to jump OVER.
+"""Professor showcase — narrow wall: ballistic planner backs the takeoff off the wall.
 
 Unlike the tall-wall demo (where the wall is too wide to arc over and the
 planner goes *around* in y), the narrow wall here cannot be bypassed in y
@@ -35,7 +35,7 @@ import config
 from demo_common import (
     HOP_RADIUS, N_ANGLES, V_MAX,
     PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
-    make_planner, diagnose_edge, param_caption, save,
+    make_planner, diagnose_edge, n_bad_hops, param_caption, save, out_path
 )
 from hopping_astar_planner import HoppingAStarPlanner
 from map2d5 import Map2D5
@@ -96,7 +96,7 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
 
     # Highlight colliding baseline edges
     for i, d in enumerate(diags_base):
-        if d["feasible"] and d["mc"] < 0.0:
+        if d["feasible"] and d["mc"] < config.MIN_CLEARANCE:
             p0 = path_base[i]; p1 = path_base[i + 1]
             ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
                     color="#d50000", linewidth=9.0, alpha=0.65, zorder=6.5,
@@ -153,7 +153,7 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
         f"tall_narrow_wall demo: baseline (clearance off) vs ballistic (clearance on)\n"
         f"wall at x=[{WALL_XMIN},{WALL_XMAX}] h={WALL_HEIGHT} m  |  "
         f"clearance threshold = {H_CLEAR:.2f} m\n"
-        f"ballistic shifts takeoff further LEFT so arc peaks over the wall",
+        f"ballistic backs the takeoff off the wall — its body cannot stand that close",
         fontsize=11,
     )
     fig.tight_layout()
@@ -201,9 +201,10 @@ def draw_arc_strip(
                     ax,
                     (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                     d["alpha_s"], m,
-                    config.G_ACCEL, config.ROBOT_RADIUS, obs_fill,
-                    config.ARC_ENDPOINT_EPSILON,
+                    config.ROBOT_RADIUS, config.LEG_LENGTH, obs_fill,
                     config.ARC_SAMPLE_MAX_STEP,
+                    min_clearance_gate=config.MIN_CLEARANCE,
+                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.05, ymax)
 
@@ -240,7 +241,7 @@ def draw_arc_strip(
     fig.suptitle(
         f"Per-hop side view: baseline (top) vs ballistic (bottom).\n"
         f"Orange dashed = clearance threshold {H_CLEAR:.2f} m.  "
-        f"Red arc = clips wall (mc<0).  Green arc = clears.  "
+        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate.  Green arc = clears.  "
         f"Both judged by the same criterion.",
         fontsize=11,
     )
@@ -276,8 +277,8 @@ def main() -> int:
         for i in range(len(path_ball) - 1)
     ]
 
-    n_base_bad = sum(1 for d in diags_base if not d["feasible"] or d["mc"] < 0.0)
-    n_ball_bad = sum(1 for d in diags_ball if not d["feasible"] or d["mc"] < 0.0)
+    n_base_bad = n_bad_hops(diags_base)
+    n_ball_bad = n_bad_hops(diags_ball)
 
     print("=" * 72)
     print(f"BASELINE   ({len(path_base)} waypoints, {len(path_base)-1} hops)")
@@ -310,9 +311,32 @@ def main() -> int:
         ax_x = path_ball[ball_hi][0]
         shift = bx - ax_x
         if shift > 0.0:
+            # Say *which* gate rejected the baseline's takeoff cell rather than
+            # assuming it was clearance. On this map it is usually stance: the
+            # baseline parks close enough that the robot's body would overlap
+            # the wall while standing, even though its arc clears comfortably.
+            d_base = diagnose_edge(planner_ball, m,
+                                   path_base[base_hi - 1], path_base[base_hi]) \
+                if base_hi > 0 else None
+            cell = m.world_to_grid(bx, path_base[base_hi][1])
+            standable = bool(planner_ball._standable[cell[0], cell[1]])
             print(f"\nBallistic takeoff (x={ax_x:.2f}) is {shift:.2f} m LEFT "
-                  f"of baseline takeoff (x={bx:.2f}) — arc enters wall further "
-                  f"along its rise and clears the threshold.")
+                  f"of baseline takeoff (x={bx:.2f}).")
+            if not standable:
+                print(f"  Reason: the baseline's cell is not STANDABLE — the wall "
+                      f"face is {WALL_XMIN - bx:.2f} m away and the body has "
+                      f"radius {config.ROBOT_RADIUS} m, leaving "
+                      f"{WALL_XMIN - bx - config.ROBOT_RADIUS:+.2f} m, under the "
+                      f"{config.MIN_CLEARANCE} m gate.")
+                if d_base is not None:
+                    print(f"  Note its ARC was fine (mc={d_base['mc']:+.3f} m) — "
+                          f"what fails is the standing pose, not the trajectory.")
+            else:
+                print(f"  Reason: the baseline's crossing arc fails the "
+                      f"{config.MIN_CLEARANCE} m clearance gate.")
+            print("  Caveat: only the nearest standable cell is forced. Among "
+                  "equally-distant standable takeoffs the total cost ties "
+                  "exactly, so the precise landing cell is A*'s tie-break.")
         elif shift < 0.0:
             print(f"\nWARNING: ballistic takeoff (x={ax_x:.2f}) is to the RIGHT "
                   f"of baseline (x={bx:.2f}) — unexpected geometry.")
@@ -323,12 +347,11 @@ def main() -> int:
     if same:
         print("\nWARNING: paths are identical — wall height may need adjusting.")
 
-    out_dir = os.path.dirname(__file__)
     draw_topdown(m, path_base, path_ball, diags_base,
-                 os.path.join(out_dir, "prof_narrow_wall_topdown.png"))
+                 out_path("prof_narrow_wall_topdown.png"))
     draw_arc_strip(m, planner_ball,
                    path_base, diags_base, path_ball, diags_ball,
-                   os.path.join(out_dir, "prof_narrow_wall_arcs.png"))
+                   out_path("prof_narrow_wall_arcs.png"))
 
     if matplotlib.get_backend().lower() != "agg":
         plt.show()

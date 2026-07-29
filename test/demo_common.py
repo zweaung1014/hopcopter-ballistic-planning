@@ -1,15 +1,18 @@
 """Shared scaffolding for the `test/demo_*.py` presentation scripts.
 
 Every demo builds a scenario, runs the ballistic planner against a baseline with
-`disable_clearance=True`, and saves annotated PNGs into `test/`.  The planner
-construction, per-edge diagnosis and ring-candidate enumeration were previously
-copy-pasted byte-identically across five demos; they live here instead.
+`disable_clearance=True`, and saves annotated PNGs via `out_path()` (see there
+for where they land).  The planner construction, per-edge diagnosis and
+ring-candidate enumeration were previously copy-pasted byte-identically across
+five demos; they live here instead.
 
-The scenario constants below are the *deck-wide* physics parameters.  They
-deliberately override `config.HOP_RADIUS` (1.0) and `config.V_MAX` (4.5): a
-1.5 m hop needs `V_max > sqrt(g * 1.5) = 3.84 m/s` with margin, and the whole
-demo suite must quote one set of numbers or the "one planner, many behaviours"
-story falls apart.  Print them on every figure via `param_caption()`.
+The scenario constants below are the *deck-wide* physics parameters.  `HOP_RADIUS`
+deliberately overrides `config.HOP_RADIUS` (1.0) because the deck's scenarios are
+laid out for a 1.5 m hop, and the whole suite must quote one set of numbers or the
+"one planner, many behaviours" story falls apart.  Everything else — crucially
+`V_MAX` — comes from `config.py`, since the robot's capability is now derived
+from `MAX_APEX_HEIGHT` rather than tuned per demo.  Print them on every figure
+via `param_caption()`.
 """
 
 import math
@@ -24,8 +27,10 @@ import matplotlib.pyplot as plt
 import config
 from hopping_astar_planner import (
     HoppingAStarPlanner,
+    alpha_for_clearance,
     feasible_alpha_interval,
     min_clearance,
+    terrain_profile,
 )
 from map2d5 import Map2D5
 from visualizer import Visualizer
@@ -36,7 +41,7 @@ from visualizer import Visualizer
 # ---------------------------------------------------------------------------
 HOP_RADIUS = 1.5
 N_ANGLES   = 16
-V_MAX      = 6.0
+V_MAX      = config.V_MAX   # derived from MAX_APEX_HEIGHT; 4.85 m/s
 
 # Figure styling, sized for projection rather than for reading on a laptop.
 PRESENTATION_DPI = 140
@@ -48,20 +53,26 @@ ANNOT_FS = 8
 C_BASE    = "#e65100"   # baseline path (clearance OFF)
 C_BALL    = "#00695c"   # ballistic path (clearance ON)
 C_COLLIDE = "#d50000"   # baseline hop that clips terrain
-C_LOWMARG = "#ff6f00"   # hop below clearance_margin (penalised, not rejected)
+C_LOWMARG = "#ff6f00"   # accepted, but within TIGHT_BAND of the clearance gate
 C_ACCEPT  = "#66bb6a"   # accepted ring candidate
 C_REJECT  = "#c62828"   # rejected ring candidate
 C_CHOSEN  = "#1b5e20"   # the candidate A* actually took
 C_ANNOT   = "#0277bd"   # measurement annotations (Δz arrows etc.)
 
+# How close to `MIN_CLEARANCE` an accepted hop has to be before it is worth
+# flagging as tight.  Purely a presentation threshold — the planner itself sees
+# a hard accept/reject boundary with nothing graded about it.
+TIGHT_BAND = 0.05
+
 
 def param_caption() -> str:
     """One-line physics summary to stamp on every figure."""
     return (
-        f"hop_radius={HOP_RADIUS} m · V_max={V_MAX} m/s · "
+        f"hop_radius={HOP_RADIUS} m · V_max={V_MAX:.2f} m/s "
+        f"(apex {config.MAX_APEX_HEIGHT} m) · leg={config.LEG_LENGTH} m · "
         f"robot_radius={config.ROBOT_RADIUS} m · "
-        f"α_uphill={config.ALPHA_UPHILL} · α_downhill={config.ALPHA_DOWNHILL} · "
-        f"clearance_margin={config.CLEARANCE_MARGIN} m"
+        f"min_clearance={config.MIN_CLEARANCE} m · res={config.CELL_RESOLUTION} m · "
+        f"α_uphill={config.ALPHA_UPHILL} · α_downhill={config.ALPHA_DOWNHILL}"
     )
 
 
@@ -97,11 +108,14 @@ def make_planner(
         g=config.G_ACCEL,
         V_max=V_max,
         robot_radius=config.ROBOT_RADIUS,
-        clearance_margin=config.CLEARANCE_MARGIN,
-        clearance_weight=config.CLEARANCE_WEIGHT,
+        leg_length=config.LEG_LENGTH,
+        min_clearance_gate=config.MIN_CLEARANCE,
+        alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        arc_endpoint_epsilon=config.ARC_ENDPOINT_EPSILON,
+        n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
+        hop_fixed_cost=config.HOP_FIXED_COST,
+        hop_scan_step=config.HOP_SCAN_STEP,
         disable_clearance=disable_clearance,
     )
     kwargs.update(overrides)
@@ -125,18 +139,34 @@ def diagnose_edge(
     z1 = float(m.get_elevation(*p1))
     X  = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
     Z  = z1 - z0
+    # Can the robot's body actually rest at the landing cell? A hop can be a
+    # perfectly good parabola and still be invalid because the robot would be
+    # standing inside a wall when it got there — the baseline planner skips
+    # this check, so it is exactly where baseline paths tend to go wrong.
+    landing = m.world_to_grid(p1[0], p1[1])
+    standable = bool(planner._standable[landing[0], landing[1]])
     iv = feasible_alpha_interval(X, Z, planner.V_max, planner.g)
     if iv is None:
-        return {"feasible": False, "X": X, "Z": Z, "alpha_s": None,
+        return {"feasible": False, "standable": standable,
+                "X": X, "Z": Z, "alpha_s": None,
                 "mc": -math.inf, "z0": z0, "z1": z1}
-    a  = 0.5 * (iv[0] + iv[1])
-    mc = min_clearance(
-        (p0[0], p0[1], z0), (p1[0], p1[1], z1), a,
-        m, planner.g, planner.robot_radius,
-        planner.arc_endpoint_epsilon, planner.arc_max_step,
-        planner._obstacle_fill,
+    profile = terrain_profile(
+        (p0[0], p0[1], z0), (p1[0], p1[1], z1),
+        m, planner.robot_radius, planner.leg_length,
+        planner.arc_max_step, planner._obstacle_fill, planner.n_lateral,
     )
-    return {"feasible": True, "X": X, "Z": Z, "alpha_s": a, "mc": mc,
+    if profile is None:
+        return {"feasible": False, "standable": standable,
+                "X": X, "Z": Z, "alpha_s": None,
+                "mc": -math.inf, "z0": z0, "z1": z1}
+    # Follows the planner's own angle rule, escalation included, so the
+    # reported alpha is the one the planner would actually have flown.
+    a, mc = alpha_for_clearance(
+        profile, iv[0], iv[1],
+        planner.min_clearance_gate, planner.alpha_margin_frac,
+    )
+    return {"feasible": True, "standable": standable,
+            "X": X, "Z": Z, "alpha_s": a, "mc": mc,
             "z0": z0, "z1": z1}
 
 
@@ -146,9 +176,15 @@ def diagnose_path(planner: HoppingAStarPlanner, m: Map2D5, path: list) -> list[d
             for i in range(len(path) - 1)]
 
 
-def n_bad_hops(diags: list[dict]) -> int:
-    """Hops that are infeasible or clip the terrain."""
-    return sum(1 for d in diags if not d["feasible"] or d["mc"] < 0.0)
+def n_bad_hops(diags: list[dict], gate: float = config.MIN_CLEARANCE) -> int:
+    """Hops the ballistic planner would refuse, for any reason.
+
+    Three ways to be refused: no takeoff angle within the leg's budget, no
+    angle that keeps the arc clear of the terrain, or a landing cell where the
+    body cannot rest without overlapping terrain.
+    """
+    return sum(1 for d in diags
+               if not d["feasible"] or d["mc"] < gate or not d.get("standable", True))
 
 
 # ---------------------------------------------------------------------------
@@ -161,16 +197,20 @@ def arc_z_at(
     X: float,
     alpha_s: float,
     u: float,
-    g: float,
+    g: float = config.G_ACCEL,
+    leg_length: float = config.LEG_LENGTH,
 ) -> float:
-    """Height of the parabola (Campana Eq. 2) at horizontal distance `u`.
+    """Height of the CoM parabola (Campana Eq. 2) at horizontal distance `u`.
 
     `X`/`Z` are the hop's horizontal span and rise, matching `diagnose_edge`.
+    `c_s[2]` is the *terrain* height at takeoff; the arc runs `leg_length`
+    above it, so this returns a CoM height, not a ground clearance.  `g` is
+    accepted for call-site compatibility but is not needed by the closed form.
     """
     tan_a = math.tan(alpha_s)
     # Campana Eq. 4 rearranged: g*X^2 / (2*xdot^2) == X*tan(alpha) - Z
     k = (X * tan_a - Z) / (X * X)
-    return c_s[2] + u * tan_a - k * u * u
+    return c_s[2] + leg_length + u * tan_a - k * u * u
 
 
 def u_of_x(p0: tuple[float, float], p1: tuple[float, float], target_x: float) -> float | None:
@@ -201,10 +241,11 @@ def enumerate_ring_candidates(
     kept so they show up as rejections.
 
     Each entry carries a `gate` field naming *which* check rejected it —
-    `"bounds"`, `"obstacle"`, `"physics"`, `"clearance"`, or `""` when accepted.
-    Distinguishing physics from clearance matters: on steep uphill hops the
-    body-guard in `min_clearance` skips nearly every interior sample and returns
-    `+inf`, so a demo that claims "clearance rejected this" must actually check.
+    `"bounds"`, `"obstacle"`, `"stance"`, `"physics"`, `"clearance"`, or `""`
+    when accepted.  Distinguishing them matters: a demo that claims "clearance
+    rejected this" must actually check, since a candidate can equally well die
+    on physics (no takeoff angle within the leg's budget) or on stance (the body
+    cannot rest at the landing cell without overlapping terrain).
     """
     m = planner.map_env
     px, py = m.grid_to_world(*cell)
@@ -249,6 +290,12 @@ def enumerate_ring_candidates(
             out.append(entry)
             continue
 
+        if not planner._standable[nb[0], nb[1]]:
+            entry["gate"] = "stance"
+            entry["reason"] = "body cannot rest here"
+            out.append(entry)
+            continue
+
         iv = feasible_alpha_interval(X, Z, planner.V_max, planner.g)
         if iv is None:
             entry["gate"] = "physics"
@@ -256,14 +303,17 @@ def enumerate_ring_candidates(
             out.append(entry)
             continue
 
-        a = 0.5 * (iv[0] + iv[1])
-        mc = min_clearance(
-            c_s, c_g, a, m, planner.g, planner.robot_radius,
-            planner.arc_endpoint_epsilon, planner.arc_max_step, obs,
+        profile = terrain_profile(
+            c_s, c_g, m, planner.robot_radius, planner.leg_length,
+            planner.arc_max_step, obs, planner.n_lateral,
+        )
+        gate = planner.min_clearance_gate
+        a, mc = alpha_for_clearance(
+            profile, iv[0], iv[1], gate, planner.alpha_margin_frac,
         )
         entry["alpha_s"] = a
         entry["mc"] = mc
-        if mc < 0:
+        if mc < gate:
             entry["gate"] = "clearance"
             entry["reason"] = f"arc clips terrain  mc={mc:+.3f} m"
         else:
@@ -276,7 +326,8 @@ def enumerate_ring_candidates(
 
 def gate_counts(cands: list[dict]) -> dict[str, int]:
     """Tally accepted candidates and rejections by which gate stopped them."""
-    tally = {"accept": 0, "bounds": 0, "obstacle": 0, "physics": 0, "clearance": 0}
+    tally = {"accept": 0, "bounds": 0, "obstacle": 0, "stance": 0,
+             "physics": 0, "clearance": 0}
     for c in cands:
         tally["accept" if c["accepted"] else c["gate"]] += 1
     return tally
@@ -285,12 +336,23 @@ def gate_counts(cands: list[dict]) -> dict[str, int]:
 def find_interesting_cells(
     planner: HoppingAStarPlanner,
     path_cells: list[tuple[int, int]],
+    gate: str | None = None,
 ) -> list[tuple[tuple[int, int], list[dict]]]:
-    """(cell, candidates) for each path node with at least one rejected candidate."""
+    """(cell, candidates) for each path node with at least one rejected candidate.
+
+    Pass `gate` (e.g. `"clearance"`) to keep only nodes where that *specific*
+    check did the rejecting.  A demo whose whole point is the clearance gate
+    should ask for clearance rejections rather than settling for whichever
+    node happens to have an off-map candidate.
+    """
     results = []
     for cell in path_cells[:-1]:   # goal has no outgoing hops
         cands = enumerate_ring_candidates(planner, cell)
-        if any(not c["accepted"] for c in cands):
+        if gate is None:
+            hit = any(not c["accepted"] for c in cands)
+        else:
+            hit = any(c["gate"] == gate for c in cands)
+        if hit:
             results.append((cell, cands))
     return results
 
@@ -394,7 +456,7 @@ def draw_ab_paths(
     ax.plot(xs_b, ys_b, "x", color=C_BASE, markersize=10, zorder=7)
 
     for i, d in enumerate(diags_base):
-        if d["feasible"] and d["mc"] < 0.0:
+        if d["feasible"] and d["mc"] < config.MIN_CLEARANCE:
             p0, p1 = path_base[i], path_base[i + 1]
             ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
                     color=C_COLLIDE, linewidth=9.0, alpha=0.65, zorder=6.5,
@@ -421,7 +483,7 @@ def add_collision_legend(ax, extra: list | None = None) -> None:
     """Append the shared collision patch (and any extras) to the axis legend."""
     handles, labels = ax.get_legend_handles_labels()
     patches = [mpatches.Patch(color=C_COLLIDE, alpha=0.65,
-                              label="baseline hop clips terrain (mc < 0)")]
+                              label="baseline hop fails the clearance gate")]
     if extra:
         patches.extend(extra)
     ax.legend(handles + patches,
@@ -430,13 +492,33 @@ def add_collision_legend(ax, extra: list | None = None) -> None:
 
 
 def save(fig, save_path: str, dpi: int = PRESENTATION_DPI) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     fig.savefig(save_path, dpi=dpi)
     print(f"Saved: {save_path}")
 
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_OUT_DIR = os.path.join("results", "after_LS_recs")
+
+
+def out_dir() -> str:
+    """Directory demo artefacts are written to, created if missing.
+
+    Defaults to `results/after_LS_recs/` so a plain `python test/demo_*.py`
+    lands in the current results set.  Override with `$PLANNER_OUT_DIR`;
+    relative overrides resolve against the repo root, not the working
+    directory, because the demos are documented as runnable from anywhere.
+    """
+    d = os.environ.get("PLANNER_OUT_DIR", _DEFAULT_OUT_DIR)
+    if not os.path.isabs(d):
+        d = os.path.join(_REPO_ROOT, d)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def out_path(name: str) -> str:
-    """Absolute path to `name` inside the `test/` directory."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    """Absolute path to `name` inside `out_dir()`."""
+    return os.path.join(out_dir(), name)
 
 
 # ---------------------------------------------------------------------------

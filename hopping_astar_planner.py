@@ -12,10 +12,22 @@ on Campana & Laumond (2016), "Ballistic motion planning":
     Eq. 2:  z(u) = z_s + u * tan(alpha) - g * u^2 / (2 * xdot^2)
 
 Combined with a leg-energy limit `v_s = xdot / cos(alpha) <= V_max`.
+
+Robot model
+-----------
+The robot is a sphere of `robot_radius` whose center — the point the parabola
+actually tracks — sits `leg_length` above the contact foot. Arcs therefore
+start and end at `terrain_z + leg_length`, and terrain is sampled across the
+body's full width, not just along the centreline.
+
+Clearance is a hard feasibility gate (`min_clearance_gate`), not a cost term:
+a hop either has an arc that stays clear of the terrain or it does not exist.
 """
 
 import heapq
 import math
+from typing import NamedTuple
+
 import numpy as np
 
 from map2d5 import Map2D5
@@ -105,20 +117,38 @@ def _xdot(X: float, Z: float, alpha_s: float, g: float) -> float:
     return math.sqrt(g * X * X / denom)
 
 
+def _arc_z(u, X: float, Z: float, z_s: float, alpha_s: float):
+    """CoM height along the arc at horizontal traversal `u` (Campana Eq. 2).
+
+    Uses the `xdot`-free form of Eq. 2. Substituting Eq. 4 gives
+    `g / (2 * xdot^2) = (X * tan(alpha) - Z) / X^2`, so
+
+        z(u) = z_s + u * tan(alpha) - ((X * tan(alpha) - Z) / X^2) * u^2
+
+    which is algebraically identical but avoids both a `sqrt` and the
+    `X*tan(alpha) - Z -> 0` singularity that `_xdot` has to guard against.
+    `u` may be a numpy array, which is what makes the alpha sweep cheap.
+    """
+    tan_a = math.tan(alpha_s)
+    k = (X * tan_a - Z) / (X * X)
+    return z_s + u * tan_a - k * u * u
+
+
 def predict_trajectory(
     c_s: tuple[float, float, float],
     c_g: tuple[float, float, float],
     alpha_s: float,
-    g: float,
+    leg_length: float = 0.0,
     n_samples: int = 32,
 ) -> list[tuple[float, float, float]]:
-    """Sample the parabolic arc from `c_s` to `c_g` with takeoff angle `alpha_s`.
+    """Sample the parabolic CoM arc from `c_s` to `c_g` with takeoff angle `alpha_s`.
 
-    Returns a list of `(x, y, z)` points. The XY projection is the straight
-    segment from `c_s[:2]` to `c_g[:2]`; z(u) follows Campana Eq. 2.
+    `c_s`/`c_g` carry *terrain* heights; the arc runs between
+    `terrain + leg_length` at each end. Returns a list of `(x, y, z)` points
+    whose XY projection is the straight segment from `c_s[:2]` to `c_g[:2]`.
     """
-    x_s, y_s, z_s = c_s
-    x_g, y_g, _ = c_g
+    x_s, y_s, t_s = c_s
+    x_g, y_g, t_g = c_g
 
     dx = x_g - x_s
     dy = y_g - y_s
@@ -130,17 +160,126 @@ def predict_trajectory(
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
 
-    xdot = _xdot(X, c_g[2] - z_s, alpha_s, g)  # Campana Eq. 4
-    tan_a = math.tan(alpha_s)
-    two_xdot_sq = 2.0 * xdot * xdot
+    z_s = t_s + leg_length
+    Z = t_g - t_s
 
     pts: list[tuple[float, float, float]] = []
     for i in range(n_samples):
         u = X * i / (n_samples - 1)
-        # Campana Eq. 2 (rewritten in horizontal traversal u in [0, X]):
-        z_u = z_s + u * tan_a - g * u * u / two_xdot_sq
+        z_u = _arc_z(u, X, Z, z_s, alpha_s)
         pts.append((x_s + u * cos_t, y_s + u * sin_t, z_u))
     return pts
+
+
+class ArcProfile(NamedTuple):
+    """Everything about a hop that does *not* depend on the takeoff angle.
+
+    Terrain sampling is by far the expensive part of validating a hop, and the
+    XY corridor the body sweeps is fixed by the endpoints alone — only the
+    arc's height varies with alpha. Splitting the two lets a whole sweep of
+    candidate angles reuse one terrain lookup (see `alpha_for_clearance`).
+    """
+    u: np.ndarray            # horizontal traversal samples, [0, X]
+    terrain: np.ndarray      # max terrain across the body width at each u
+    X: float                 # horizontal hop distance
+    Z: float                 # terrain elevation change, z_g - z_s
+    z_s: float               # CoM height at takeoff = terrain + leg_length
+    robot_radius: float
+    out_of_bounds: bool      # centreline left the map -> hop is infeasible
+
+
+def terrain_profile(
+    c_s: tuple[float, float, float],
+    c_g: tuple[float, float, float],
+    height_map: Map2D5,
+    robot_radius: float,
+    leg_length: float,
+    max_step: float,
+    obstacle_fill: float,
+    n_lateral: int = 3,
+) -> ArcProfile | None:
+    """Sample the terrain under the corridor the robot's body sweeps.
+
+    Marches the closed interval `u in [0, X]` in steps of
+    `min(max_step, height_map.resolution / 3)`, so terrain is sampled at least
+    ~3x per grid cell. At each `u`, `n_lateral` points spanning
+    `[-robot_radius, +robot_radius]` perpendicular to travel are sampled and
+    the **maximum** kept — the body is a sphere, not a point, so a ridge beside
+    the centreline blocks it just as surely as one beneath.
+
+    OBSTACLE cells read as `obstacle_fill` (a tall-wall value) so they block
+    arcs rather than producing bilinear artefacts.
+
+    Sampling is closed rather than trimmed at the endpoints: with the leg
+    offset the arc no longer *starts* on the ground, so takeoff and landing
+    are real samples worth checking (clearance there is exactly
+    `leg_length - robot_radius`). Trimming them, as the point-mass model had
+    to, would let hops shorter than the trim width pass with no check at all.
+
+    Lateral samples are clamped to the map (bilinear degrades to nearest-edge)
+    rather than failing the hop, so a body passing near the border does not
+    delete a `robot_radius`-wide ring of the map. Only the centreline leaving
+    the map marks the hop infeasible.
+
+    Returns `None` for a degenerate zero-length hop.
+    """
+    x_s, y_s, t_s = c_s
+    x_g, y_g, t_g = c_g
+
+    dx = x_g - x_s
+    dy = y_g - y_s
+    X = math.hypot(dx, dy)
+    if X < 1e-9:
+        return None
+
+    theta = math.atan2(dy, dx)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+
+    step = min(max_step, height_map.resolution / 3.0)
+    n = max(3, int(math.ceil(X / step)) + 1)
+    u = np.linspace(0.0, X, n)
+
+    cx = x_s + u * cos_t
+    cy = y_s + u * sin_t
+
+    out_of_bounds = bool(
+        np.any((cx < 0.0) | (cx >= height_map.size_x)
+               | (cy < 0.0) | (cy >= height_map.size_y))
+    )
+
+    if n_lateral <= 1:
+        offsets = np.zeros(1)
+    else:
+        offsets = np.linspace(-robot_radius, robot_radius, n_lateral)
+
+    # Perpendicular to travel is (-sin_t, cos_t).
+    px = cx[:, None] - offsets[None, :] * sin_t
+    py = cy[:, None] + offsets[None, :] * cos_t
+
+    z = height_map.sample_bilinear(px, py, obstacle_fill=obstacle_fill)
+
+    return ArcProfile(
+        u=u,
+        terrain=z.max(axis=1),
+        X=X,
+        Z=t_g - t_s,
+        z_s=t_s + leg_length,
+        robot_radius=robot_radius,
+        out_of_bounds=out_of_bounds,
+    )
+
+
+def clearance_for_alpha(profile: ArcProfile, alpha_s: float) -> float:
+    """Minimum body-to-terrain clearance over a profile at one takeoff angle.
+
+    This is the cheap half of the split: a handful of vectorized ops on an
+    array that `terrain_profile` already paid for.
+    """
+    if profile.out_of_bounds:
+        return -math.inf
+    z_arc = _arc_z(profile.u, profile.X, profile.Z, profile.z_s, alpha_s)
+    return float(np.min(z_arc - profile.terrain - profile.robot_radius))
 
 
 def min_clearance(
@@ -148,94 +287,81 @@ def min_clearance(
     c_g: tuple[float, float, float],
     alpha_s: float,
     height_map: Map2D5,
-    g: float,
     robot_radius: float,
-    epsilon: float,
+    leg_length: float,
     max_step: float,
     obstacle_fill: float,
+    n_lateral: int = 3,
 ) -> float:
-    """Minimum arc-to-terrain clearance over the hop, minus robot radius.
+    """Minimum body-to-terrain clearance over the hop.
 
-    Marches along the XY segment from `c_s[:2]` to `c_g[:2]` in steps of
-    `min(max_step, height_map.resolution / 3)` so the terrain is sampled at
-    least ~3x per grid cell (never coarser than the map). At each sample:
+    Convenience wrapper: `terrain_profile` followed by `clearance_for_alpha`.
+    Use the two directly when evaluating several angles over one hop.
 
-      * `u` is the horizontal distance traversed;
-      * `z_arc(u)` comes from Campana Eq. 2;
-      * `z_terrain` is obtained by bilinear interpolation of the height map,
-        with OBSTACLE cells replaced by `obstacle_fill` (a tall-wall value)
-        so obstacles show up as blockers rather than as bilinear artefacts.
-
-    Endpoints are trimmed by `epsilon` (in horizontal units) because the arc
-    meets the ground at takeoff and landing by definition. Returns the
-    minimum of `(z_arc - z_terrain - robot_radius)` over the sampled
-    interior. Returns `-inf` if any sample leaves the map (treated as
-    infeasible). Returns `+inf` if the interior sample set is empty.
+    Returns `-inf` if the arc leaves the map, `+inf` for a degenerate
+    zero-length hop. Note there is no `g` parameter — the closed form in
+    `_arc_z` does not need one.
     """
-    x_s, y_s, z_s = c_s
-    x_g, y_g, z_g = c_g
-
-    dx = x_g - x_s
-    dy = y_g - y_s
-    X = math.hypot(dx, dy)
-    if X < 1e-9:
+    profile = terrain_profile(
+        c_s, c_g, height_map, robot_radius, leg_length,
+        max_step, obstacle_fill, n_lateral,
+    )
+    if profile is None:
         return math.inf
+    return clearance_for_alpha(profile, alpha_s)
 
-    theta = math.atan2(dy, dx)
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
 
-    Z = z_g - z_s
-    xdot = _xdot(X, Z, alpha_s, g)  # Campana Eq. 4
-    tan_a = math.tan(alpha_s)
-    two_xdot_sq = 2.0 * xdot * xdot
+def alpha_for_clearance(
+    profile: ArcProfile,
+    alpha_min: float,
+    alpha_max: float,
+    gate: float,
+    margin_frac: float = 0.5,
+    n_bisect: int = 8,
+) -> tuple[float, float]:
+    """Pick a takeoff angle: the *least* steep one that clears the terrain.
 
-    step = min(max_step, height_map.resolution / 3.0)
+    Returns `(alpha_s, clearance)`. The caller rejects the hop when the
+    returned clearance is below `gate`.
 
-    # Interior range in u: (epsilon, X - epsilon). If the hop is too short
-    # for any interior sample, we consider it un-obstructed by definition.
-    u_lo = epsilon
-    u_hi = X - epsilon
-    if u_hi <= u_lo:
-        return math.inf
+    Clearance is monotone nondecreasing in `tan(alpha)`: from `_arc_z`,
+    `dz/d(tan a) = u * (X - u) / X >= 0` for every `u` in `[0, X]`, so a
+    steeper angle lifts the whole arc at once and never trades height at one
+    point for height at another. The pointwise minimum inherits that
+    monotonicity, which makes "the least steep angle that clears" both unique
+    and bisectable.
 
-    n_interior = max(1, int(math.ceil((u_hi - u_lo) / step)) + 1)
+    That monotonicity also means the maximum-clearance angle is *always*
+    `alpha_max` — but `alpha_max` is exactly where `v_s = V_max`, i.e. the leg
+    at 100% of its energy budget. So the policy is minimum sufficient effort:
 
-    min_c = math.inf
-    for i in range(n_interior):
-        if n_interior == 1:
-            u = 0.5 * (u_lo + u_hi)
+      * take the default angle (`margin_frac` of the way up the feasible
+        interval, 0.5 = Campana's max-margin midpoint) when it already clears;
+      * give up only if even `alpha_max` cannot clear;
+      * otherwise bisect for the shallowest angle that does.
+
+    The common case costs one clearance evaluation, rejection costs two, and
+    only genuinely tight hops pay for the bisection.
+    """
+    alpha_default = alpha_min + margin_frac * (alpha_max - alpha_min)
+
+    mc = clearance_for_alpha(profile, alpha_default)
+    if mc >= gate:
+        return alpha_default, mc
+
+    mc_max = clearance_for_alpha(profile, alpha_max)
+    if mc_max < gate:
+        return alpha_max, mc_max  # even full leg energy cannot clear
+
+    lo, hi = alpha_default, alpha_max  # clears at hi, not at lo
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        if clearance_for_alpha(profile, mid) >= gate:
+            hi = mid
         else:
-            u = u_lo + (u_hi - u_lo) * i / (n_interior - 1)
+            lo = mid
 
-        sx = x_s + u * cos_t
-        sy = y_s + u * sin_t
-
-        if not height_map.is_within_bounds(sx, sy):
-            return -math.inf  # arc leaves the map -> infeasible
-
-        # Campana Eq. 2 (rewritten in u):
-        z_arc = z_s + u * tan_a - g * u * u / two_xdot_sq
-
-        # Skip endpoint-adjacent samples where the robot body has not yet
-        # cleared the takeoff column, or has already re-entered the landing
-        # column. Along the arc `z_arc(u)` starts at `z_s` (u=0) and ends at
-        # `z_g` (u=X). The body-of-the-robot only clears the endpoint ground
-        # plane when the arc has risen at least `robot_radius` above it. We
-        # do this per-sample rather than solving a quadratic for u because
-        # the exact "clear-body" horizontal distance depends on the sign of
-        # Z and the arc's asymmetry.
-        if (z_arc - z_s) < robot_radius or (z_arc - z_g) < robot_radius:
-            continue
-
-        z_terrain = height_map.get_elevation_bilinear(
-            sx, sy, obstacle_fill=obstacle_fill
-        )
-        clearance = z_arc - z_terrain - robot_radius
-        if clearance < min_c:
-            min_c = clearance
-
-    return min_c
+    return hi, clearance_for_alpha(profile, hi)
 
 
 class HoppingAStarPlanner:
@@ -248,15 +374,13 @@ class HoppingAStarPlanner:
 
       * lands within the leg's takeoff-speed budget `V_max`
         (Campana Eq. 4 + `v_s = xdot / cos(alpha) <= V_max`);
-      * clears the terrain along the segment with a bilinearly-sampled
-        height-map lookup (accounting for robot radius).
+      * keeps the robot's body at least `min_clearance_gate` clear of the
+        terrain across the whole corridor it sweeps.
 
-    Feasible hops get a base cost (xy distance + asymmetric elevation
-    penalty) plus a smooth proximity penalty that grows as the minimum
-    arc-to-terrain clearance shrinks toward `clearance_margin`. The A*
-    heuristic remains Euclidean XY distance to the goal (admissible: the
-    proximity penalty is >= 0 and elevation only adds cost, so actual cost
-    >= straight-line XY distance).
+    Clearance is a pure feasibility gate — it does not shape cost. Edge cost
+    is `xy distance + asymmetric elevation penalty + hop_fixed_cost`. The A*
+    heuristic remains Euclidean XY distance to the goal, and stays admissible
+    because every term only ever adds to the actual cost.
 
     A "goal-snap" edge is added whenever the goal lies within `hop_radius`
     of the current cell, so the planner can land exactly on the goal
@@ -275,25 +399,30 @@ class HoppingAStarPlanner:
         alpha_downhill: float = 0.5,
         # Ballistic / clearance parameters (defaults match config.py).
         g: float = 9.81,
-        V_max: float = 3.0,
-        robot_radius: float = 0.1,
-        clearance_margin: float = 0.15,
-        clearance_weight: float = 2.0,
+        V_max: float = 4.852,
+        robot_radius: float = 0.2,
+        leg_length: float = 0.4,
+        min_clearance_gate: float = 0.15,
+        alpha_margin_frac: float = 0.5,
         arc_max_step: float = 0.05,
-        arc_endpoint_epsilon: float = 0.05,
-        obstacle_wall_extra: float = 1.0,
-        # Minimum allowed hop distance for the inward ray-search. When the
-        # full-radius hop along a direction is blocked, the planner scans inward
-        # in steps of `resolution` but stops at this floor. Setting it to a
-        # meaningful fraction of `hop_radius` (default: half) prevents the
-        # planner from degenerating into tiny-step perimeter-walking when the
-        # clearance penalty on large arcs makes many micro-hops look cheaper.
-        min_hop_radius: float | None = None,
-        # Demo/analysis flag: when True, skip the arc-vs-terrain clearance
-        # rejection AND set the proximity penalty to zero. The Campana Eq. 4
-        # + `v_s <= V_max` feasibility gate still runs (it guards physics,
-        # not clearance). Intended for A/B baselines that isolate what the
-        # clearance term contributes; do NOT use for real planning.
+        n_lateral: int = 3,
+        obstacle_wall_extra: float = 1.5,
+        # Per-hop constant. Without it, N short hops along a straight line cost
+        # exactly as much as one long hop, leaving A* indifferent between them
+        # and tie-breaking on heap order.
+        hop_fixed_cost: float = 0.05,
+        # Inward ray-search step, in world metres. Deliberately independent of
+        # `map_env.resolution`: tying it to the grid means refining the map also
+        # multiplies the branching factor, which dominates the cost of planning.
+        hop_scan_step: float = 0.3,
+        # Floor on the inward ray-search. 0 lets the planner consider arbitrarily
+        # short hops; `hop_fixed_cost` is what keeps it from abusing them.
+        min_hop_radius: float = 0.0,
+        # Demo/analysis flag: when True, skip the clearance gate entirely. The
+        # Campana Eq. 4 + `v_s <= V_max` feasibility gate and the standability
+        # check still run (they guard physics and static pose, not arc
+        # clearance). Intended for A/B baselines that isolate what the clearance
+        # gate contributes; do NOT use for real planning.
         disable_clearance: bool = False,
     ):
         self.map_env = map_env
@@ -311,10 +440,13 @@ class HoppingAStarPlanner:
         self.g = g
         self.V_max = V_max
         self.robot_radius = robot_radius
-        self.clearance_margin = clearance_margin
-        self.clearance_weight = clearance_weight
+        self.leg_length = leg_length
+        self.min_clearance_gate = min_clearance_gate
+        self.alpha_margin_frac = alpha_margin_frac
         self.arc_max_step = arc_max_step
-        self.arc_endpoint_epsilon = arc_endpoint_epsilon
+        self.n_lateral = n_lateral
+        self.hop_fixed_cost = hop_fixed_cost
+        self.hop_scan_step = hop_scan_step
         self.disable_clearance = disable_clearance
 
         # Height used in place of OBSTACLE sentinels when the arc-clearance
@@ -324,12 +456,19 @@ class HoppingAStarPlanner:
         map_max_z = float(non_obs.max()) if non_obs.size > 0 else 0.0
         self._obstacle_fill = map_max_z + obstacle_wall_extra
 
+        # Cells where the robot can physically stand. Screening landing cells
+        # against this catches body-vs-terrain overlap for ~1us instead of
+        # discovering the same collision by marching a whole arc.
+        self._standable = map_env.standable_mask(
+            robot_radius, min_clearance_gate, leg_length
+        )
+
         # Convert start/goal to grid coordinates
         self.start_cell = map_env.world_to_grid(start[0], start[1])
         self.goal_cell = map_env.world_to_grid(goal[0], goal[1])
 
         # Minimum hop radius for the inward ray-search (see parameter docs above).
-        self._min_hop_radius = hop_radius / 2.0 if min_hop_radius is None else min_hop_radius
+        self._min_hop_radius = min_hop_radius
 
         # Precompute unit-vector directions for ring sampling
         angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
@@ -391,7 +530,7 @@ class HoppingAStarPlanner:
         """Yield (neighbor_cell, edge_cost) pairs reachable from `current` in one hop.
 
         For each of the `n_angles` sampled directions, a ray-search scans from
-        `hop_radius` down to `_min_hop_radius` in steps of `resolution`, adding
+        `hop_radius` down to `_min_hop_radius` in steps of `hop_scan_step`, adding
         every valid (ballistically feasible, clearance-passing) landing cell it
         finds. Generating all valid radii per direction — not just the farthest —
         lets A* consider shorter landings in the same direction: a full-radius hop
@@ -419,7 +558,7 @@ class HoppingAStarPlanner:
         attempted: set[tuple[int, int]] = {current}
         in_results: set[tuple[int, int]] = set()
 
-        step = self.map_env.resolution  # inward scan step size (one grid cell)
+        step = self.hop_scan_step  # inward scan step size, in world metres
 
         # For each direction: scan all radii from hop_radius down to min_hop_radius
         # and add every valid landing cell. Not stopping at the first valid is
@@ -473,17 +612,17 @@ class HoppingAStarPlanner:
     ) -> float | None:
         """Return edge cost if the hop is ballistically valid, else None.
 
-        Sequence:
+        Sequence, cheapest test first:
           (a) reject if the landing cell itself is an obstacle;
-          (b) FEASIBILITY GATE: reject if no `alpha_s` satisfies both
+          (b) STANCE GATE: reject if the robot's body cannot sit at the landing
+              cell without overlapping nearby terrain (precomputed mask);
+          (c) FEASIBILITY GATE: reject if no `alpha_s` satisfies both
               Campana Eq. 4 validity and `v_s <= V_max`;
-          (c) pick `alpha_s = 0.5 * (alpha_min + alpha_max)` (Campana's
-              max-margin choice; farthest from both constraint boundaries);
-          (d) CLEARANCE GATE: reject if the min arc-to-terrain clearance is
-              negative (arc intersects terrain);
-          (e) return base edge cost + smooth proximity penalty. The penalty
-              is 0 when clearance >= clearance_margin and grows linearly up
-              to `clearance_weight` at zero clearance.
+          (d) CLEARANCE GATE: pick the shallowest takeoff angle whose arc keeps
+              the body `min_clearance_gate` clear of the terrain, and reject if
+              no feasible angle manages it;
+          (e) return the edge cost. Clearance does NOT appear here — it is a
+              feasibility test, not a cost term.
         """
         self.n_edge_checks += 1
         neighbor_z = self.map_env.grid[neighbor[0], neighbor[1]]
@@ -492,53 +631,48 @@ class HoppingAStarPlanner:
         if neighbor_z == Map2D5.OBSTACLE:
             return None
 
+        # (b) The robot must be able to stand where it lands.
+        if not self.disable_clearance and not self._standable[neighbor[0], neighbor[1]]:
+            return None
+
         cx, cy = self.map_env.grid_to_world(current[0], current[1])
         nx, ny = self.map_env.grid_to_world(neighbor[0], neighbor[1])
         X = float(math.hypot(nx - cx, ny - cy))
         Z = float(neighbor_z - current_z)
 
-        # (b) Ballistic feasibility (Campana Eq. 4 + leg-energy limit).
+        # (c) Ballistic feasibility (Campana Eq. 4 + leg-energy limit).
         interval = feasible_alpha_interval(X, Z, self.V_max, self.g)
         if interval is None:
             return None
         alpha_min, alpha_max = interval
 
-        # (c) Max-margin takeoff angle (Campana): midpoint of the feasible
-        # interval, which maximizes distance from the two constraints.
-        alpha_s = 0.5 * (alpha_min + alpha_max)
-
-        # (d) Arc-to-terrain clearance along the segment (Campana Eq. 2).
-        c_s = (cx, cy, float(current_z))
-        c_g = (nx, ny, float(neighbor_z))
-        mc = min_clearance(
-            c_s, c_g, alpha_s,
-            self.map_env,
-            self.g,
-            self.robot_radius,
-            self.arc_endpoint_epsilon,
-            self.arc_max_step,
-            self._obstacle_fill,
-        )
-        if not self.disable_clearance and mc < 0.0:
-            return None  # arc intersects terrain -> untraversable
-
-        # (e) Base cost + smooth proximity penalty. Penalty is 0 when
-        # clearance is ample and grows linearly as it shrinks toward 0.
-        # When `disable_clearance` is set (A/B baseline), the penalty is
-        # suppressed too so the base cost is what A* minimises.
-        base = self._edge_cost(current, neighbor, Z)
-        if self.disable_clearance:
-            penalty = 0.0
-        elif mc < self.clearance_margin:
-            penalty = (
-                self.clearance_weight
-                * (self.clearance_margin - mc)
-                / self.clearance_margin
+        # (d) Arc-to-terrain clearance across the body's swept corridor.
+        if not self.disable_clearance:
+            c_s = (cx, cy, float(current_z))
+            c_g = (nx, ny, float(neighbor_z))
+            profile = terrain_profile(
+                c_s, c_g,
+                self.map_env,
+                self.robot_radius,
+                self.leg_length,
+                self.arc_max_step,
+                self._obstacle_fill,
+                self.n_lateral,
             )
-        else:
-            penalty = 0.0
+            if profile is None:
+                return None
+            _alpha_s, mc = alpha_for_clearance(
+                profile, alpha_min, alpha_max,
+                self.min_clearance_gate,
+                self.alpha_margin_frac,
+            )
+            if mc < self.min_clearance_gate:
+                return None  # no feasible arc clears the terrain
+
+        # (e) Edge cost. `hop_fixed_cost` breaks the tie that would otherwise
+        # make N micro-hops exactly as cheap as one long hop.
         self.n_edges_accepted += 1
-        return base + penalty
+        return self._edge_cost(current, neighbor, Z) + self.hop_fixed_cost
 
     def _edge_cost(
         self,
@@ -568,8 +702,8 @@ class HoppingAStarPlanner:
         """Admissible heuristic: Euclidean distance in world coordinates to goal.
 
         Admissible because sum of hop xy-distances >= straight-line distance
-        (triangle inequality), and elevation + proximity penalties only add
-        to the actual g-cost.
+        (triangle inequality), and the elevation penalty and `hop_fixed_cost`
+        only add to the actual g-cost.
         """
         x1, y1 = self.map_env.grid_to_world(cell[0], cell[1])
         x2, y2 = self.map_env.grid_to_world(self.goal_cell[0], self.goal_cell[1])

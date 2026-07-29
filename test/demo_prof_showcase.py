@@ -38,7 +38,7 @@ import config
 from demo_common import (
     HOP_RADIUS, N_ANGLES, V_MAX,
     PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
-    make_planner, diagnose_edge, param_caption, save,
+    make_planner, diagnose_edge, n_bad_hops, param_caption, save, out_path
 )
 from hopping_astar_planner import HoppingAStarPlanner
 from map2d5 import Map2D5
@@ -88,9 +88,9 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
             zorder=6, label="Baseline (clearance OFF)")
     ax.plot(xs_b, ys_b, "x", color="#e65100", markersize=10, zorder=7)
 
-    # Highlight baseline edges whose ballistic mc < 0 with a thick red band.
+    # Highlight baseline edges that fail the ballistic clearance gate.
     for i, d in enumerate(diags_base):
-        if d["feasible"] and d["mc"] < 0.0:
+        if d["feasible"] and d["mc"] < config.MIN_CLEARANCE:
             p0 = path_base[i]; p1 = path_base[i + 1]
             ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
                     color="#d50000", linewidth=9.0, alpha=0.65, zorder=6.5,
@@ -178,9 +178,10 @@ def draw_arc_strip(
                     ax,
                     (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                     d["alpha_s"], m,
-                    config.G_ACCEL, config.ROBOT_RADIUS, obs_fill,
-                    config.ARC_ENDPOINT_EPSILON,
+                    config.ROBOT_RADIUS, config.LEG_LENGTH, obs_fill,
                     config.ARC_SAMPLE_MAX_STEP,
+                    min_clearance_gate=config.MIN_CLEARANCE,
+                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.05, ymax)
             if i == 0:
@@ -193,7 +194,7 @@ def draw_arc_strip(
 
     fig.suptitle(
         "Per-hop side view: baseline (top) vs ballistic (bottom).\n"
-        "Red arc = would collide (mc<0). Green arc = clears.  "
+        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate. Green arc = clears.  "
         "All edges judged by the same ballistic criterion.",
         fontsize=11,
     )
@@ -227,8 +228,8 @@ def main() -> int:
         for i in range(len(path_ball) - 1)
     ]
 
-    n_base_bad = sum(1 for d in diags_base if not d["feasible"] or d["mc"] < 0.0)
-    n_ball_bad = sum(1 for d in diags_ball if not d["feasible"] or d["mc"] < 0.0)
+    n_base_bad = n_bad_hops(diags_base)
+    n_ball_bad = n_bad_hops(diags_ball)
 
     print("=" * 68)
     print(f"BASELINE   ({len(path_base)} waypoints, {len(path_base)-1} hops)")
@@ -261,12 +262,11 @@ def main() -> int:
         print("\nPaths differ. Ballistic planner routed hops farther from "
               "the wall to keep the parabolic trajectory in the clear.")
 
-    out_dir = os.path.dirname(__file__)
     draw_topdown(m, path_base, path_ball, diags_base,
-                 os.path.join(out_dir, "prof_showcase_topdown.png"))
+                 out_path("prof_showcase_topdown.png"))
     draw_arc_strip(m, planner_ball, path_base, diags_base,
                    path_ball, diags_ball,
-                   os.path.join(out_dir, "prof_showcase_arcs.png"))
+                   out_path("prof_showcase_arcs.png"))
 
     if matplotlib.get_backend().lower() != "agg":
         plt.show()

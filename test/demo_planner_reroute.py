@@ -38,10 +38,12 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 import config
+from demo_common import out_path
 from hopping_astar_planner import (
     HoppingAStarPlanner,
+    alpha_for_clearance,
     feasible_alpha_interval,
-    min_clearance,
+    terrain_profile,
 )
 from map2d5 import Map2D5
 from visualizer import Visualizer, draw_arc_side_view
@@ -50,18 +52,23 @@ from visualizer import Visualizer, draw_arc_side_view
 # --- Scenario -------------------------------------------------------------- #
 MAP_X = 6.0
 MAP_Y = 5.0
-RES = 0.1
+RES = config.CELL_RESOLUTION
 
-# Tall wall-like pillar blocking the direct XY route.
+# Wall-like pillar blocking the direct XY route. Painted as an OBSTACLE region,
+# so its stored height is irrelevant — the clearance check substitutes
+# `_obstacle_fill = map_max_z + OBSTACLE_WALL_EXTRA`, which config guarantees is
+# taller than any arc this robot can fly.
 PILLAR_XMIN, PILLAR_XMAX = 2.8, 3.2
 PILLAR_YMIN, PILLAR_YMAX = 1.0, 3.0
-PILLAR_H = 0.9  # m; taller than any feasible arc peak at hop_radius=2
 
 START = (1.0, 2.0)
 GOAL = (5.0, 2.0)
-HOP_RADIUS = 2.0
+# The longest feasible flat hop at the derived V_MAX is V_MAX^2 / g = 2.40 m,
+# and a flat hop of span X needs v_s >= sqrt(g*X). 1.8 m leaves ~13% margin,
+# enough that grid snapping cannot push an edge past the limit.
+HOP_RADIUS = 1.8
 N_ANGLES = 16
-V_MAX = 7.0  # override config so hop_radius=2 flat hops are feasible
+V_MAX = config.V_MAX
 
 
 def build_map() -> Map2D5:
@@ -94,11 +101,14 @@ def make_planner(m: Map2D5) -> HoppingAStarPlanner:
         g=config.G_ACCEL,
         V_max=V_MAX,
         robot_radius=config.ROBOT_RADIUS,
-        clearance_margin=config.CLEARANCE_MARGIN,
-        clearance_weight=config.CLEARANCE_WEIGHT,
+        leg_length=config.LEG_LENGTH,
+        min_clearance_gate=config.MIN_CLEARANCE,
+        alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        arc_endpoint_epsilon=config.ARC_ENDPOINT_EPSILON,
+        n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
+        hop_fixed_cost=config.HOP_FIXED_COST,
+        hop_scan_step=config.HOP_SCAN_STEP,
     )
 
 
@@ -148,14 +158,17 @@ def enumerate_ring_candidates(planner: HoppingAStarPlanner, parent_cell):
             entry["reason"] = "no feasible alpha (leg energy / geometry)"
             out.append(entry)
             continue
-        a = 0.5 * (iv[0] + iv[1])
-        entry["alpha_s"] = a
-        mc = min_clearance(
-            c_s, c_g, a, m, planner.g, planner.robot_radius,
-            planner.arc_endpoint_epsilon, planner.arc_max_step, obs_fill,
+        profile = terrain_profile(
+            c_s, c_g, m, planner.robot_radius, planner.leg_length,
+            planner.arc_max_step, obs_fill, planner.n_lateral,
         )
+        a, mc = alpha_for_clearance(
+            profile, iv[0], iv[1],
+            planner.min_clearance_gate, planner.alpha_margin_frac,
+        )
+        entry["alpha_s"] = a
         entry["mc"] = mc
-        if mc < 0:
+        if mc < planner.min_clearance_gate:
             entry["reason"] = f"arc collides (mc={mc:+.3f} m)"
         else:
             entry["accepted"] = True
@@ -282,8 +295,10 @@ def draw_candidate_sideviews(fig, planner, candidates, chosen_cell, chosen_next)
         else:
             draw_arc_side_view(
                 ax, cand["c_s"], cand["c_g"], cand["alpha_s"],
-                m, planner.g, planner.robot_radius, obs_fill,
-                planner.arc_endpoint_epsilon, planner.arc_max_step,
+                m, planner.robot_radius, planner.leg_length, obs_fill,
+                planner.arc_max_step,
+                min_clearance_gate=planner.min_clearance_gate,
+                n_lateral=planner.n_lateral,
             )
             ax.set_ylim(-0.05, obs_fill + 0.4)
         marker = "  <-- CHOSEN" if cand["cell"] == chosen_next else ""
@@ -328,7 +343,7 @@ def main() -> int:
     ax_top = fig_top.add_subplot(1, 1, 1)
     draw_topdown(fig_top, ax_top, planner, path, chosen_cell, candidates)
     fig_top.tight_layout()
-    top_path = os.path.join(os.path.dirname(__file__), "planner_reroute_topdown.png")
+    top_path = out_path("planner_reroute_topdown.png")
     fig_top.savefig(top_path, dpi=110)
     print(f"\nSaved: {top_path}")
 
@@ -343,7 +358,7 @@ def main() -> int:
         fontsize=11,
     )
     fig_side.tight_layout(rect=(0, 0, 1, 0.96))
-    side_path = os.path.join(os.path.dirname(__file__), "planner_reroute_sideview.png")
+    side_path = out_path("planner_reroute_sideview.png")
     fig_side.savefig(side_path, dpi=110)
     print(f"Saved: {side_path}")
 

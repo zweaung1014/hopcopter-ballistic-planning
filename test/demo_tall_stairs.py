@@ -55,9 +55,9 @@ import config
 from demo_common import (
     HOP_RADIUS, N_ANGLES, V_MAX,
     PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
-    make_planner, diagnose_edge,
+    make_planner, diagnose_edge, n_bad_hops,
     enumerate_ring_candidates, find_interesting_cells, gate_counts,
-    path_cells_of, param_caption, save,
+    path_cells_of, param_caption, save, out_path, TIGHT_BAND, C_LOWMARG
 )
 from hopping_astar_planner import HoppingAStarPlanner
 from map2d5 import Map2D5
@@ -85,8 +85,8 @@ STEP_ZS = [STEP1_Z, STEP2_Z, TOP_Z]
 # ---------------------------------------------------------------------------
 
 def _n_clearance_rejects(cands: list[dict]) -> int:
-    """Count candidates rejected specifically due to arc-terrain clearance (mc < 0)."""
-    return sum(1 for c in cands if c["mc"] is not None and c["mc"] < 0)
+    """Count candidates rejected specifically by the arc-terrain clearance gate."""
+    return sum(1 for c in cands if c["mc"] is not None and c["mc"] < config.MIN_CLEARANCE)
 
 
 # ---------------------------------------------------------------------------
@@ -134,41 +134,43 @@ def draw_topdown(
                     xytext=(-18, -16), textcoords="offset points",
                     fontsize=6, color="#e65100", zorder=8)
 
-    # Highlight baseline hops below clearance margin (orange) or clipping (red)
-    clearance_margin = config.CLEARANCE_MARGIN
-    _low_margin_labelled = False
+    # Highlight baseline hops the clearance gate would have rejected (red), and
+    # those it accepts only barely (orange). The gate is hard — clearance no
+    # longer feeds into cost — so the orange band is a *presentation* nicety
+    # marking hops with little margin, not a second cost regime.
+    gate = config.MIN_CLEARANCE
+    _tight_labelled = False
     for i, d in enumerate(diags_base):
         if not d["feasible"]:
             continue
         p0, p1 = path_base[i], path_base[i + 1]
-        if d["mc"] < 0.0:
+        if d["mc"] < gate:
             ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
                     color="#d50000", linewidth=8, alpha=0.55,
                     zorder=6.5, solid_capstyle="round")
             ax.annotate(
-                f"CLIPS\nmc={d['mc']:+.3f}m",
+                f"REJECTED\nmc={d['mc']:+.3f}m",
                 (0.5*(p0[0]+p1[0]), 0.5*(p0[1]+p1[1])),
                 xytext=(0, 26), textcoords="offset points",
                 ha="center", fontsize=8, color="#b71c1c", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white",
                           ec="#b71c1c", lw=1.1), zorder=11,
             )
-        elif d["mc"] < clearance_margin:
-            penalty = config.CLEARANCE_WEIGHT * (clearance_margin - d["mc"])
+        elif d["mc"] < gate + TIGHT_BAND:
             # Only add legend label once
-            lbl = (f"mc < {clearance_margin} m → clearance penalty"
-                   if not _low_margin_labelled else "_nolegend_")
-            _low_margin_labelled = True
+            lbl = (f"within {TIGHT_BAND} m of the {gate} m gate"
+                   if not _tight_labelled else "_nolegend_")
+            _tight_labelled = True
             ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
-                    color="#ff6f00", linewidth=7, alpha=0.45,
+                    color=C_LOWMARG, linewidth=7, alpha=0.45,
                     zorder=6.4, solid_capstyle="round", label=lbl)
             ax.annotate(
-                f"mc={d['mc']:+.3f}m\n(pen≈+{penalty:.2f})",
+                f"mc={d['mc']:+.3f}m\n(tight)",
                 (0.5*(p0[0]+p1[0]), 0.5*(p0[1]+p1[1])),
                 xytext=(0, 22), textcoords="offset points",
                 ha="center", fontsize=7, color="#e65100", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white",
-                          ec="#ff6f00", lw=1.1), zorder=11,
+                          ec=C_LOWMARG, lw=1.1), zorder=11,
             )
 
     # Ballistic path (teal solid)
@@ -185,7 +187,7 @@ def draw_topdown(
 
     # Ring candidates at the most-constrained ballistic waypoint
     if interesting:
-        # pick cell with the most total rejections (infeasible + OOB + mc<0)
+        # pick cell with the most total rejections (any gate)
         chosen_cell, cands = max(
             interesting,
             key=lambda t: sum(1 for c in t[1] if not c["accepted"]),
@@ -233,10 +235,10 @@ def draw_topdown(
         # legend patches
         extra_h = [
             mpatches.Patch(color="#66bb6a", label=f"ACCEPT ({n_acc})"),
-            mpatches.Patch(color="#c62828", label=f"REJECT ({n_rej}) OOB/infeasible/mc<0"),
+            mpatches.Patch(color="#c62828", label=f"REJECT ({n_rej}) OOB/stance/physics/clearance"),
             mpatches.Patch(color="#1b5e20", label="CHOSEN"),
             mpatches.Patch(color="#d50000", alpha=0.55,
-                           label="baseline hop clips terrain (mc < 0)"),
+                           label="baseline hop fails the clearance gate"),
         ]
     else:
         extra_h = []
@@ -249,7 +251,8 @@ def draw_topdown(
     ax.legend(handles + extra_h, labels + [h.get_label() for h in extra_h],
               loc="upper left", fontsize=7)
 
-    tally = {"accept": 0, "bounds": 0, "obstacle": 0, "physics": 0, "clearance": 0}
+    tally = {"accept": 0, "bounds": 0, "obstacle": 0, "stance": 0,
+             "physics": 0, "clearance": 0}
     for _, cands in interesting:
         for key, val in gate_counts(cands).items():
             tally[key] += val
@@ -257,10 +260,11 @@ def draw_topdown(
     ax.set_title(
         f"tall_stairs: ballistic planner climbs to the z={TOP_Z:.1f} m platform\n"
         f"Ring rejections at these waypoints: clearance {tally['clearance']} · "
-        f"physics {tally['physics']} · off-map {tally['bounds']}  →  neither gate "
-        f"fires on plain risers;\nthe path difference comes from the clearance "
-        f"PENALTY shaping cost, not from hops being ruled out. "
-        f"See demo_stairs_curb.py for a real clearance rejection.\n"
+        f"stance {tally['stance']} · physics {tally['physics']} · "
+        f"off-map {tally['bounds']}\n"
+        f"The risers are well inside the leg's budget, so what prunes the search "
+        f"is the robot's body: it cannot stand within {config.ROBOT_RADIUS:.1f} m "
+        f"of a riser, and flat approach arcs clip the step edge.\n"
         f"{param_caption()}",
         fontsize=TITLE_FS - 3,
     )
@@ -340,9 +344,10 @@ def draw_ring_panels(
             else:
                 draw_arc_side_view(
                     ax, cand["c_s"], cand["c_g"], cand["alpha_s"],
-                    m, planner_ball.g, planner_ball.robot_radius,
-                    obs_fill, planner_ball.arc_endpoint_epsilon,
-                    planner_ball.arc_max_step,
+                    m, planner_ball.robot_radius, planner_ball.leg_length,
+                    obs_fill, planner_ball.arc_max_step,
+                    min_clearance_gate=planner_ball.min_clearance_gate,
+                    n_lateral=planner_ball.n_lateral,
                 )
                 ax.set_ylim(-0.1, ymax_arc)
                 # Step reference lines
@@ -423,8 +428,10 @@ def draw_arc_strip(
                     ax,
                     (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                     d["alpha_s"], m,
-                    config.G_ACCEL, config.ROBOT_RADIUS, obs_fill,
-                    config.ARC_ENDPOINT_EPSILON, config.ARC_SAMPLE_MAX_STEP,
+                    config.ROBOT_RADIUS, config.LEG_LENGTH, obs_fill,
+                    config.ARC_SAMPLE_MAX_STEP,
+                    min_clearance_gate=config.MIN_CLEARANCE,
+                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.1, ymax)
                 # Step reference lines
@@ -444,7 +451,7 @@ def draw_arc_strip(
     fig.suptitle(
         "Per-hop side view — baseline (top) vs ballistic (bottom)\n"
         f"Dotted lines = step elevations  {STEP1_Z} / {STEP2_Z} / {TOP_Z} m · "
-        "Red arc = clips terrain (mc<0) · Green = clears",
+        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate · Green = clears",
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.91))
@@ -480,8 +487,8 @@ def main() -> int:
     ]
 
     # --- console summary ---
-    n_base_bad = sum(1 for d in diags_base if not d["feasible"] or d["mc"] < 0)
-    n_ball_bad = sum(1 for d in diags_ball if not d["feasible"] or d["mc"] < 0)
+    n_base_bad = n_bad_hops(diags_base)
+    n_ball_bad = n_bad_hops(diags_ball)
 
     print("=" * 72)
     print(f"BASELINE   ({len(path_base)} waypoints, {len(path_base)-1} hops)")
@@ -523,28 +530,26 @@ def main() -> int:
         n_inf = sum(1 for c in cands if not c["accepted"] and c["cell"] is not None
                     and c["mc"] is None and c["reason"].startswith("infeasible"))
         print(f"  ({px:.1f},{py:.1f}) z={pz:.1f}  ACCEPT={n_acc}  REJECT={n_rej}"
-              f"  (mc<0:{n_clr}  infeasible:{n_inf}  OOB:{n_oob})")
+              f"  (clearance:{n_clr}  infeasible:{n_inf}  OOB:{n_oob})")
         for c in cands:
-            if not c["accepted"] and c["mc"] is not None and c["mc"] < 0:
+            if not c["accepted"] and c["mc"] is not None and c["mc"] < config.MIN_CLEARANCE:
                 if c["cell"] is not None:
                     lx, ly = m.grid_to_world(*c["cell"])
-                    print(f"    REJECT mc<0 → ({lx:.1f},{ly:.1f})  {c['reason']}")
-
-    out_dir = os.path.dirname(os.path.abspath(__file__))
+                    print(f"    REJECT clearance → ({lx:.1f},{ly:.1f})  {c['reason']}")
 
     draw_topdown(
         m, path_base, path_ball, diags_base, planner_ball, interesting,
-        os.path.join(out_dir, "stairs_topdown.png"),
+        out_path("stairs_topdown.png"),
     )
     draw_ring_panels(
         m, planner_ball, path_ball, interesting,
-        os.path.join(out_dir, "stairs_ring_candidates.png"),
+        out_path("stairs_ring_candidates.png"),
     )
     draw_arc_strip(
         m, planner_ball,
         path_base, diags_base,
         path_ball, diags_ball,
-        os.path.join(out_dir, "stairs_arcs.png"),
+        out_path("stairs_arcs.png"),
     )
 
     return 0

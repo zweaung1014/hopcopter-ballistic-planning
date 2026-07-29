@@ -33,7 +33,7 @@ import config
 from demo_common import (
     HOP_RADIUS, N_ANGLES, V_MAX,
     PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
-    make_planner, diagnose_edge, param_caption, save,
+    make_planner, diagnose_edge, n_bad_hops, param_caption, save, out_path
 )
 from hopping_astar_planner import HoppingAStarPlanner
 from map2d5 import Map2D5
@@ -52,7 +52,9 @@ START = (0.5, 2.4)
 GOAL  = (4.5, 2.4)
 
 # Height the arc centre must clear: wall top + robot body radius.
-H_CLEAR = WALL_HEIGHT + config.ROBOT_RADIUS   # 0.32 m
+H_CLEAR = WALL_HEIGHT + config.ROBOT_RADIUS + config.MIN_CLEARANCE
+# Lowest the CoM may pass over the wall: wall top, plus the body's radius,
+# plus the clearance the gate demands.
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +115,7 @@ def draw_topdown(
 
     # Highlight baseline hops that clip the wall
     for i, d in enumerate(diags_base):
-        if d["feasible"] and d["mc"] < 0.0:
+        if d["feasible"] and d["mc"] < config.MIN_CLEARANCE:
             p0 = path_base[i]
             p1 = path_base[i + 1]
             ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
@@ -166,7 +168,7 @@ def draw_topdown(
 
     handles, labels = ax.get_legend_handles_labels()
     handles.append(mpatches.Patch(color="#d50000", alpha=0.65))
-    labels.append("baseline hop clips wall (mc<0)")
+    labels.append("baseline hop fails the clearance gate")
     ax.legend(handles, labels, loc="upper left", fontsize=8)
     ax.set_title(
         f"barely_jumpable_wall: baseline vs ballistic\n"
@@ -224,8 +226,10 @@ def draw_arc_strip(
                     ax,
                     (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                     d["alpha_s"], m,
-                    config.G_ACCEL, config.ROBOT_RADIUS, obs_fill,
-                    config.ARC_ENDPOINT_EPSILON, config.ARC_SAMPLE_MAX_STEP,
+                    config.ROBOT_RADIUS, config.LEG_LENGTH, obs_fill,
+                    config.ARC_SAMPLE_MAX_STEP,
+                    min_clearance_gate=config.MIN_CLEARANCE,
+                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.05, ymax)
 
@@ -250,7 +254,7 @@ def draw_arc_strip(
     fig.suptitle(
         f"Per-hop side view — baseline (top) vs ballistic (bottom)\n"
         f"Orange dotted = H_clear={H_CLEAR:.2f} m.  "
-        f"Red arc = clips wall (mc<0).  Green arc = clears.",
+        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate.  Green arc = clears.",
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.91))
@@ -303,9 +307,11 @@ def draw_crossing_comparison(
         # Core arc + terrain plot
         draw_arc_side_view(
             ax, c_s, c_g, d["alpha_s"], m,
-            config.G_ACCEL, config.ROBOT_RADIUS, planner._obstacle_fill,
-            config.ARC_ENDPOINT_EPSILON, config.ARC_SAMPLE_MAX_STEP,
+            config.ROBOT_RADIUS, config.LEG_LENGTH, planner._obstacle_fill,
+            config.ARC_SAMPLE_MAX_STEP,
             label=f"Parabolic arc   mc = {d['mc']:+.4f} m",
+            min_clearance_gate=config.MIN_CLEARANCE,
+            n_lateral=config.ARC_LATERAL_SAMPLES,
         )
 
         # Wall-top line and clearance-threshold line
@@ -337,11 +343,12 @@ def draw_crossing_comparison(
                 u_tight = u_lo
                 try:
                     import hopping_astar_planner as _hap
-                    xdot = _hap._xdot(X, d["Z"], d["alpha_s"], config.G_ACCEL)
-                    z_tight = (d["z0"]
-                               + u_tight * math.tan(d["alpha_s"])
-                               - config.G_ACCEL * u_tight ** 2
-                               / (2.0 * xdot ** 2))
+                    # CoM height at the tightest point. `_arc_z` takes the arc's
+                    # starting CoM height, so the leg offset goes in here.
+                    z_tight = _hap._arc_z(
+                        u_tight, X, d["Z"],
+                        d["z0"] + config.LEG_LENGTH, d["alpha_s"],
+                    )
                     gap = z_tight - WALL_HEIGHT - config.ROBOT_RADIUS
                     y_bot = WALL_HEIGHT + config.ROBOT_RADIUS
                     y_top = z_tight
@@ -419,8 +426,8 @@ def main() -> int:
         for i in range(len(path_ball) - 1)
     ]
 
-    n_base_bad = sum(1 for d in diags_base if not d["feasible"] or d["mc"] < 0.0)
-    n_ball_bad = sum(1 for d in diags_ball if not d["feasible"] or d["mc"] < 0.0)
+    n_base_bad = n_bad_hops(diags_base)
+    n_ball_bad = n_bad_hops(diags_ball)
 
     print("=" * 72)
     print(f"BASELINE   ({len(path_base)} waypoints, {len(path_base)-1} hops)")
@@ -463,23 +470,21 @@ def main() -> int:
     if path_base == path_ball:
         print("\nWARNING: paths are identical — wall height may need adjusting.")
 
-    out_dir = os.path.dirname(os.path.abspath(__file__))
-
     draw_topdown(
         m, path_base, path_ball, diags_base,
-        os.path.join(out_dir, "barely_jumpable_topdown.png"),
+        out_path("barely_jumpable_topdown.png"),
     )
     draw_arc_strip(
         m, planner_ball,
         path_base, diags_base,
         path_ball, diags_ball,
-        os.path.join(out_dir, "barely_jumpable_arcs.png"),
+        out_path("barely_jumpable_arcs.png"),
     )
     draw_crossing_comparison(
         m, planner_base, planner_ball,
         path_base, diags_base,
         path_ball, diags_ball,
-        os.path.join(out_dir, "barely_jumpable_crossing.png"),
+        out_path("barely_jumpable_crossing.png"),
     )
 
     return 0

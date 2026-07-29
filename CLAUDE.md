@@ -37,8 +37,12 @@ python test/test_clearance_rejection.py
 # Timing/scaling benchmark (ballistic vs. baseline planner on the same scenario)
 python test/benchmark_tall_stairs.py
 
-# Visual demos — each produces PNGs into test/ (side-view arcs, top-down paths,
-# ring-candidate panels, etc.); open the generated PNGs to inspect results
+# Per-scenario timing table across the whole deck (writes markdown)
+python test/time_deck.py results/after_LS_recs/timings.md
+
+# Visual demos — each writes PNGs into results/after_LS_recs/ (side-view arcs,
+# top-down paths, ring-candidate panels, etc.); set PLANNER_OUT_DIR to redirect.
+# Open the generated PNGs to inspect results.
 python test/demo_tall_stairs.py
 python test/demo_clearance_sweep.py
 python test/demo_barely_jumpable.py
@@ -62,8 +66,9 @@ astar_planner.py         ← original 8-connected grid A* (kept as reference, un
 hopping_astar_planner.py ← HoppingAStarPlanner: the active planner (ballistic hops)
 visualizer.py            ← Visualizer: matplotlib rendering (grid, arcs, path)
 main.py                  ← entry point: load_map(name) → plan() → visualize
-test/                     ← demo scripts (produce PNGs), a benchmark, and one
-                            assertion-based numeric test (no pytest)
+test/                     ← demo scripts (produce PNGs), a benchmark, a timing
+                            harness, and one assertion-based numeric test (no pytest)
+results/                  ← generated figures + timing tables, one dir per run
 ```
 
 ### Map2D5 (`map2d5.py`)
@@ -71,10 +76,16 @@ test/                     ← demo scripts (produce PNGs), a benchmark, and one
 Stores terrain as a numpy 2D array of elevations (meters). `OBSTACLE = -1.0` is a
 sentinel value, not a real elevation. Key methods: `world_to_grid`/`grid_to_world`
 (cell centers are at `((col+0.5)*res, (row+0.5)*res)`), `is_obstacle`,
-`get_elevation`, `get_elevation_bilinear` (used by the clearance check to sample
-terrain height continuously along an arc, with obstacle cells substituted for a tall
-"wall" fill value so they block arcs instead of producing bilinear artifacts),
-`set_obstacle_region`.
+`get_elevation`, `sample_bilinear` (vectorized; the clearance check samples a whole
+arc in one call, with obstacle cells substituted for a tall "wall" fill value so
+they block arcs instead of producing bilinear artifacts — the substituted grid is
+memoised), `get_elevation_bilinear` (scalar wrapper over it), `set_obstacle_region`,
+`paint_region`, `standable_mask`.
+
+**Always paint terrain with `paint_region`,** which takes world-metre bounds. Raw
+column slices (`grid[:, 10:13]`) hard-code a cell count, and `world_to_grid(...)`
+plus an inclusive `+1` overshoots by up to one cell; both silently rescale the
+physical terrain when `CELL_RESOLUTION` changes.
 
 ### Maps (`maps/`)
 
@@ -92,31 +103,52 @@ neighbor generation and edge validation are non-trivial:
 
 - **Neighbor generation** (`_generate_hop_neighbors`): for each of `n_angles` evenly
   spaced directions around the current cell, a ray-search scans radii from
-  `hop_radius` down to `min_hop_radius` (default `hop_radius / 2`) in steps of one
-  grid cell, adding *every* valid landing cell found along the ray — not just the
-  farthest. This matters because a full-radius hop may land too close to an obstacle
+  `hop_radius` down to `min_hop_radius` (default 0) in steps of `hop_scan_step`
+  (world metres), adding *every* valid landing cell found along the ray — not
+  just the farthest. This matters because a full-radius hop may land too close to an obstacle
   for the *next* arc to clear it, while a shorter hop in the same direction gives a
   better launch position. Two dedup sets (`attempted`, `in_results`) prevent
   redundant validation while still letting different directions scan past a
   previously *failed* cell to reach a valid shorter-radius one. A "goal-snap" edge is
   added whenever the goal is within `hop_radius`, so reaching it doesn't depend on
   angular alignment with the ring sampling.
-- **Edge validation** (`_validate_and_cost`), in order:
+- **Edge validation** (`_validate_and_cost`), cheapest test first:
   1. reject if the landing cell is an obstacle;
-  2. **feasibility gate** (`feasible_alpha_interval`): reject unless some takeoff
+  2. **stance gate** (`Map2D5.standable_mask`, precomputed once): reject if the
+     robot's body cannot rest at the landing cell without overlapping nearby
+     terrain;
+  3. **feasibility gate** (`feasible_alpha_interval`): reject unless some takeoff
      angle `alpha` satisfies both Campana Eq. 4 validity and the leg-energy limit
      `v_s = xdot/cos(alpha) <= V_max`;
-  3. pick `alpha_s` as the midpoint of the feasible interval (max-margin choice);
-  4. **clearance gate** (`min_clearance`): march along the arc's XY segment,
-     comparing the parabola's height (Campana Eq. 2) against the terrain (bilinear
-     lookup, obstacles treated as tall walls) minus `robot_radius`; reject if the arc
-     ever intersects the terrain;
+  4. **clearance gate**: `terrain_profile` samples the corridor the body sweeps,
+     then `alpha_for_clearance` picks a takeoff angle and reports the resulting
+     clearance; reject if it is below `min_clearance_gate`;
   5. cost = XY distance + asymmetric elevation penalty (`alpha_uphill` /
-     `alpha_downhill`) + a smooth penalty that grows linearly as clearance shrinks
-     below `clearance_margin` (zero once clearance ≥ margin).
-- `disable_clearance=True` keeps the physics feasibility gate but skips the terrain
-  clearance gate and its cost penalty — used only for A/B baseline comparisons (e.g.
-  in `test/benchmark_tall_stairs.py`), never for real planning.
+     `alpha_downhill`) + `hop_fixed_cost`. **Clearance does not enter the cost** —
+     it is purely a feasibility test.
+- `disable_clearance=True` skips the stance and clearance gates but keeps the
+  physics feasibility gate — used only for A/B baseline comparisons (e.g. in
+  `test/benchmark_tall_stairs.py`), never for real planning. Note this is now a
+  *feasibility* A/B ("which candidates exist"), not a cost-shaping one.
+
+### The robot model — three things that are easy to get wrong
+
+- **The arc is the CoM, not the feet.** Hops start and end at
+  `terrain_z + leg_length`. `Z = z_g - z_s` is unchanged (both ends shift
+  equally), so `feasible_alpha_interval` is untouched; only the absolute arc
+  height moves. Anything comparing an arc to terrain must add the leg offset.
+- **Clearance is monotone in `tan(alpha)`.** `dz/d tan a = u(X-u)/X >= 0` at every
+  `u`, so a steeper angle lifts the whole arc at once and the max-clearance angle
+  is *always* `alpha_max` — which is exactly where `v_s = V_max`. That is why
+  `alpha_for_clearance` does not simply maximise: it takes the max-margin midpoint
+  when that clears, and bisects for the shallowest sufficient angle otherwise.
+  Monotonicity is what makes the bisection valid.
+- **Standability is a 3D distance, not a vertical drop.** `standable_mask`
+  measures the distance from the body sphere's centre to each terrain column. A
+  flat-underside test would reject every graded slope. The traversable-grade
+  ceiling is `sqrt((LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE))^2 - 1)`; at
+  shipped values that is 0.553, and `maps/slope_crest.py` is graded to stay under
+  it.
 - Instrumentation counters (`n_expansions`, `n_edge_checks`, `n_edges_accepted`) are
   reset at the top of `plan()` and read by the benchmark script.
 
@@ -133,13 +165,34 @@ ballistic/clearance parameter, add it to `config.py` and thread it through both
 `main.py` and any test/demo script that constructs a `HoppingAStarPlanner`.
 
 Notable non-obvious parameters:
-- `V_MAX` must exceed `sqrt(G_ACCEL * HOP_RADIUS)` with margin, or no hop of length
-  `HOP_RADIUS` is physically reachable (the minimum feasible takeoff speed for a flat
-  hop of distance X is `sqrt(g*X)`).
+- `V_MAX` is **derived**, not tuned: `sqrt(2 * G_ACCEL * MAX_APEX_HEIGHT)`, i.e. the
+  speed needed to raise the CoM `MAX_APEX_HEIGHT` on a vertical in-place hop. The
+  longest feasible flat hop it affords is `V_MAX^2 / G_ACCEL`, and a flat hop of
+  distance X needs `sqrt(g*X)`, so `HOP_RADIUS` must stay well under that. Change
+  `MAX_APEX_HEIGHT` to change the robot, never `V_MAX` directly.
+- `LEG_LENGTH - ROBOT_RADIUS` must exceed `MIN_CLEARANCE`, or *every* edge is
+  rejected and `plan()` silently returns `None` everywhere. `config.py` asserts it.
 - `OBSTACLE_WALL_EXTRA` is added on top of the map's max real elevation to get the
   height used for obstacle cells in the clearance check — obstacles aren't just
   "tall," they're "taller than anything else on the map," so bilinear interpolation
-  near an obstacle edge doesn't accidentally produce a below-wall reading.
+  near an obstacle edge doesn't accidentally produce a below-wall reading. It must
+  exceed `LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE` or obstacles
+  become jumpable; `config.py` asserts this too.
+- `HOP_SCAN_STEP` is a separate parameter from `CELL_RESOLUTION` so it can be
+  tuned for speed — branching factor is proportional to `1/step`, making it the
+  cheapest lever on planning time. But it also quantizes how far a hop can go:
+  straight ahead you can only ever land on `x + step*k`, while diagonals project
+  to different increments, so a coarse step makes A* reach for lateral doglegs to
+  land on x-values the straight ladder skips. It ships equal to `CELL_RESOLUTION`
+  for that reason. If you coarsen it for speed, check the paths for zig-zags
+  before trusting the figures.
+- `HOP_FIXED_COST` exists because `min_hop_radius` defaults to 0. Without it, N
+  short hops along a straight line cost exactly as much as one long hop, so A* is
+  indifferent and tie-breaks on heap order, producing jittery micro-hop chains.
+
+Obstacles must be **at least two cells thick** across any arc that should be
+blocked. A one-cell obstacle sampled along its own boundary is averaged 50/50 with
+its neighbour by the bilinear lookup, halving its effective height.
 
 ### Visualizer (`visualizer.py`)
 
@@ -153,7 +206,9 @@ they need more specialized plots than the generic `Visualizer` provides.
 - No test framework — new numeric checks follow the `test/test_clearance_rejection.py`
   pattern: plain assertions, PASS/FAIL prints, `sys.exit(1)` on failure. New visual
   demos follow the `test/demo_*.py` pattern: build a scenario, run both the ballistic
-  and baseline (`disable_clearance=True`) planners, save annotated PNGs into `test/`.
+  and baseline (`disable_clearance=True`) planners, save annotated PNGs via
+  `demo_common.out_path()` (`results/after_LS_recs/` by default, override with
+  `$PLANNER_OUT_DIR`).
 - `CHANGELOG.md` (Keep a Changelog format) is actively maintained — update it under
   `[Unreleased]` when making a notable change to the planner or its parameters.
 - Pure, unit-testable physics functions (`feasible_alpha_interval`, `predict_trajectory`,

@@ -41,11 +41,14 @@ def main():
         g=config.G_ACCEL,
         V_max=config.V_MAX,
         robot_radius=config.ROBOT_RADIUS,
-        clearance_margin=config.CLEARANCE_MARGIN,
-        clearance_weight=config.CLEARANCE_WEIGHT,
+        leg_length=config.LEG_LENGTH,
+        min_clearance_gate=config.MIN_CLEARANCE,
+        alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        arc_endpoint_epsilon=config.ARC_ENDPOINT_EPSILON,
+        n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
+        hop_fixed_cost=config.HOP_FIXED_COST,
+        hop_scan_step=config.HOP_SCAN_STEP,
     )
     path = planner.plan()
 

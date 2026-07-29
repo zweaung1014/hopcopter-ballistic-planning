@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — revised robot model (denser map, leg, body radius, hard clearance gate)
+
+The robot is no longer a point mass on a coarse grid. It is a sphere of
+`ROBOT_RADIUS` whose centre — the point the ballistic arc actually tracks — sits
+`LEG_LENGTH` above the contact foot, moving over a grid at twice the previous
+density. Clearance became a hard feasibility gate rather than a cost penalty.
+
+- **Map density doubled**: `CELL_RESOLUTION` 0.2 → 0.1 m (25×25 → 50×50 cells).
+  - [map2d5.py](map2d5.py): new `paint_region()` sets cells by *world-metre*
+    bounds. Both previous idioms were resolution-dependent: raw column slices
+    (`grid[:, 10:13]`) hard-code a cell count, and `world_to_grid(...)` with an
+    inclusive `+1` overshoots by up to one cell. At 0.1 m the former halved the
+    staircases in `tall_stairs`/`stairs_with_curb` and left the map's right half
+    at z=0; the latter shrank every world-painted obstacle by 0.1 m per axis.
+    All seven maps now paint from world bounds and are resolution-invariant.
+- **Jump height is now a stated capability, not a tuned constant**:
+  `MAX_APEX_HEIGHT = 1.2 m` (the CoM rise on a vertical in-place hop) derives
+  `V_MAX = sqrt(2 g h) = 4.852 m/s`. The longest feasible flat hop is
+  `V_MAX^2 / g = 2.40 m`. `test/demo_common.py` no longer overrides `V_MAX`
+  (was 6.0), and `demo_clearance_sweep` / `demo_planner_reroute` no longer
+  hardcode 7.0 — their geometry was rescaled to spans the robot can reach.
+- **`LEG_LENGTH = 0.4 m`**: hop arcs start and end at `terrain_z + LEG_LENGTH`.
+  `Z = z_g - z_s` is unchanged, so `feasible_alpha_interval` is unaffected.
+  This retired two workarounds that only existed because the arc used to start
+  *on* the ground: the endpoint body-guard in `min_clearance`, and
+  `ARC_ENDPOINT_EPSILON`. Both are deleted. Dropping the epsilon also closed a
+  hole where hops shorter than `2 * epsilon` returned `+inf` and were accepted
+  with no clearance check at all.
+- **`ROBOT_RADIUS` 0.1 → 0.2 m, and the body now has lateral extent**: the
+  clearance check samples `ARC_LATERAL_SAMPLES` points across the body's width
+  perpendicular to travel and takes the maximum terrain, so a ridge *beside* the
+  centreline blocks the hop. New `Map2D5.standable_mask()` rejects landing cells
+  where the body could not rest, measuring true 3D distance to the terrain
+  rather than a vertical drop — a flat-underside test would condemn every graded
+  slope. There is a closed-form ceiling on traversable grade:
+  `sqrt((LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE))^2 - 1)` = 0.553.
+- **Clearance is a hard gate**: `MIN_CLEARANCE = 0.15 m` rejects outright.
+  `CLEARANCE_MARGIN` and `CLEARANCE_WEIGHT` are deleted and the smooth proximity
+  penalty is gone — clearance no longer enters edge cost at all. This makes the
+  `disable_clearance=True` A/B a *feasibility* comparison ("which candidates
+  exist") rather than a cost-shaping one.
+- **Takeoff angle: minimum sufficient effort**. Clearance is monotone
+  nondecreasing in `tan(alpha)` (`dz/d tan a = u(X-u)/X >= 0` at every `u`), so
+  the max-clearance angle is *always* `alpha_max` — which is exactly where
+  `v_s = V_max`, the leg at 100% of its budget. Rather than always flying at the
+  limit, `alpha_for_clearance()` takes the max-margin midpoint when it already
+  clears, gives up only if `alpha_max` cannot, and otherwise bisects for the
+  shallowest angle that does. Typical hops cost one clearance evaluation.
+- **`min_hop_radius` default 0** (was `hop_radius / 2`), with two changes that
+  make it affordable and well-behaved:
+  - `HOP_FIXED_COST = 0.05` per hop. Without it, N short hops along a straight
+    line cost *exactly* as much as one long hop, leaving A* indifferent and
+    tie-breaking on heap order — the observed result was paths containing runs
+    of consecutive 0.1 m micro-hops. The old radius floor existed to prevent
+    exactly this; a fixed cost does it without imposing a floor.
+  - `HOP_SCAN_STEP` makes the inward ray-search step an explicit parameter
+    rather than reading `map.resolution`. It is the dominant cost knob — the
+    branching factor is proportional to `1/step` — but coarsening it also
+    quantizes how far a hop can travel, which shows up as lateral doglegs where
+    the straight-ahead ladder cannot reach a wanted x. Shipped at 0.1 m
+    (= `CELL_RESOLUTION`), i.e. the pre-change behaviour, after 0.3 m was found
+    to put a visible 0.30 m y-detour into the `slope_crest` path.
+- **Performance**: a naive implementation of the above measured 13.7 s per
+  `plan()` (vs 284 ms before). Two-phase evaluation now separates the
+  alpha-independent terrain sampling (`terrain_profile`) from the cheap
+  per-angle arc evaluation (`clearance_for_alpha`), backed by a vectorized
+  `Map2D5.sample_bilinear()` and a memoised obstacle-substituted grid. The
+  cached grid lives on `Map2D5`, not the planner, so the six external callers of
+  `min_clearance` get it for free. Deck total: **2.46 s → 24.4 s** for 14 plans
+  (the full demo suite, which runs more than one plan per script, takes ~73 s).
+- **Obstacle maps recalibrated ~3×**. The leg offset lifts the arc 0.4 m, which
+  made every previously-tuned obstacle invisible. Heights re-derived empirically:
+  `tall_narrow_wall` 0.15 → 0.70 m, `barely_jumpable_wall` 0.22 → 1.00 m,
+  `stairs_with_curb` curb rise 0.10 → 0.60 m, `slope_crest` crest-above-shelf
+  0.25 → 0.85 m with the ramp regraded 0.75 → 0.50 to stay under the 0.553
+  standability ceiling. Map docstrings quote the fresh sweeps.
+- **`enumerate_ring_candidates` gained a `stance` gate**, and `n_bad_hops` now
+  counts a hop bad if its landing cell is un-standable. Several demos asserted
+  "the baseline path contains clipping hops"; under the new model the baseline
+  more often fails by *landing where the body cannot rest*, which the old
+  arc-only diagnosis missed entirely.
+- **Demo output moved** from `test/` to `results/after_LS_recs/`, via
+  `demo_common.out_dir()` with a `$PLANNER_OUT_DIR` override (relative paths
+  resolve against the repo root). All ten demos now route through `out_path()`.
+- [test/time_deck.py](test/time_deck.py): new timing harness recording
+  wall-clock, expansions, edge checks, hop count and leg-energy utilisation per
+  scenario. Written against `make_planner`'s default interface so the same file
+  runs against both old and new code; baselines are in
+  `results/before_LS_recs/timings.md`.
+- `test/benchmark_tall_stairs.py`: `N_TRIALS` 30 → 5, since a `tall_stairs` plan
+  is now ~6.5 s (the benchmark itself takes ~40 s).
+
 ### Added
 - **Presentation demo suite** — six scenarios covering go-around, hop-over,
   takeoff readjustment, stair climbing and slope climbing, all sharing one set

@@ -1,18 +1,19 @@
 """Curbed-stairs demo: rejection driven by the *clearance* gate, not by physics.
 
-`test/demo_tall_stairs.py` shows the planner climbing plain stairs, but its
-rejections come from the physics feasibility gate — on a plain riser the
-body-guard inside `min_clearance` skips every interior sample and returns `+inf`
-(see the note in `maps/tall_stairs.py`).  This demo closes that gap.
+`test/demo_tall_stairs.py` shows the planner climbing plain stairs, but nothing
+there is rejected on *clearance*: a hop onto a plain riser passes well above the
+terrain, so what prunes the search is the stance check and the physics gate.
+This demo closes that gap.
 
-Each tread here carries a curb standing 0.10 m proud of the tread behind it, so
-the curb is a local maximum and its samples survive the body-guard.  A hop that
-approaches too flat catches the curb on the descending part of its arc and is
-rejected with a finite negative `mc`.
+Each tread here carries a curb standing `CURB_RISE` proud of the tread behind
+it, so the curb is a genuine local maximum sitting under the descending part of
+an incoming arc. A hop that approaches too flat catches it and is rejected on
+clearance.
 
 Every rejected ring candidate is labelled with the gate that stopped it —
-`bounds`, `obstacle`, `physics` or `clearance` — which is the whole point of the
-figure: it lets you say which check did the work rather than assuming.
+`bounds`, `obstacle`, `stance`, `physics` or `clearance` — which is the whole
+point of the figure: it lets you say which check did the work rather than
+assuming.
 
 Figures produced
 ----------------
@@ -64,8 +65,9 @@ CURBS = [
 GATE_LABEL = {
     "bounds":    "REJECT · off map",
     "obstacle":  "REJECT · OBSTACLE cell",
+    "stance":    "REJECT · body cannot stand",
     "physics":   "REJECT · physics (V_max)",
-    "clearance": "REJECT · clearance (mc<0)",
+    "clearance": "REJECT · clearance gate",
     "":          "ACCEPT",
 }
 
@@ -102,8 +104,8 @@ def draw_topdown(m, path_base, path_ball, diags_base, save_path):
 
     ax.set_title(
         f"stairs_with_curb: each tread edge stands {CURB_RISE:.2f} m proud\n"
-        "Curbs are local maxima, so the clearance gate survives the body-guard "
-        "and rejects flat approaches\n"
+        "Curbs are local maxima under the descending limb of an incoming arc, "
+        "so flat approaches are rejected on clearance\n"
         f"{param_caption()}",
         fontsize=TITLE_FS - 2,
     )
@@ -142,9 +144,10 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
                 p0, p1 = path[i], path[i + 1]
                 draw_arc_side_view(
                     ax, (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
-                    d["alpha_s"], m, config.G_ACCEL, config.ROBOT_RADIUS,
-                    obs_fill, config.ARC_ENDPOINT_EPSILON,
-                    config.ARC_SAMPLE_MAX_STEP,
+                    d["alpha_s"], m, config.ROBOT_RADIUS, config.LEG_LENGTH,
+                    obs_fill, config.ARC_SAMPLE_MAX_STEP,
+                    min_clearance_gate=config.MIN_CLEARANCE,
+                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.1, ymax)
                 for _, cz, _, col in CURBS:
@@ -162,7 +165,7 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
     fig.suptitle(
         "Per-hop side view — baseline (top) vs ballistic (bottom)\n"
         f"Dotted: curb elevations {CURB1_Z} / {CURB2_Z} / {CURB3_Z} m · "
-        "Red arc = clips a curb (mc<0) · Green = clears",
+        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate · Green = clears",
         fontsize=TITLE_FS - 2,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.90))
@@ -229,8 +232,10 @@ def draw_ring_panels(m, planner_ball, path_ball, interesting, save_path):
             else:
                 draw_arc_side_view(
                     ax, cand["c_s"], cand["c_g"], cand["alpha_s"], m,
-                    planner_ball.g, planner_ball.robot_radius, obs_fill,
-                    planner_ball.arc_endpoint_epsilon, planner_ball.arc_max_step,
+                    planner_ball.robot_radius, planner_ball.leg_length,
+                    obs_fill, planner_ball.arc_max_step,
+                    min_clearance_gate=planner_ball.min_clearance_gate,
+                    n_lateral=planner_ball.n_lateral,
                 )
                 ax.set_ylim(-0.1, CURB3_Z + 0.45)
                 for _, cz, _, col in CURBS:
@@ -255,7 +260,7 @@ def draw_ring_panels(m, planner_ball, path_ball, interesting, save_path):
     fig.suptitle(
         "Ring candidates at each ballistic waypoint, labelled by the gate that "
         "rejected them\n"
-        "Cream background = rejected on CLEARANCE (finite mc < 0) · "
+        "Cream background = rejected on CLEARANCE · "
         "Pink = rejected before the arc was even computed · "
         "Green = the candidate A* took",
         fontsize=TITLE_FS - 2,
@@ -288,17 +293,29 @@ def main() -> int:
         m, path_base, diags_base, path_ball, diags_ball,
     )
 
-    interesting = find_interesting_cells(planner_ball, path_cells_of(planner_ball, path_ball))
+    # Look for clearance rejections along BOTH paths, not just the ballistic
+    # one. That is where they live: the ballistic planner's waypoints are the
+    # ones it picked *because* their ring candidates clear, so nothing is
+    # rejected there. The baseline parks on the tread edges, and from those
+    # cells most of the ring dies on clearance — which is the comparison the
+    # figure is meant to make.
+    cells = path_cells_of(planner_ball, path_ball)
+    for cell in path_cells_of(planner_ball, path_base):
+        if cell not in cells:
+            cells.append(cell)
+    interesting = find_interesting_cells(planner_ball, cells, gate="clearance")
 
     # The headline claim of this demo: clearance, not physics, does the rejecting.
-    total = {"accept": 0, "bounds": 0, "obstacle": 0, "physics": 0, "clearance": 0}
+    total = {"accept": 0, "bounds": 0, "obstacle": 0, "stance": 0,
+             "physics": 0, "clearance": 0}
     for _, cands in interesting:
         for key, val in gate_counts(cands).items():
             total[key] += val
 
     print(f"\nRing candidates across {len(interesting)} ballistic waypoint(s):")
     print(f"  ACCEPT                 {total['accept']}")
-    print(f"  REJECT · clearance     {total['clearance']}   ← finite mc < 0")
+    print(f"  REJECT · clearance     {total['clearance']}   ← arc clips terrain")
+    print(f"  REJECT · stance        {total['stance']}   ← body cannot rest there")
     print(f"  REJECT · physics       {total['physics']}")
     print(f"  REJECT · off map       {total['bounds']}")
     print(f"  REJECT · OBSTACLE      {total['obstacle']}")
