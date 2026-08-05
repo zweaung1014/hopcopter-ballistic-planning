@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — leg safety margin (stance leg-cylinder sides + flight capsule)
+
+The body's collision volume is now the full leg-to-CoM capsule of radius
+`ROBOT_RADIUS`, not just the sphere at the CoM. Stance and flight enforce it
+differently.
+
+- **Stance** — [map2d5.py](map2d5.py) `standable_mask` gains a leg-cylinder-
+  sides channel: the upper `(1 - LEG_CLEARANCE_START_FRAC) = 2/3` of a cylinder
+  of radius `ROBOT_RADIUS` from foot to CoM must clear terrain too. The bottom
+  `LEG_CLEARANCE_START_FRAC = 1/3` is exempt so graded slopes remain standable.
+  Max standable grade tightens from ~0.55 (sphere-only) to
+  `(LEG_LENGTH * frac) / (ROBOT_RADIUS + MIN_CLEARANCE) ≈ 0.38`.
+- **Flight** — [hopping_astar_planner.py](hopping_astar_planner.py)
+  `clearance_for_alpha` models the full capsule (top hemisphere at the CoM +
+  full cylinder + bottom hemisphere at the foot). Terrain directly under the
+  foot must clear the foot tip by `ROBOT_RADIUS + MIN_CLEARANCE = 0.35 m`, not
+  just `MIN_CLEARANCE`. The `terrain_profile` corridor is widened from
+  `[-R, R]` to `[-(R + gate), +(R + gate)]`, and per-sample terrain is stored
+  without max-collapse so the capsule distance can be computed cell-by-cell.
+- **Endpoint-transition mask** — samples where `terrain <= endpoint_max AND
+  foot_h < endpoint_max + R + gate` are masked to `+inf`. This suppresses the
+  rigid-vertical-leg model's spurious "foot skimming endpoint terrain" artifact
+  at near-endpoint samples, without ever masking wall samples (terrain above
+  endpoint height).
+- **Lateral samples**: `ARC_LATERAL_SAMPLES` bumped 3 → 5 so the inter-sample
+  gap stays ≤ 0.175 m under the widened corridor.
+- **Config**: new `LEG_CLEARANCE_START_FRAC = 1.0/3.0` in
+  [config.py](config.py). Threaded through `HoppingAStarPlanner.__init__`.
+- **Scenarios**: [maps/slope_crest.py](maps/slope_crest.py) regraded 0.50 →
+  0.35 to stay under the new 0.38 ceiling. [maps/tall_stairs.py](maps/tall_stairs.py)
+  docstring updated for the widened `R + MIN_CLEARANCE = 0.35 m` un-standable
+  band in front of each riser.
+- **Visualizer**: [visualizer.py](visualizer.py) `draw_arc_side_view` now plots
+  foot-tip trajectory and bottom-cap envelope; new
+  `Visualizer.draw_robot_pose()` overlays top-down body + envelope rings at
+  start/goal, wired up in [main.py](main.py).
+- **Tests**: [test/test_clearance_rejection.py](test/test_clearance_rejection.py)
+  gains case (6) covering capsule-specific stance and flight geometry
+  (grade-0.35 standable / grade-0.50 not, bump-clearing hop accepts,
+  wall-scraping hop rejects). Pillar height in case (1) recalibrated 0.9 → 0.45
+  m to match the new capsule reach.
+
 ### Changed — revised robot model (denser map, leg, body radius, hard clearance gate)
 
 The robot is no longer a point mass on a coarse grid. It is a sphere of

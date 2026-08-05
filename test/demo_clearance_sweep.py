@@ -121,6 +121,7 @@ def main() -> int:
         profile = terrain_profile(
             c_s, c_g, m, ROBOT_R, LEG, MAX_STEP, obs_fill,
             config.ARC_LATERAL_SAMPLES,
+            min_clearance_gate=GATE,
         )
         # Same rule the planner uses: start at the max-margin angle and only
         # escalate to a steeper one if the gate demands it.

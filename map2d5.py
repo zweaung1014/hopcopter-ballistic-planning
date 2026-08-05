@@ -180,32 +180,50 @@ class Map2D5:
         radius: float,
         clearance: float,
         leg_length: float,
+        leg_clearance_start_frac: float = 1.0 / 3.0,
     ) -> np.ndarray:
         """Boolean grid of cells where the robot can stand without clipping terrain.
 
-        The body is a sphere of `radius` whose center sits `leg_length` above
-        the contact point. A cell is standable when every terrain point around
-        it stays at least `clearance` away from that sphere.
+        The body has two collision components at stance:
 
-        Distance is measured properly in 3D, not as a vertical drop. For a
-        terrain column at horizontal distance `d` with top at height `h`, the
-        nearest point to a sphere center at `c = grid[r, c] + leg_length` is
+          * a sphere of `radius` centred at `center_z = grid[r, c] + leg_length`
+            (the CoM the ballistic arc tracks);
+          * the SIDES of the leg cylinder from `foot_z + leg_length * frac` up
+            to `center_z`, radius `radius`, where `foot_z = grid[r, c]` and
+            `frac = leg_clearance_start_frac`. The BOTTOM `frac` of the leg is
+            deliberately exempt from the check — the foot is on the ground by
+            definition, and without an exempt slab any rigid-vertical-leg model
+            would condemn every graded slope. No bottom cap (no cap either at
+            the exempt-zone top): this is `open` cylinder sides, so terrain
+            below the exempt threshold does not fire the leg constraint.
 
-            d                       when h >= c  (center is inside the column's
-                                                  vertical span; nearest point
-                                                  is straight out sideways)
-            hypot(d, c - h)         otherwise    (nearest point is the top edge)
+        A cell is standable iff every terrain point around it stays at least
+        `clearance` from BOTH components.
 
-        and the clearance is that distance minus `radius`. Using a flat
-        underside instead would condemn every graded slope: on a 0.5 grade the
-        terrain 0.2 m away is 0.1 m up, which reads as only 0.1 m of vertical
-        room but is genuinely 0.32 m from the sphere center.
+        Sphere distance (unchanged from the point-mass calc): for a terrain
+        column at horizontal distance `d` with top at height `h`,
 
-        Only offsets closer than `radius + clearance` can ever fail, since
-        beyond that even an infinitely tall column is far enough, so the
+            d                       when h >= center_z
+            hypot(d, center_z - h)  otherwise
+
+        Leg-cylinder-sides distance: only fires when the column top rises into
+        the checked zone (`h >= foot_z + leg_length * frac`). When it does, the
+        column has points at horizontal distance `d` inside the cylinder's
+        z-range, so the distance to the leg axis is exactly `d`; below the
+        exempt threshold the leg check is skipped (return `+inf`).
+
+        Combined body distance = min(sphere, leg). Cell is standable iff
+        `min_dist - radius >= clearance` at every relevant offset.
+
+        Max standable constant grade with `frac=1/3` at shipped geometry
+        (L=0.4, R=0.2, MIN_CLEARANCE=0.15): `(L * frac) / (R + clearance)`
+        ≈ 0.133 / 0.35 ≈ 0.38. Anything steeper is un-standable everywhere
+        under the rigid-vertical-leg model.
+
+        Only offsets closer than `radius + clearance` can ever fail (beyond
+        that even an infinitely tall column is far enough away), so the
         neighbourhood is bounded by that. OBSTACLE columns are treated as
-        infinitely tall. Off-map neighbours are ignored (the planner does its
-        own bounds check).
+        infinitely tall. Off-map neighbours are ignored.
 
         Computed once per planner. Screening landing cells against this is far
         cheaper than discovering the same collision by marching an arc.
@@ -220,6 +238,9 @@ class Map2D5:
         padded[pad:pad + self.rows, pad:pad + self.cols] = filled
 
         center_z = self.grid + leg_length
+        # Top of the exempt slab — any neighbour column whose top rises above
+        # this triggers the leg-cylinder-sides check.
+        leg_exempt_top = self.grid + leg_length * leg_clearance_start_frac
         min_dist = np.full(self.grid.shape, np.inf)
 
         for dr in range(-r_cells, r_cells + 1):
@@ -229,11 +250,17 @@ class Map2D5:
                     continue  # too far to matter, however tall
                 h = padded[pad + dr:pad + dr + self.rows,
                            pad + dc:pad + dc + self.cols]
-                dist = np.where(
+                # Sphere at CoM.
+                sphere_dist = np.where(
                     h >= center_z,
                     d,
                     np.hypot(d, center_z - np.where(np.isneginf(h), center_z, h)),
                 )
+                # Leg cylinder sides (open, upper `1 - frac` of leg). Only fires
+                # when the column top rises into the checked zone; otherwise
+                # `+inf` so it never becomes the minimum.
+                leg_dist = np.where(h >= leg_exempt_top, d, np.inf)
+                dist = np.minimum(sphere_dist, leg_dist)
                 # Off-map neighbours (-inf) impose no constraint.
                 dist = np.where(np.isneginf(h), np.inf, dist)
                 min_dist = np.minimum(min_dist, dist)

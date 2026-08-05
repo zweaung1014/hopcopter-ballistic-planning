@@ -47,6 +47,7 @@ def main():
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
+        leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_fixed_cost=config.HOP_FIXED_COST,
         hop_scan_step=config.HOP_SCAN_STEP,
     )
@@ -64,6 +65,8 @@ def main():
         vis.draw_hop_circles(path, config.HOP_RADIUS)
         vis.draw_path(path)
     vis.draw_start_goal(config.START, config.GOAL)
+    vis.draw_robot_pose(config.START, config.ROBOT_RADIUS, config.MIN_CLEARANCE)
+    vis.draw_robot_pose(config.GOAL, config.ROBOT_RADIUS, config.MIN_CLEARANCE)
     vis.show()
 
 

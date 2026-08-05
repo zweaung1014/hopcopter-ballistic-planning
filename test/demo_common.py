@@ -178,6 +178,7 @@ def make_planner(
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
+        leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_fixed_cost=config.HOP_FIXED_COST,
         hop_scan_step=config.HOP_SCAN_STEP,
         disable_clearance=disable_clearance,
@@ -218,6 +219,7 @@ def diagnose_edge(
         (p0[0], p0[1], z0), (p1[0], p1[1], z1),
         m, planner.robot_radius, planner.leg_length,
         planner.arc_max_step, planner._obstacle_fill, planner.n_lateral,
+        min_clearance_gate=planner.min_clearance_gate,
     )
     if profile is None:
         return {"feasible": False, "standable": standable,
@@ -562,14 +564,15 @@ def save(fig, save_path: str, dpi: int = PRESENTATION_DPI) -> None:
 
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DEFAULT_OUT_DIR = os.path.join("results", "after_LS_recs")
+_DEFAULT_OUT_DIR = os.path.join("results", "with_leg_capsule_margin")
 
 
 def out_dir() -> str:
     """Directory demo artefacts are written to, created if missing.
 
-    Defaults to `results/after_LS_recs/` so a plain `python test/demo_*.py`
-    lands in the current results set.  Override with `$PLANNER_OUT_DIR`;
+    Defaults to `results/with_leg_capsule_margin/` so a plain
+    `python test/demo_*.py` lands in the current results set.
+    Override with `$PLANNER_OUT_DIR`;
     relative overrides resolve against the repo root, not the working
     directory, because the demos are documented as runnable from anywhere.
     """

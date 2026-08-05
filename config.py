@@ -59,6 +59,29 @@ HOP_FIXED_COST = 0.05  # per-hop constant added to every edge. Without it, N sho
 ROBOT_RADIUS = 0.2   # m; body radius — both lateral half-width and vertical half-height
 LEG_LENGTH = 0.4     # m; CoM height above the foot. Hop arcs start and end at
                      # `terrain_z + LEG_LENGTH`, not at terrain level.
+LEG_CLEARANCE_START_FRAC = 1.0 / 3.0
+    # Fraction of LEG_LENGTH from the foot upward that is exempt from the
+    # STANCE leg-cylinder-sides check. The lower `frac * L` slab of the leg is
+    # not required to clear terrain — the foot is on the ground by definition
+    # and requiring the lower leg to also clear terrain would condemn every
+    # non-flat cell. Only the upper `(1 - frac) * L` of the leg's sides are
+    # checked at stance (in addition to the CoM sphere).
+    #
+    # This sets the maximum standable constant grade under a rigid vertical
+    # leg. On a slope of grade `g`, the terrain at horizontal distance
+    # `R + MIN_CLEARANCE` uphill rises by `g * (R + MIN_CLEARANCE)`; the leg
+    # sides start firing at height `L * frac` above the foot, so
+    #
+    #     g_max = (L * frac) / (R + MIN_CLEARANCE)
+    #           = (0.4 * 1/3) / (0.2 + 0.15)
+    #           ≈ 0.38
+    #
+    # Anything steeper is un-standable everywhere. This is why
+    # `maps/slope_crest.py` uses grade 0.35, not the earlier 0.5.
+    #
+    # DOES NOT apply during flight: `terrain_profile` uses the full capsule
+    # (sphere + full cylinder + bottom hemisphere at the foot). The exempt
+    # slab is a stance-only relaxation.
 
 # Ballistic (parabolic hop) physics + clearance parameters
 # Based on Campana & Laumond (2016), "Ballistic motion planning."
@@ -77,9 +100,19 @@ ALPHA_MARGIN_FRAC = 0.5  # where in [alpha_min, alpha_max] the default takeoff a
                          # sits. 0.5 = Campana's max-margin midpoint. The planner
                          # escalates above this only when the gate demands it.
 ARC_SAMPLE_MAX_STEP = 0.05  # m; upper bound on sampling step along the arc's XY line
-ARC_LATERAL_SAMPLES = 3  # terrain samples across the body's width, spanning
-                         # [-ROBOT_RADIUS, +ROBOT_RADIUS] perpendicular to travel.
-                         # 1 collapses to the old point-mass centreline check.
+ARC_LATERAL_SAMPLES = 5  # terrain samples across the body's width, spanning
+                         # [-(ROBOT_RADIUS + MIN_CLEARANCE),
+                         #  +(ROBOT_RADIUS + MIN_CLEARANCE)] perpendicular to
+                         # travel. The corridor half-width includes MIN_CLEARANCE
+                         # because the leg-cylinder's safety margin extends past
+                         # the body radius. 1 collapses to a centreline-only
+                         # check.
+                         #
+                         # Bumped from 3 to 5 when the corridor widened
+                         # (ROBOT_RADIUS → ROBOT_RADIUS + MIN_CLEARANCE) so the
+                         # inter-sample gap stays ≤ 0.2 m: with 3 samples across
+                         # a 0.7 m corridor the gap is 0.35 m, wide enough for
+                         # a narrow (~20 cm) obstacle to slip through undetected.
 OBSTACLE_WALL_EXTRA = 1.5  # m; added on top of map_max_z to treat OBSTACLE cells as
                            # tall walls. Must exceed the tallest arc the robot can
                            # fly over a cell, else OBSTACLEs become jumpable:

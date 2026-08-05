@@ -80,7 +80,9 @@ sentinel value, not a real elevation. Key methods: `world_to_grid`/`grid_to_worl
 arc in one call, with obstacle cells substituted for a tall "wall" fill value so
 they block arcs instead of producing bilinear artifacts — the substituted grid is
 memoised), `get_elevation_bilinear` (scalar wrapper over it), `set_obstacle_region`,
-`paint_region`, `standable_mask`.
+`paint_region`, `standable_mask` (sphere-at-CoM + upper `(1 - LEG_CLEARANCE_START_FRAC)`
+of the leg cylinder sides — the leg-sides channel tightens the max standable
+grade from ~0.55 to ~0.38 at shipped values).
 
 **Always paint terrain with `paint_region`,** which takes world-metre bounds. Raw
 column slices (`grid[:, 10:13]`) hard-code a cell count, and `world_to_grid(...)`
@@ -143,12 +145,23 @@ neighbor generation and edge validation are non-trivial:
   `alpha_for_clearance` does not simply maximise: it takes the max-margin midpoint
   when that clears, and bisects for the shallowest sufficient angle otherwise.
   Monotonicity is what makes the bisection valid.
-- **Standability is a 3D distance, not a vertical drop.** `standable_mask`
-  measures the distance from the body sphere's centre to each terrain column. A
-  flat-underside test would reject every graded slope. The traversable-grade
-  ceiling is `sqrt((LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE))^2 - 1)`; at
-  shipped values that is 0.553, and `maps/slope_crest.py` is graded to stay under
-  it.
+- **Collision geometry is a capsule, not just a sphere, and it's checked
+  differently at stance than in flight.** The full collision volume is a
+  capsule from foot to CoM with radius `ROBOT_RADIUS`. `standable_mask`
+  (stance) checks the sphere at the CoM PLUS the upper
+  `1 - LEG_CLEARANCE_START_FRAC` of the leg cylinder sides — the bottom
+  `frac` is exempt so graded slopes stay standable. `clearance_for_alpha`
+  (flight) checks the full capsule (sphere + full cylinder + bottom
+  hemisphere at the foot), so terrain right under the foot must clear the
+  foot tip by `ROBOT_RADIUS + MIN_CLEARANCE`, not just `MIN_CLEARANCE`.
+  Near-endpoint samples where the arc has barely lifted are masked (the
+  rigid-vertical-leg model would spuriously report the foot grazing endpoint
+  terrain there); `standable_mask` handles those.
+- **Max standable grade** at shipped values is
+  `(LEG_LENGTH * LEG_CLEARANCE_START_FRAC) / (ROBOT_RADIUS + MIN_CLEARANCE)`
+  ≈ 0.38 (from `LEG_CLEARANCE_START_FRAC = 1/3`). Steeper than that is
+  un-standable everywhere. `maps/slope_crest.py` ships at grade 0.35 to stay
+  under this ceiling.
 - Instrumentation counters (`n_expansions`, `n_edge_checks`, `n_edges_accepted`) are
   reset at the top of `plan()` and read by the benchmark script.
 

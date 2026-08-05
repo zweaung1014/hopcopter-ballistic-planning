@@ -125,6 +125,7 @@ def probe(m: Map2D5, x_takeoff: float, x_landing: float, planner) -> dict:
         (p0[0], p0[1], z0), (p1[0], p1[1], z1),
         m, planner.robot_radius, planner.leg_length,
         planner.arc_max_step, planner._obstacle_fill, planner.n_lateral,
+        min_clearance_gate=planner.min_clearance_gate,
     )
     a, mc = alpha_for_clearance(
         profile, iv[0], iv[1],

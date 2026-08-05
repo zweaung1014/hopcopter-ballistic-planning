@@ -34,7 +34,15 @@ WALL_EXTRA = config.OBSTACLE_WALL_EXTRA
 # physics gate never fires and every verdict below is genuinely about clearance.
 GOAL_X = 3.2
 PILLAR_X = 2.7
-PILLAR_H = 0.9   # calibrated: see the sweep in case (1)
+PILLAR_H = 0.45  # calibrated for the capsule (bottom-cap + cylinder-side) gate.
+                 # The old sphere-only check used 0.9 and needed only the CoM to
+                 # clear the pillar top by (R + gate) = 0.35 m. The capsule check
+                 # instead requires the foot tip to clear by (R + gate), which
+                 # is L = 0.4 m stricter — so a 0.9 m pillar is un-jumpable at
+                 # every takeoff x. 0.45 restores the "only midrange clears"
+                 # sweep because the pillar's TRAILING edge (arc descending
+                 # limb) blocks far-back takeoffs and the LEADING edge (arc
+                 # hasn't risen yet) blocks close-in takeoffs.
 
 
 def _obs_fill(m: Map2D5) -> float:
@@ -66,7 +74,10 @@ def _mc_for(xs: float, goal_x: float, pillar_h: float) -> float:
     iv = feasible_alpha_interval(goal_x - xs, 0.0, config.V_MAX, G)
     if iv is None:
         return -math.inf  # infeasible counts as rejection
-    profile = terrain_profile(c_s, c_g, m, ROBOT_R, LEG, MAX_STEP, obs, N_LAT)
+    profile = terrain_profile(
+        c_s, c_g, m, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
+        min_clearance_gate=GATE,
+    )
     _alpha, mc = alpha_for_clearance(
         profile, iv[0], iv[1], GATE, config.ALPHA_MARGIN_FRAC
     )
@@ -88,8 +99,10 @@ def main() -> int:
 
     # -- Sweep takeoff distance against a fixed pillar. --
     # Both ends of the range fail, for opposite reasons: from far back the
-    # pillar sits under the arc's descending limb, from close in the arc is
-    # too flat to get over it at all. Only the middle of the range clears.
+    # pillar's trailing edge sits under the arc's descending limb, from close
+    # in the arc hasn't risen enough at the leading edge (the arc rises
+    # quadratically from takeoff, so short u ≈ short foot lift). Only the
+    # middle of the range clears both edges.
     print(f"\n(1) Fixed goal x={GOAL_X}, sweep takeoff toward pillar "
           f"(x={PILLAR_X}, h={PILLAR_H}):")
     all_ok = True
@@ -127,6 +140,7 @@ def main() -> int:
     profile = terrain_profile(
         (1.5, 1.5, 0.0), (3.5, 1.5, 0.0), m, ROBOT_R, LEG,
         MAX_STEP, _obs_fill(m), N_LAT,
+        min_clearance_gate=GATE,
     )
     _a, mc = alpha_for_clearance(profile, iv[0], iv[1], GATE, config.ALPHA_MARGIN_FRAC)
     all_ok &= _check("arc over OBSTACLE region", mc, expect_accept=False)
@@ -165,6 +179,90 @@ def main() -> int:
     ok = bool(sm[row, 2]) and not bool(sm[row, 9])
     print(f"  [{'PASS' if ok else 'FAIL'}] flat ground standable, "
           f"cell abutting a 0.8 m step is not")
+    all_ok &= ok
+
+    # -- Capsule stance/flight geometry. --
+    # These target the pieces the new leg-cylinder-sides stance check + full
+    # capsule flight check add on top of the pure-sphere model, so a
+    # regression in the capsule math shows up here even if the pillar sweep
+    # in case (1) still happens to pass.
+    print("\n(6) Capsule stance + flight geometry:")
+
+    # (6a) Leg cylinder sides catch a wider un-standable band. The old
+    # sphere-only stance ceiling admitted grades up to
+    # sqrt((LEG/(R+GATE))^2 - 1) ≈ 0.55. The new leg-cylinder-sides check
+    # brings that ceiling down to (L * frac) / (R + GATE) ≈ 0.38 — a slope
+    # at grade 0.50 sits between the two.
+    frac = 1.0 / 3.0
+    g_max_capsule = (LEG * frac) / (ROBOT_R + GATE)
+    g_max_sphere = math.sqrt((LEG / (ROBOT_R + GATE)) ** 2 - 1)
+    ok = g_max_capsule < 0.50 < g_max_sphere
+    print(f"  [{'PASS' if ok else 'FAIL'}] capsule g_max ≈ {g_max_capsule:.3f} "
+          f"< 0.50 < sphere g_max ≈ {g_max_sphere:.3f}")
+    all_ok &= ok
+    # Grade-0.35 slope: standable (under new ceiling of 0.38).
+    # Grade-0.50 slope: un-standable under the capsule check.
+    slope_ok = True
+    for grade, expect in [(0.35, True), (0.50, False)]:
+        mm = Map2D5(3.0, 2.0, 0.1)
+        for col in range(mm.cols):
+            mm.grid[:, col] = grade * ((col + 0.5) * mm.resolution)
+        sm = mm.standable_mask(ROBOT_R, GATE, LEG, leg_clearance_start_frac=frac)
+        # Interior cell, avoiding boundary effects.
+        stands_somewhere = bool(sm[mm.rows // 2, mm.cols // 2])
+        row_ok = (stands_somewhere == expect)
+        slope_ok &= row_ok
+        print(f"  [{'PASS' if row_ok else 'FAIL'}] grade {grade} slope "
+              f"{'standable' if stands_somewhere else 'un-standable'} "
+              f"(expected {'standable' if expect else 'un-standable'})")
+    all_ok &= slope_ok
+
+    # (6b) Flight-time bottom cap. A short obstacle that the CoM SPHERE
+    # clears easily but the FOOT tip does not should reject under the
+    # capsule check. Build a flat scenario with a short bump.
+    mm = Map2D5(3.0, 2.0, 0.1)
+    mm.paint_region(0.30, x_min=1.35, x_max=1.65, y_min=0.85, y_max=1.15)
+    obs = _obs_fill(mm)
+    c_s = (0.4, 1.0, 0.0)
+    c_g = (2.4, 1.0, 0.0)   # X=2.0 flat, well inside V_MAX
+    iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G)
+    prof = terrain_profile(
+        c_s, c_g, mm, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
+        min_clearance_gate=GATE,
+    )
+    _, mc_capsule = alpha_for_clearance(
+        prof, iv[0], iv[1], GATE, config.ALPHA_MARGIN_FRAC,
+    )
+    # For reference, what the sphere-only check would have said:
+    # (foot_h at bump's u would be foot_h(u_bump); the sphere check only
+    # requires z_arc(u_bump) - bump_h - ROBOT_R >= GATE, which is
+    # foot_h + LEG - bump_h - ROBOT_R >= GATE, i.e. an extra `LEG` worth of
+    # headroom on top of the bottom-cap requirement).
+    print(f"  [{'PASS' if mc_capsule >= GATE else 'FAIL'}] "
+          f"flat hop over a 0.30 m bump: mc={mc_capsule:+.3f} m -> "
+          f"{'ACCEPT' if mc_capsule >= GATE else 'REJECT'} (expected ACCEPT)")
+    all_ok &= (mc_capsule >= GATE)
+
+    # (6c) Endpoint-transition mask does not hide walls. A wall between the
+    # endpoints that the arc barely fails to clear must still register as a
+    # reject even though the near-endpoint samples are masked.
+    mm = Map2D5(3.0, 2.0, 0.1)
+    mm.paint_region(1.10, x_min=1.35, x_max=1.65, y_min=0.85, y_max=1.15)
+    obs = _obs_fill(mm)
+    c_s = (0.4, 1.0, 0.0)
+    c_g = (2.4, 1.0, 0.0)
+    iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G)
+    prof = terrain_profile(
+        c_s, c_g, mm, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
+        min_clearance_gate=GATE,
+    )
+    _, mc_wall = alpha_for_clearance(
+        prof, iv[0], iv[1], GATE, config.ALPHA_MARGIN_FRAC,
+    )
+    ok = mc_wall < GATE
+    print(f"  [{'PASS' if ok else 'FAIL'}] flat hop over a 1.10 m wall: "
+          f"mc={mc_wall:+.3f} m -> "
+          f"{'ACCEPT' if mc_wall >= GATE else 'REJECT'} (expected REJECT)")
     all_ok &= ok
 
     print("\n" + ("ALL PASSED" if all_ok else "SOME FAILED"))

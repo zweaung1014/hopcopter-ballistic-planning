@@ -7,26 +7,32 @@ along each arc.
 Profile (applied to ALL rows — the full y-span means no lateral bypass, so the
 robot has to climb):
 
-    x ∈ [0.0, 0.9)    z = 0.00                    approach apron
-    x ∈ [0.9, 3.0]    z = 0.00 → 1.05  linear     ramp, grade 0.50
+    x ∈ [0.0, 3.0]    z = 0.00 → 1.05  linear     ramp, grade 0.35
     x ∈ (3.0, 3.3]    z = 1.05                    crest — LOCAL MAXIMUM
     x ∈ (3.3, 3.7)    z = 1.05 → 0.20  linear     back side of the brow
     x ∈ [3.7, 5.0]    z = 0.20                    far shelf (goal sits here)
 
-Why the ramp grade is 0.50
+Why the ramp grade is 0.35
 --------------------------
 There is a hard ceiling on how steep a slope this robot can stand on. Its body
-is a sphere of `ROBOT_RADIUS` centred `LEG_LENGTH` above the foot, so on a
-constant grade `g` the nearest terrain point sits `LEG_LENGTH / sqrt(1 + g^2)`
-from the centre. Requiring that to exceed `ROBOT_RADIUS + MIN_CLEARANCE` gives
+is a sphere of `ROBOT_RADIUS` PLUS the upper `(1 - LEG_CLEARANCE_START_FRAC)`
+of a leg cylinder of the same radius. On a constant grade `g`, the terrain
+`(R + MIN_CLEARANCE)` metres uphill of the foot rises by `g * (R + MIN_CLEARANCE)`.
+The leg-cylinder-sides check kicks in whenever that rise exceeds
+`L * LEG_CLEARANCE_START_FRAC` (the exempt-slab height), so
 
-    g_max = sqrt((LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE))^2 - 1) = 0.553
+    g_max = (L * LEG_CLEARANCE_START_FRAC) / (R + MIN_CLEARANCE)
+          = (0.4 * 1/3) / (0.2 + 0.15)
+          ≈ 0.38
 
 At the shipped geometry anything steeper is un-standable everywhere, and the
-planner returns no path at all. The original 0.75 grade sat well past that, so
-the ramp toe moves from x = 1.6 to x = 0.9 to spread the same 1.05 m climb over
-a 0.50 grade. (`Map2D5.standable_mask` verifies this empirically: 0.55 is 100%
-standable, 0.60 is 0%.)
+planner returns no path at all. The ramp toe therefore reaches all the way to
+x = 0.0 (spreading the 1.05 m climb over 3.0 m for a 0.35 grade), leaving a
+0.03 slack under the 0.38 ceiling. (`Map2D5.standable_mask` verifies this
+empirically.)
+
+The earlier sphere-only stance model allowed `g_max = 0.553`, so this map used
+to ship at 0.50; the leg-cylinder check tightens the ceiling significantly.
 
 Why the crest overshoots the shelf
 ----------------------------------
@@ -63,15 +69,17 @@ import config
 from map2d5 import Map2D5
 
 # --- profile constants (exported so demos can draw reference lines) ---------
-RAMP_X0  = 0.9    # m; ramp toe
+RAMP_X0  = 0.0    # m; ramp toe (starts at the map's left edge)
 RAMP_X1  = 3.0    # m; ramp shoulder / start of crest
 CREST_Z  = 1.05   # m; crest elevation — the local maximum
 CREST_X1 = 3.3    # m; end of the flat crest
 TOP_X0   = 3.7    # m; start of the far shelf
 TOP_Z    = 0.20   # m; far shelf elevation (calibrated; see module docstring)
 
-RAMP_GRADE = CREST_Z / (RAMP_X1 - RAMP_X0)   # 0.50 — see docstring on the
-                                             # 0.553 standability ceiling
+RAMP_GRADE = CREST_Z / (RAMP_X1 - RAMP_X0)   # 0.35 — stays under the 0.38
+                                             # standability ceiling that comes
+                                             # from the leg-cylinder-sides
+                                             # stance check.
 
 
 def profile_z(x: float) -> float:

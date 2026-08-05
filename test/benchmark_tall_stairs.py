@@ -61,6 +61,7 @@ def make_planner(m: Map2D5, disable_clearance: bool) -> HoppingAStarPlanner:
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
+        leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_fixed_cost=config.HOP_FIXED_COST,
         hop_scan_step=config.HOP_SCAN_STEP,
         disable_clearance=disable_clearance,

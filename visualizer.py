@@ -34,18 +34,21 @@ def draw_arc_side_view(
     in demo scripts).
 
     `c_s`/`c_g` carry *terrain* heights; the plotted arc is the CoM
-    trajectory, running between `terrain + leg_length` at each end.
+    trajectory, running between `terrain + leg_length` at each end. The foot
+    tip trajectory (`arc - leg_length`) and the bottom-cap envelope
+    (`arc - leg_length - min_clearance_gate`) are also drawn — the bottom
+    envelope is the surface the gate is really testing against.
 
     Drawing:
       * terrain profile filled in brown along `u in [0, X]` — this is the
-        *swept-corridor* profile (max across the body's width), which is what
-        the gate actually tests, so a ridge beside the centreline shows up;
-      * parabolic arc (Campana Eq. 2) as a line, green when the whole arc
-        clears the gate, red when any sample falls below it;
-      * the body's underside as a dashed line `robot_radius` below the arc —
-        clearance is the gap between that and the terrain;
-      * a marker at the minimum-clearance sample plus an annotation of the
-        clearance and `alpha_s`.
+        max-across-corridor profile (an upper bound on what the gate sees);
+      * CoM arc as a line, green when the whole capsule clears the gate,
+        red when any sample falls below it;
+      * foot-tip line = `arc - leg_length` (the axis-segment bottom);
+      * bottom-cap envelope = `arc - leg_length - min_clearance_gate` (dashed):
+        the envelope terrain must stay below to satisfy the gate directly
+        under the foot;
+      * marker at the min-clearance sample and an α / clearance annotation.
     """
     x_s, y_s, t_s = c_s
     x_g, y_g, t_g = c_g
@@ -76,7 +79,8 @@ def draw_arc_side_view(
     if n_lateral <= 1:
         offsets = np.zeros(1)
     else:
-        offsets = np.linspace(-robot_radius, robot_radius, n_lateral)
+        corridor = robot_radius + min_clearance_gate
+        offsets = np.linspace(-corridor, corridor, n_lateral)
     cx = x_s + us * cos_t
     cy = y_s + us * sin_t
     px = cx[:, None] - offsets[None, :] * sin_t
@@ -89,41 +93,62 @@ def draw_arc_side_view(
               (cy < 0.0) | (cy >= height_map.size_y)
     z_terr = np.where(off_map, obstacle_fill, z_terr)
 
-    clearance = z_arc - z_terr - robot_radius
+    # Foot tip and bottom-cap envelope. The gate directly under the foot is
+    # `robot_radius + min_clearance_gate` below the foot tip, since the
+    # bottom hemisphere of the capsule has radius `robot_radius`. Terrain
+    # touching the bottom envelope is the tightest thing this dense
+    # (max-collapsed) plot can flag.
+    z_foot = z_arc - leg_length
+    z_bottom_env = z_foot - min_clearance_gate
 
     # Authoritative value from the planner's own function, so the displayed
     # number matches exactly what the A* gate would evaluate.
     profile = terrain_profile(
         c_s, c_g, height_map, robot_radius, leg_length,
         max_step, obstacle_fill, n_lateral,
+        min_clearance_gate=min_clearance_gate,
     )
     min_c = math.inf if profile is None else clearance_for_alpha(profile, alpha_s)
 
-    min_idx = int(np.argmin(clearance))
+    # Sample where the bottom-envelope hits the closest to terrain in the
+    # side view — this marker is a visual proxy for the tightest bottom-cap
+    # sample the capsule check would report.
+    display_clear = z_bottom_env - z_terr
+    if display_clear.size >= 2:
+        display_clear = display_clear.copy()
+        display_clear[0] = np.inf
+        display_clear[-1] = np.inf
+    min_idx = int(np.argmin(display_clear))
     rejected = min_c < min_clearance_gate
     arc_colour = "#c62828" if rejected else "#2e7d32"
 
     # --- draw ---
     ax.fill_between(
-        us, z_terr, min(z_terr.min(), (z_arc - robot_radius).min()) - 0.1,
-        color="#8d6e63", alpha=0.55, linewidth=0, label="Terrain (swept)",
+        us, z_terr, min(z_terr.min(), z_bottom_env.min()) - 0.1,
+        color="#8d6e63", alpha=0.55, linewidth=0, label="Terrain (max in corridor)",
     )
     ax.plot(
         us, z_arc,
         color=arc_colour, linewidth=2.0,
         label=(label or ("Arc (rejected)" if rejected else "Arc (clears)")),
     )
-    # Underside of the body — the surface the gate is actually measuring.
+    # Foot tip: the axis-segment bottom of the capsule.
     ax.plot(
-        us, z_arc - robot_radius,
+        us, z_foot,
+        color=arc_colour, linewidth=1.0, linestyle="-", alpha=0.6,
+        label=f"Foot tip (arc − L, L={leg_length} m)",
+    )
+    # Bottom-cap envelope: the surface the gate needs the terrain to stay below.
+    ax.plot(
+        us, z_bottom_env,
         color=arc_colour, linewidth=1.0, linestyle="--", alpha=0.6,
-        label=f"Body underside (r={robot_radius} m)",
+        label=f"Bottom-cap envelope (foot − gate, gate={min_clearance_gate} m)",
     )
     # Clearance marker at the tightest sample.
     ax.plot([us[min_idx], us[min_idx]],
-            [z_arc[min_idx] - robot_radius, z_terr[min_idx]],
+            [z_bottom_env[min_idx], z_terr[min_idx]],
             color=arc_colour, linewidth=1.2, linestyle=":")
-    ax.plot(us[min_idx], z_arc[min_idx] - robot_radius, "o",
+    ax.plot(us[min_idx], z_bottom_env[min_idx], "o",
             color=arc_colour, markersize=5)
 
     verdict = "REJECT" if rejected else "ACCEPT"
@@ -241,6 +266,40 @@ class Visualizer:
         """Draw start and goal markers."""
         self.ax.plot(start[0], start[1], "go", markersize=10, label="Start")
         self.ax.plot(goal[0], goal[1], "r*", markersize=15, label="Goal")
+
+    def draw_robot_pose(
+        self,
+        pose: tuple[float, float],
+        robot_radius: float,
+        min_clearance: float,
+    ):
+        """Overlay top-down body and clearance envelope at a pose.
+
+        Two concentric rings: the inner one is the body (`robot_radius`), the
+        outer one is the safety envelope the leg-cylinder-sides check widens
+        to (`robot_radius + min_clearance`). Placed at start and goal to make
+        the scale of the collision volume visible relative to the map.
+        """
+        x, y = pose
+        body = mpatches.Circle(
+            (x, y), radius=robot_radius,
+            fill=False, edgecolor="#1565c0", linewidth=1.4, alpha=0.9,
+            label=f"Robot body (r={robot_radius} m)",
+        )
+        env = mpatches.Circle(
+            (x, y), radius=robot_radius + min_clearance,
+            fill=False, edgecolor="#1565c0", linewidth=0.8,
+            linestyle="--", alpha=0.6,
+            label=f"Clearance envelope (+{min_clearance} m)",
+        )
+        # Only label once so the legend doesn't accumulate duplicates when the
+        # method is called for start AND goal.
+        if getattr(self, "_pose_drawn", False):
+            body.set_label(None)
+            env.set_label(None)
+        self.ax.add_patch(body)
+        self.ax.add_patch(env)
+        self._pose_drawn = True
 
     def show(self):
         """Display the plot."""

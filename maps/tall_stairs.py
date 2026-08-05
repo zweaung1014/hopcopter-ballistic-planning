@@ -17,10 +17,12 @@ grid only samples the same terrain more finely.
 What the gates do here
 ----------------------
 The 0.4 m risers are well inside the leg's budget, so the physics gate is
-inert. What bites instead is the *stance* check: the robot's body has radius
-`ROBOT_RADIUS`, so it cannot stand within that distance of a riser without
-overlapping it. That carves an un-standable band in front of each step, and
-the planner has to place its takeoff outside those bands — which is what
+inert. What bites instead is the *stance* check. The robot's body is a sphere
+of `ROBOT_RADIUS` at the CoM plus the upper `(1 - LEG_CLEARANCE_START_FRAC)`
+of a leg cylinder of the same radius, so the un-standable band in front of
+each riser is `ROBOT_RADIUS + MIN_CLEARANCE = 0.35 m` wide (the leg cylinder
+sides widen it from just `ROBOT_RADIUS` to `ROBOT_RADIUS + MIN_CLEARANCE`).
+The planner has to place its takeoff outside those bands — which is what
 separates the ballistic path from the clearance-disabled baseline.
 """
 
