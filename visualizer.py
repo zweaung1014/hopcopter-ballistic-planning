@@ -127,11 +127,10 @@ def draw_arc_side_view(
             color=arc_colour, markersize=5)
 
     verdict = "REJECT" if rejected else "ACCEPT"
-    ax.set_title(
-        f"α={math.degrees(alpha_s):.1f}°   clearance={min_c:+.3f} m   "
-        f"[{verdict} @ {min_clearance_gate:.2f} m]",
-        fontsize=9,
-    )
+    # Deliberately terse: these titles sit above panels that can be under 2.5 in
+    # wide in a multi-hop strip. The gate value is stated once in the figure's
+    # suptitle, so repeating it per panel is what overflows the layout.
+    ax.set_title(f"{verdict}   {min_c:+.3f} m\nα = {math.degrees(alpha_s):.1f}°")
     ax.set_xlabel("u (m along XY segment)")
     ax.set_ylabel("z (m)")
     ax.set_xlim(0, X)
@@ -206,7 +205,7 @@ class Visualizer:
         sm = cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
         cbar = self.fig.colorbar(sm, ax=self.ax, fraction=0.03, pad=0.02)
-        cbar.set_label("Elevation (m)", fontsize=9)
+        cbar.set_label("Elevation (m)")
 
         # Add obstacle legend patch
         self._obstacle_patch = mpatches.Patch(facecolor="black", alpha=0.85, label="Obstacle")

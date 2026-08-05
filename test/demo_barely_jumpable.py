@@ -26,11 +26,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import matplotlib.patches as mpatches
 import numpy as np
 
 import config
 from demo_common import (
+    SLIDE_FIGSIZE, TOPDOWN_FIGSIZE, arcs_figsize,
     HOP_RADIUS, N_ANGLES, V_MAX,
     PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
     make_planner, diagnose_edge, n_bad_hops, param_caption, save, out_path
@@ -88,7 +90,7 @@ def draw_topdown(
     diags_base: list,
     save_path: str,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(10, 9))
+    fig, ax = plt.subplots(figsize=TOPDOWN_FIGSIZE)
     vis = Visualizer.__new__(Visualizer)
     vis.map_env = m
     vis.fig = fig
@@ -126,7 +128,7 @@ def draw_topdown(
             ax.annotate(
                 f"COLLIDES\nmc={d['mc']:+.3f} m",
                 (mx, my), xytext=(0, 24), textcoords="offset points",
-                ha="center", fontsize=9, color="#b71c1c", fontweight="bold",
+                ha="center", color="#b71c1c", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.25", fc="white",
                           ec="#b71c1c", lw=1.2), zorder=11,
             )
@@ -141,12 +143,10 @@ def draw_topdown(
     # Waypoint labels
     for i, p in enumerate(path_base):
         ax.annotate(f"B{i}\n{distance_to_wall(p):.2f}m", p,
-                    xytext=(6, -14), textcoords="offset points",
-                    fontsize=7, color="#e65100")
+                    xytext=(6, -14), textcoords="offset points", color="#e65100")
     for i, p in enumerate(path_ball):
         ax.annotate(f"A{i}\n{distance_to_wall(p):.2f}m", p,
-                    xytext=(6, 6), textcoords="offset points",
-                    fontsize=7, color="#00695c")
+                    xytext=(6, 6), textcoords="offset points", color="#00695c")
 
     # Arrow showing x-shift at crossing
     base_idx = wall_crossing_hop(path_base, m)
@@ -159,8 +159,7 @@ def draw_topdown(
             ax.annotate(
                 f"← {shift:.2f} m left\n(ballistic steps back\nfor arc clearance)",
                 xy=(ax_x, ay), xytext=(bx + 0.15, ay + 0.50),
-                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.5),
-                fontsize=9, color="#1565c0", fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.5), color="#1565c0", fontweight="bold",
             )
 
     ax.plot(START[0], START[1], "go", markersize=11, zorder=10, label="start")
@@ -169,13 +168,12 @@ def draw_topdown(
     handles, labels = ax.get_legend_handles_labels()
     handles.append(mpatches.Patch(color="#d50000", alpha=0.65))
     labels.append("baseline hop fails the clearance gate")
-    ax.legend(handles, labels, loc="upper left", fontsize=8)
+    ax.legend(handles, labels, loc="upper left")
     ax.set_title(
         f"barely_jumpable_wall: baseline vs ballistic\n"
-        f"wall x=[{WALL_XMIN},{WALL_XMAX}] h={WALL_HEIGHT} m  |  "
+        f"wall x=[{WALL_XMIN},{WALL_XMAX}] h={WALL_HEIGHT:.2f} m  |  "
         f"clearance threshold H_clear={H_CLEAR:.2f} m\n"
-        f"ballistic backs off 0.4 m so wall falls at arc midpoint (u=0.6–1.0 m)",
-        fontsize=11,
+        f"ballistic backs off 0.4 m so wall falls at arc midpoint (u=0.6–1.0 m)", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)
@@ -198,7 +196,7 @@ def draw_arc_strip(
     n_base = len(path_base) - 1
     n_ball = len(path_ball) - 1
     ncols  = max(n_base, n_ball)
-    fig, axes = plt.subplots(2, ncols, figsize=(3.8 * ncols, 5.8), squeeze=False)
+    fig, axes = plt.subplots(2, ncols, figsize=arcs_figsize(ncols), squeeze=False)
 
     obs_fill = ballistic_planner._obstacle_fill
     ymax     = max(WALL_HEIGHT + 0.35, 0.55)
@@ -215,8 +213,7 @@ def draw_arc_strip(
             d = diags[i]
             if not d["feasible"]:
                 ax.set_facecolor("#fbe9e7")
-                ax.text(0.5, 0.5, "INFEASIBLE", ha="center", va="center",
-                        fontsize=9, transform=ax.transAxes)
+                ax.text(0.5, 0.5, "INFEASIBLE", ha="center", va="center", transform=ax.transAxes)
                 ax.set_xticks([])
                 ax.set_yticks([])
             else:
@@ -240,24 +237,23 @@ def draw_arc_strip(
                     ax.axhline(H_CLEAR, color="#f57f17", linewidth=1.2,
                                linestyle=":", zorder=4)
                     ax.text(0.02, H_CLEAR + 0.01, f"H_clear={H_CLEAR:.2f}m",
-                            transform=ax.get_yaxis_transform(),
-                            fontsize=7, color="#f57f17", va="bottom")
+                            transform=ax.get_yaxis_transform(), color="#f57f17", va="bottom")
 
             if i == 0:
-                ax.set_ylabel(f"{row_label}\nz (m)", fontsize=10)
-            ax.set_xlabel(
-                f"hop {i}: ({path[i][0]:.1f},{path[i][1]:.1f})"
-                f" → ({path[i+1][0]:.1f},{path[i+1][1]:.1f})",
-                fontsize=8,
-            )
+                ax.set_ylabel(f"{row_label}\nz (m)")
+            # Terse: at 5 panels across a slide each is under 2.7 in wide, so
+            # the full coordinate pair does not fit. x tells the story here —
+            # the hops all run along a constant y.
+            ax.set_xlabel(f"hop {i}   {path[i][0]:.1f}→{path[i+1][0]:.1f} m")
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
 
     fig.suptitle(
         f"Per-hop side view — baseline (top) vs ballistic (bottom)\n"
-        f"Orange dotted = H_clear={H_CLEAR:.2f} m.  "
-        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate.  Green arc = clears.",
-        fontsize=11,
+        f"orange dotted = H_clear {H_CLEAR:.2f} m  ·  "
+        f"red = below the {config.MIN_CLEARANCE} m gate", wrap=True
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.91))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     save(fig, save_path)
     plt.close(fig)
 
@@ -294,7 +290,7 @@ def draw_crossing_comparison(
         return
 
     fig, axes = plt.subplots(len(rows), 1,
-                             figsize=(10, 4.8 * len(rows)),
+                             figsize=SLIDE_FIGSIZE,
                              squeeze=False)
 
     for ax, (panel_label, path, diags, hi, planner) in zip(axes[:, 0], rows):
@@ -364,25 +360,23 @@ def draw_crossing_comparison(
                         ax.text(
                             u_tight + 0.04,
                             0.5 * (y_bot + y_top),
-                            f"Δz = {gap:+.3f} m",
-                            fontsize=9, color="#0277bd", va="center",
+                            f"Δz = {gap:+.3f} m", color="#0277bd", va="center",
                             fontweight="bold",
                         )
                 except Exception:
                     pass
 
         ax.set_ylim(-0.05, max(WALL_HEIGHT + 0.30, 0.60))
-        ax.set_xlabel("u  —  horizontal distance from takeoff (m)", fontsize=11)
-        ax.set_ylabel("z  (m)", fontsize=11)
-        ax.legend(fontsize=9, loc="upper right")
+        ax.set_xlabel("u  —  horizontal distance from takeoff (m)")
+        ax.set_ylabel("z  (m)")
+        ax.legend(loc="upper right")
         # Override the title set internally by draw_arc_side_view
         ax.set_title(
             f"{panel_label}\n"
             f"hop  ({p0[0]:.2f}, {p0[1]:.2f}) → ({p1[0]:.2f}, {p1[1]:.2f})     "
             f"X = {d['X']:.2f} m     "
             f"α_s = {math.degrees(d['alpha_s']):.1f}°     "
-            f"mc = {d['mc']:+.4f} m",
-            fontsize=10,
+            f"mc = {d['mc']:+.4f} m", wrap=True
         )
 
     fig.suptitle(
@@ -390,10 +384,9 @@ def draw_crossing_comparison(
         f"Wall  h = {WALL_HEIGHT:.2f} m,   robot_radius = {config.ROBOT_RADIUS:.2f} m,   "
         f"H_clear = {H_CLEAR:.2f} m,   arc apex ≈ 0.400 m\n"
         f"Baseline (top): arc clips through wall  |  "
-        f"Ballistic (bottom): arc clears with Δz ≈ +0.055 m",
-        fontsize=12,
+        f"Ballistic (bottom): arc clears with Δz ≈ +0.055 m", wrap=True
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.88))
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
     save(fig, save_path)
     plt.close(fig)
 
@@ -403,6 +396,7 @@ def draw_crossing_comparison(
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    print(param_caption())
     m = build_map()
 
     planner_base = make_planner(m, True, START, GOAL)

@@ -11,8 +11,11 @@ deliberately overrides `config.HOP_RADIUS` (1.0) because the deck's scenarios ar
 laid out for a 1.5 m hop, and the whole suite must quote one set of numbers or the
 "one planner, many behaviours" story falls apart.  Everything else — crucially
 `V_MAX` — comes from `config.py`, since the robot's capability is now derived
-from `MAX_APEX_HEIGHT` rather than tuned per demo.  Print them on every figure
-via `param_caption()`.
+from `MAX_APEX_HEIGHT` rather than tuned per demo.  `param_caption()` renders
+them for the console.
+
+Text size for every figure in the deck is set once here — see the styling block
+below before adding any `fontsize=` argument to a demo.
 """
 
 import math
@@ -43,11 +46,66 @@ HOP_RADIUS = 1.5
 N_ANGLES   = 16
 V_MAX      = config.V_MAX   # derived from MAX_APEX_HEIGHT; 4.85 m/s
 
-# Figure styling, sized for projection rather than for reading on a laptop.
-PRESENTATION_DPI = 140
-TITLE_FS = 13
-LABEL_FS = 11
-ANNOT_FS = 8
+# ---------------------------------------------------------------------------
+# Figure styling — sized to be read off a projected slide, not a laptop screen.
+#
+# These three constants plus the rcParams block below are the ONLY place text
+# size is set. Every demo imports this module, so this is the single lever.
+#
+# If you add a `fontsize=` argument anywhere in a demo it OVERRIDES rcParams and
+# silently opts that element out of this lever — which is exactly how the deck
+# ended up with 66 hardcoded sizes that no longer agreed with each other. Only
+# pass a size when the element genuinely needs to differ from the hierarchy.
+#
+# Sizes assume a canvas around 13.3 x 7.5 in (a full 16:9 slide). The smallest
+# text, ANNOT_FS, is ~2.6% of that canvas height, which stays legible when
+# projected.
+# ---------------------------------------------------------------------------
+PRESENTATION_DPI = 200
+TITLE_FS = 22    # suptitles and the single-axes figure titles
+LABEL_FS = 17    # axis labels, per-panel titles
+ANNOT_FS = 14    # in-plot annotations, legends, tick labels
+PANEL_TITLE_FS = 15   # titles above the small panels of a multi-hop strip, where
+                      # a full-size axes title would collide with its neighbour
+
+plt.rcParams.update({
+    "font.size":        ANNOT_FS,
+    "axes.titlesize":   PANEL_TITLE_FS,
+    "axes.labelsize":   LABEL_FS,
+    "xtick.labelsize":  ANNOT_FS,   # never styled before this — used to stay at 10 pt
+    "ytick.labelsize":  ANNOT_FS,
+    "legend.fontsize":  ANNOT_FS,
+    "figure.titlesize": TITLE_FS,
+})
+
+# Canvas that drops onto a 16:9 slide at 100% — no downscaling, so the text
+# lands at the size it was rendered.
+SLIDE_FIGSIZE = (13.33, 7.5)
+
+# Top-down maps are drawn with equal aspect on a square 5 x 5 m grid, so a 16:9
+# canvas would only add dead margin either side. This fits a 7.5 in slide height
+# at ~94% with room for the title and colourbar.
+TOPDOWN_FIGSIZE = (10.0, 8.0)
+
+
+def arcs_figsize(ncols: int) -> tuple[float, float]:
+    """Canvas for a 2-row per-hop arc strip with `ncols` hops.
+
+    Fixed at the slide canvas so the figure needs no downscaling in PowerPoint —
+    which is what used to shrink the text. The strips previously grew their
+    width with the panel count (`3.8 * ncols`), so a five-hop path produced a
+    19.5 in canvas that PowerPoint then squashed to 68%, undoing any font
+    increase.
+
+    Panel count is data-dependent and has already swung between 3 and 5 between
+    runs, so past ~5 panels the canvas does have to widen or the panels become
+    unreadably narrow; the slide then takes a downscale, which is the lesser
+    evil.
+    """
+    # 2.95 rather than a tight 2.7: panel titles are centred on their axes and
+    # overhang it slightly, so the last column needs margin to overhang into or
+    # it gets clipped at the canvas edge.
+    return (max(SLIDE_FIGSIZE[0], 2.95 * ncols), SLIDE_FIGSIZE[1])
 
 # Colour vocabulary — consistent across every figure in the deck.
 C_BASE    = "#e65100"   # baseline path (clearance OFF)
@@ -66,7 +124,13 @@ TIGHT_BAND = 0.05
 
 
 def param_caption() -> str:
-    """One-line physics summary to stamp on every figure."""
+    """One-line physics summary of the run.
+
+    Printed to stdout by each demo rather than stamped on the figures: at
+    presentation type size this is ~150 characters of parameter soup that
+    crowds out the actual title, and nobody reads eight parameters off a
+    projected slide. The values are also recorded in the results README.
+    """
     return (
         f"hop_radius={HOP_RADIUS} m · V_max={V_MAX:.2f} m/s "
         f"(apex {config.MAX_APEX_HEIGHT} m) · leg={config.LEG_LENGTH} m · "
@@ -378,8 +442,8 @@ def draw_topdown_base(m: Map2D5, fig, ax) -> None:
     ax.set_xlim(0, m.size_x)
     ax.set_ylim(0, m.size_y)
     ax.set_aspect("equal")
-    ax.set_xlabel("X (m)", fontsize=LABEL_FS)
-    ax.set_ylabel("Y (m)", fontsize=LABEL_FS)
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
     vis.draw_map()
 
 
@@ -411,11 +475,11 @@ def draw_topdown_compact(m: Map2D5, ax, colorbar_on=None) -> None:
     ax.set_xlim(0, m.size_x)
     ax.set_ylim(0, m.size_y)
     ax.set_aspect("equal")
-    ax.set_xlabel("X (m)", fontsize=LABEL_FS)
-    ax.set_ylabel("Y (m)", fontsize=LABEL_FS)
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
     if colorbar_on is not None:
         cbar = colorbar_on.colorbar(im, ax=ax, fraction=0.036, pad=0.02)
-        cbar.set_label("Elevation (m)", fontsize=ANNOT_FS)
+        cbar.set_label("Elevation (m)")
     return im
 
 
@@ -466,7 +530,7 @@ def draw_ab_paths(
                     f"COLLIDES\nmc={d['mc']:+.3f} m",
                     (0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])),
                     xytext=(0, 24), textcoords="offset points",
-                    ha="center", fontsize=ANNOT_FS + 1, color="#b71c1c",
+                    ha="center", color="#b71c1c",
                     fontweight="bold",
                     bbox=dict(boxstyle="round,pad=0.25", fc="white",
                               ec="#b71c1c", lw=1.2), zorder=11,
@@ -488,7 +552,7 @@ def add_collision_legend(ax, extra: list | None = None) -> None:
         patches.extend(extra)
     ax.legend(handles + patches,
               labels + [p.get_label() for p in patches],
-              loc="upper left", fontsize=ANNOT_FS)
+              loc="upper left")
 
 
 def save(fig, save_path: str, dpi: int = PRESENTATION_DPI) -> None:

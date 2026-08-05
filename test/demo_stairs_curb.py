@@ -32,10 +32,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import matplotlib.patches as mpatches
 
 import config
 from demo_common import (
+    SLIDE_FIGSIZE, TOPDOWN_FIGSIZE, arcs_figsize,
     HOP_RADIUS, PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
     C_BASE, C_BALL, C_COLLIDE, C_ACCEPT, C_REJECT, C_CHOSEN,
     make_planner, diagnose_path, n_bad_hops,
@@ -77,25 +79,26 @@ GATE_LABEL = {
 # ---------------------------------------------------------------------------
 
 def draw_topdown(m, path_base, path_ball, diags_base, save_path):
-    fig, ax = plt.subplots(figsize=(11, 9))
+    fig, ax = plt.subplots(figsize=TOPDOWN_FIGSIZE)
     draw_topdown_base(m, fig, ax)
 
-    for x_bnd, cz, tz, col in CURBS:
+    # Stagger the three curb labels vertically: at presentation type size they
+    # are wider than the 0.2 m gap between the curbs they annotate.
+    for k, (x_bnd, cz, tz, col) in enumerate(CURBS):
         ax.axvline(x_bnd, color=col, linewidth=1.6, linestyle="--",
                    alpha=0.8, zorder=4)
-        ax.text(x_bnd + 0.03, 0.12, f"curb z={cz}\n(tread {tz})",
-                color=col, fontsize=ANNOT_FS - 1, va="bottom", zorder=5)
+        ax.text(x_bnd + 0.04, 0.15 + 0.42 * k, f"curb {cz:.2f}",
+                color=col, va="bottom", zorder=5,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.7))
 
     draw_ab_paths(ax, path_base, path_ball, diags_base)
 
     for i, p in enumerate(path_base):
         ax.annotate(f"B{i}\nz={m.get_elevation(*p):.2f}", p,
-                    xytext=(-20, -20), textcoords="offset points",
-                    fontsize=ANNOT_FS - 1, color=C_BASE, zorder=10)
+                    xytext=(-20, -20), textcoords="offset points", color=C_BASE, zorder=10)
     for i, p in enumerate(path_ball):
         ax.annotate(f"A{i}\nz={m.get_elevation(*p):.2f}", p,
-                    xytext=(6, 8), textcoords="offset points",
-                    fontsize=ANNOT_FS - 1, color=C_BALL, zorder=10)
+                    xytext=(6, 8), textcoords="offset points", color=C_BALL, zorder=10)
 
     ax.plot(*START, "go", markersize=11, zorder=11, label="start  z=0.00")
     ax.plot(*GOAL, "r*", markersize=15, zorder=11,
@@ -103,11 +106,9 @@ def draw_topdown(m, path_base, path_ball, diags_base, save_path):
     add_collision_legend(ax)
 
     ax.set_title(
-        f"stairs_with_curb: each tread edge stands {CURB_RISE:.2f} m proud\n"
-        "Curbs are local maxima under the descending limb of an incoming arc, "
-        "so flat approaches are rejected on clearance\n"
-        f"{param_caption()}",
-        fontsize=TITLE_FS - 2,
+        f"stairs_with_curb — each tread edge stands {CURB_RISE:.2f} m proud\n"
+        "curbs sit under the descending limb, so flat\n"
+        "approaches are rejected on clearance", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)
@@ -121,7 +122,7 @@ def draw_topdown(m, path_base, path_ball, diags_base, save_path):
 def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball,
                    save_path):
     ncols = max(len(path_base), len(path_ball)) - 1
-    fig, axes = plt.subplots(2, ncols, figsize=(3.9 * ncols, 6.0), squeeze=False)
+    fig, axes = plt.subplots(2, ncols, figsize=arcs_figsize(ncols), squeeze=False)
     obs_fill = planner_ball._obstacle_fill
     ymax = CURB3_Z + 0.45
 
@@ -138,7 +139,7 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
             if not d["feasible"]:
                 ax.set_facecolor("#fbe9e7")
                 ax.text(0.5, 0.5, "INFEASIBLE\n(physics gate)", ha="center",
-                        va="center", fontsize=9, transform=ax.transAxes)
+                        va="center", transform=ax.transAxes)
                 ax.set_xticks([]); ax.set_yticks([])
             else:
                 p0, p1 = path[i], path[i + 1]
@@ -155,20 +156,18 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
                                alpha=0.8, zorder=4)
 
             if i == 0:
-                ax.set_ylabel(f"{row_label}\nz (m)", fontsize=LABEL_FS)
-            ax.set_xlabel(
-                f"hop {i}: ({path[i][0]:.1f},{path[i][1]:.1f})"
-                f" → ({path[i+1][0]:.1f},{path[i+1][1]:.1f})",
-                fontsize=ANNOT_FS,
-            )
+                ax.set_ylabel(f"{row_label}\nz (m)")
+            # Terse: at 5 panels across a slide each is under 2.7 in wide.
+            ax.set_xlabel(f"hop {i}   {path[i][0]:.1f}→{path[i+1][0]:.1f} m")
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
 
     fig.suptitle(
         "Per-hop side view — baseline (top) vs ballistic (bottom)\n"
-        f"Dotted: curb elevations {CURB1_Z} / {CURB2_Z} / {CURB3_Z} m · "
-        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate · Green = clears",
-        fontsize=TITLE_FS - 2,
+        f"curbs at {CURB1_Z:.2f} / {CURB2_Z:.2f} / {CURB3_Z:.2f} m  ·  "
+        f"red = below the {config.MIN_CLEARANCE} m gate", wrap=True
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     save(fig, save_path)
     plt.close(fig)
 
@@ -215,8 +214,7 @@ def draw_ring_panels(m, planner_ball, path_ball, interesting, save_path):
         # title, and matplotlib draws left- and center-aligned titles at the
         # same height, so the two would overlap.
         all_axes[panel_row, 0].text(
-            0.0, 1.34, row_label, transform=all_axes[panel_row, 0].transAxes,
-            fontsize=ANNOT_FS + 1, color="#1a237e", fontweight="bold",
+            0.0, 1.34, row_label, transform=all_axes[panel_row, 0].transAxes, color="#1a237e", fontweight="bold",
             va="bottom", ha="left",
         )
 
@@ -226,7 +224,7 @@ def draw_ring_panels(m, planner_ball, path_ball, interesting, save_path):
             if cand["alpha_s"] is None or cand["c_g"] is None:
                 ax.set_facecolor("#fbe9e7")
                 ax.text(0.5, 0.5, f"{GATE_LABEL[cand['gate']]}\n{cand['reason']}",
-                        ha="center", va="center", fontsize=ANNOT_FS,
+                        ha="center", va="center",
                         transform=ax.transAxes)
                 ax.set_xticks([]); ax.set_yticks([])
             else:
@@ -250,8 +248,7 @@ def draw_ring_panels(m, planner_ball, path_ball, interesting, save_path):
                 ax.set_facecolor("#f1f8e9")
             colour = (C_CHOSEN if cand["cell"] == chosen_next
                       else (C_REJECT if not cand["accepted"] else "black"))
-            ax.set_xlabel(f"{GATE_LABEL[cand['gate']]}{tag}",
-                          fontsize=ANNOT_FS, color=colour)
+            ax.set_xlabel(f"{GATE_LABEL[cand['gate']]}{tag}", color=colour)
 
         for k in range(len(cands), nrows_block * NCOLS):
             all_axes[panel_row + k // NCOLS, k % NCOLS].axis("off")
@@ -262,8 +259,7 @@ def draw_ring_panels(m, planner_ball, path_ball, interesting, save_path):
         "rejected them\n"
         "Cream background = rejected on CLEARANCE · "
         "Pink = rejected before the arc was even computed · "
-        "Green = the candidate A* took",
-        fontsize=TITLE_FS - 2,
+        "Green = the candidate A* took", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.955), h_pad=3.2)
     save(fig, save_path, dpi=110)
@@ -275,6 +271,7 @@ def draw_ring_panels(m, planner_ball, path_ball, interesting, save_path):
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    print(param_caption())
     m = build_map()
 
     planner_base = make_planner(m, True, START, GOAL)

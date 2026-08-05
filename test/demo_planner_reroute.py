@@ -267,11 +267,10 @@ def draw_topdown(fig, ax, planner, path, chosen_cell, candidates):
         mpatches.Patch(color="#1b5e20", label="candidate: CHOSEN"),
     ]
     labels += ["candidate: ACCEPT", "candidate: REJECT", "candidate: CHOSEN"]
-    ax.legend(handles, labels, loc="upper left", fontsize=8)
+    ax.legend(handles, labels, loc="upper left")
     ax.set_title(
         f"Chosen path (red) + all {len(candidates)} ring candidates from"
-        f" takeoff cell {chosen_cell}",
-        fontsize=10,
+        f" takeoff cell {chosen_cell}", wrap=True
     )
 
 
@@ -289,7 +288,7 @@ def draw_candidate_sideviews(fig, planner, candidates, chosen_cell, chosen_next)
             # No feasible alpha: draw a stub telling the user why.
             ax.set_facecolor("#fbe9e7")
             ax.text(0.5, 0.5, f"INFEASIBLE\n{cand['reason']}",
-                    ha="center", va="center", fontsize=8,
+                    ha="center", va="center",
                     transform=ax.transAxes)
             ax.set_xticks([]); ax.set_yticks([])
         else:
@@ -302,7 +301,7 @@ def draw_candidate_sideviews(fig, planner, candidates, chosen_cell, chosen_next)
             )
             ax.set_ylim(-0.05, obs_fill + 0.4)
         marker = "  <-- CHOSEN" if cand["cell"] == chosen_next else ""
-        ax.set_xlabel(f"cell {cand['cell']}{marker}", fontsize=7)
+        ax.set_xlabel(f"cell {cand['cell']}{marker}")
     for j in range(len(candidates), len(axes)):
         axes[j].axis("off")
 
@@ -354,8 +353,7 @@ def main() -> int:
     draw_candidate_sideviews(fig_side, planner, candidates, chosen_cell, chosen_next)
     fig_side.suptitle(
         f"Ring candidates from takeoff cell {chosen_cell}: "
-        f"per-candidate arc vs terrain profile",
-        fontsize=11,
+        f"per-candidate arc vs terrain profile", wrap=True
     )
     fig_side.tight_layout(rect=(0, 0, 1, 0.96))
     side_path = out_path("planner_reroute_sideview.png")

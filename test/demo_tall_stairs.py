@@ -112,13 +112,13 @@ def draw_topdown(
 
     # Step boundary lines
     for x_bnd, label, col in [
-        (STEP1_XMIN, f"riser 1\n(z=0→{STEP1_Z})", "#e65100"),
-        (STEP2_XMIN, f"riser 2\n(z={STEP1_Z}→{STEP2_Z})", "#bf360c"),
-        (TOP_XMIN,   f"riser 3\n(z={STEP2_Z}→{TOP_Z})", "#7f0000"),
+        (STEP1_XMIN, f"riser 1\n(z=0→{STEP1_Z:.2f})", "#e65100"),
+        (STEP2_XMIN, f"riser 2\n(z={STEP1_Z:.2f}→{STEP2_Z:.2f})", "#bf360c"),
+        (TOP_XMIN,   f"riser 3\n(z={STEP2_Z:.2f}→{TOP_Z:.2f})", "#7f0000"),
     ]:
         ax.axvline(x_bnd, color=col, linewidth=1.5, linestyle="--",
                    alpha=0.75, zorder=4)
-        ax.text(x_bnd + 0.03, 0.15, label, color=col, fontsize=7,
+        ax.text(x_bnd + 0.03, 0.15, label, color=col,
                 va="bottom", zorder=5)
 
     # Baseline path (dashed orange)
@@ -131,8 +131,7 @@ def draw_topdown(
         z = m.get_elevation(*p)
         mc_str = f"\nmc={d['mc']:+.3f}" if d and d["feasible"] else ""
         ax.annotate(f"B{i}\nz={z:.1f}{mc_str}", p,
-                    xytext=(-18, -16), textcoords="offset points",
-                    fontsize=6, color="#e65100", zorder=8)
+                    xytext=(-18, -16), textcoords="offset points", color="#e65100", zorder=8)
 
     # Highlight baseline hops the clearance gate would have rejected (red), and
     # those it accepts only barely (orange). The gate is hard — clearance no
@@ -152,7 +151,7 @@ def draw_topdown(
                 f"REJECTED\nmc={d['mc']:+.3f}m",
                 (0.5*(p0[0]+p1[0]), 0.5*(p0[1]+p1[1])),
                 xytext=(0, 26), textcoords="offset points",
-                ha="center", fontsize=8, color="#b71c1c", fontweight="bold",
+                ha="center", color="#b71c1c", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white",
                           ec="#b71c1c", lw=1.1), zorder=11,
             )
@@ -168,7 +167,7 @@ def draw_topdown(
                 f"mc={d['mc']:+.3f}m\n(tight)",
                 (0.5*(p0[0]+p1[0]), 0.5*(p0[1]+p1[1])),
                 xytext=(0, 22), textcoords="offset points",
-                ha="center", fontsize=7, color="#e65100", fontweight="bold",
+                ha="center", color="#e65100", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white",
                           ec=C_LOWMARG, lw=1.1), zorder=11,
             )
@@ -182,8 +181,7 @@ def draw_topdown(
     for i, p in enumerate(path_ball):
         z = m.get_elevation(*p)
         ax.annotate(f"A{i}\nz={z:.1f}", p,
-                    xytext=(5, 5), textcoords="offset points",
-                    fontsize=6, color="#00695c", zorder=10)
+                    xytext=(5, 5), textcoords="offset points", color="#00695c", zorder=10)
 
     # Ring candidates at the most-constrained ballistic waypoint
     if interesting:
@@ -249,7 +247,7 @@ def draw_topdown(
 
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(handles + extra_h, labels + [h.get_label() for h in extra_h],
-              loc="upper left", fontsize=7)
+              loc="upper left")
 
     tally = {"accept": 0, "bounds": 0, "obstacle": 0, "stance": 0,
              "physics": 0, "clearance": 0}
@@ -264,9 +262,7 @@ def draw_topdown(
         f"off-map {tally['bounds']}\n"
         f"The risers are well inside the leg's budget, so what prunes the search "
         f"is the robot's body: it cannot stand within {config.ROBOT_RADIUS:.1f} m "
-        f"of a riser, and flat approach arcs clip the step edge.\n"
-        f"{param_caption()}",
-        fontsize=TITLE_FS - 3,
+        f"of a riser, and flat approach arcs clip the step edge.", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)
@@ -326,8 +322,7 @@ def draw_ring_panels(
         # and matplotlib draws left- and center-aligned titles at the same
         # height, so the two would overlap.
         all_axes[panel_row, 0].text(
-            0.0, 1.34, row_label, transform=all_axes[panel_row, 0].transAxes,
-            fontsize=9, color="#1a237e", fontweight="bold",
+            0.0, 1.34, row_label, transform=all_axes[panel_row, 0].transAxes, color="#1a237e", fontweight="bold",
             va="bottom", ha="left",
         )
 
@@ -338,7 +333,7 @@ def draw_ring_panels(
                 ax.set_facecolor("#fbe9e7")
                 ax.text(0.5, 0.5,
                         f"INFEASIBLE\n{cand['reason']}",
-                        ha="center", va="center", fontsize=7,
+                        ha="center", va="center",
                         transform=ax.transAxes)
                 ax.set_xticks([]); ax.set_yticks([])
             else:
@@ -363,7 +358,6 @@ def draw_ring_panels(
                 ax.set_facecolor("#f1f8e9")
             ax.set_xlabel(
                 f"cell {cand['cell']}{r_str}{tag}",
-                fontsize=7,
                 color=("#1b5e20" if cand["cell"] == chosen_next
                        else ("#c62828" if not cand["accepted"] else "black")),
             )
@@ -378,8 +372,7 @@ def draw_ring_panels(
     fig.suptitle(
         "Ring-candidate side views at every ballistic waypoint with ≥1 rejection\n"
         "Green arc = ACCEPT · Red arc = REJECT · Green background = CHOSEN · "
-        "Dotted lines = step elevations",
-        fontsize=11,
+        "Dotted lines = step elevations", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.96), h_pad=3.2)
     save(fig, save_path, dpi=110)
@@ -419,8 +412,7 @@ def draw_arc_strip(
             d = diags[i]
             if not d["feasible"]:
                 ax.set_facecolor("#fbe9e7")
-                ax.text(0.5, 0.5, "INFEASIBLE", ha="center", va="center",
-                        fontsize=9, transform=ax.transAxes)
+                ax.text(0.5, 0.5, "INFEASIBLE", ha="center", va="center", transform=ax.transAxes)
                 ax.set_xticks([]); ax.set_yticks([])
             else:
                 p0, p1 = path[i], path[i + 1]
@@ -441,18 +433,16 @@ def draw_arc_strip(
                                linestyle=":", alpha=0.8, zorder=4)
 
             if i == 0:
-                ax.set_ylabel(f"{row_label}\nz (m)", fontsize=10)
+                ax.set_ylabel(f"{row_label}\nz (m)")
             ax.set_xlabel(
                 f"hop {i}: ({path[i][0]:.1f},{path[i][1]:.1f})"
                 f" → ({path[i+1][0]:.1f},{path[i+1][1]:.1f})",
-                fontsize=8,
             )
 
     fig.suptitle(
         "Per-hop side view — baseline (top) vs ballistic (bottom)\n"
-        f"Dotted lines = step elevations  {STEP1_Z} / {STEP2_Z} / {TOP_Z} m · "
-        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate · Green = clears",
-        fontsize=11,
+        f"Dotted lines = step elevations  {STEP1_Z:.2f} / {STEP2_Z:.2f} / {TOP_Z:.2f} m · "
+        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate · Green = clears", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.91))
     save(fig, save_path)
@@ -464,6 +454,7 @@ def draw_arc_strip(
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    print(param_caption())
     m = build_map()
 
     planner_base = make_planner(m, True, START, GOAL)

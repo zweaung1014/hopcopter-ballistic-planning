@@ -107,6 +107,7 @@ def crossing_hop(path: list) -> int | None:
 
 
 def main() -> int:
+    print(param_caption())
     results = []
     for h in HEIGHTS:
         m = build_wall(h)
@@ -155,8 +156,7 @@ def main() -> int:
         badge = "#00695c" if strat == "OVER" else "#4527a0"
         ax.set_title(
             f"h = {h:.2f} m\n{strat}  —  {detail}\n"
-            f"cost = {cost:.2f}   (climb penalty α·h = {config.ALPHA_UPHILL * h:.2f})",
-            fontsize=TITLE_FS - 2, color=badge, fontweight="bold",
+            f"cost = {cost:.2f}   (climb penalty α·h = {config.ALPHA_UPHILL * h:.2f})", color=badge, fontweight="bold", wrap=True
         )
 
         # ---- bottom row: the crossing hop, or why there wasn't one ----
@@ -175,10 +175,10 @@ def main() -> int:
             axb.set_ylim(-0.1, max(HEIGHTS) + 0.5)
             axb.axhline(h, color="#e65100", linewidth=1.4, linestyle="--",
                         zorder=5, label=f"wall top z={h:.2f}")
-            axb.legend(fontsize=ANNOT_FS - 1, loc="upper right")
+            axb.legend(loc="upper right")
             axb.set_xlabel(
                 f"crossing hop {hi}: ({p0[0]:.1f},{p0[1]:.1f}) → "
-                f"({p1[0]:.1f},{p1[1]:.1f})", fontsize=ANNOT_FS,
+                f"({p1[0]:.1f},{p1[1]:.1f})",
             )
         else:
             axb.set_facecolor("#ede7f6")
@@ -187,21 +187,19 @@ def main() -> int:
                 "No crossing hop\n\nthe planner detoured past\nthe end of the wall\n\n"
                 f"climbing would cost α·h = {config.ALPHA_UPHILL * h:.2f}\n"
                 "on top of the travel distance",
-                ha="center", va="center", fontsize=ANNOT_FS + 2,
+                ha="center", va="center",
                 color="#4527a0", transform=axb.transAxes,
             )
             axb.set_xticks([]); axb.set_yticks([])
-            axb.set_xlabel("detour", fontsize=ANNOT_FS)
+            axb.set_xlabel("detour")
 
         if col == 0:
-            axb.set_ylabel("z (m)", fontsize=LABEL_FS)
+            axb.set_ylabel("z (m)")
 
     fig.suptitle(
         "One planner, one geometry — only the wall height changes\n"
         f"Wall x∈[{WALL_XMIN}, {WALL_XMAX}] m, y∈[{WALL_YMIN}, {WALL_YMAX}] m "
-        "(bypassable at both ends) · plain elevation, so the crest is landable\n"
-        f"{param_caption()}",
-        fontsize=TITLE_FS,
+        "(bypassable at both ends) · plain elevation, so the crest is landable", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     save(fig, out_path("decision_sweep.png"))

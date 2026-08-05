@@ -31,11 +31,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import matplotlib.patches as mpatches
 import numpy as np
 
 import config
 from demo_common import (
+    SLIDE_FIGSIZE, TOPDOWN_FIGSIZE, arcs_figsize,
     HOP_RADIUS, N_ANGLES, V_MAX,
     PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
     make_planner, diagnose_edge, n_bad_hops, param_caption, save, out_path
@@ -67,7 +69,7 @@ def distance_to_wall(p: tuple[float, float]) -> float:
 # --- Figure 1: top-down A/B overlay -------------------------------------- #
 
 def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
-    fig, ax = plt.subplots(figsize=(10, 9))
+    fig, ax = plt.subplots(figsize=TOPDOWN_FIGSIZE)
     vis = Visualizer.__new__(Visualizer)
     vis.map_env = m; vis.fig = fig; vis.ax = ax
     ax.set_xlim(0, m.size_x); ax.set_ylim(0, m.size_y)
@@ -99,7 +101,7 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
             ax.annotate(
                 f"COLLIDES\nmc={d['mc']:+.2f} m",
                 (mx, my), xytext=(0, 22), textcoords="offset points",
-                ha="center", fontsize=9, color="#b71c1c", fontweight="bold",
+                ha="center", color="#b71c1c", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.25", fc="white",
                           ec="#b71c1c", lw=1.2), zorder=11,
             )
@@ -114,11 +116,11 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
     for i, p in enumerate(path_base):
         d = distance_to_wall(p)
         ax.annotate(f"B{i}\n{d:.2f}m", p, xytext=(6, -12),
-                    textcoords="offset points", fontsize=7, color="#e65100")
+                    textcoords="offset points", color="#e65100")
     for i, p in enumerate(path_ball):
         d = distance_to_wall(p)
         ax.annotate(f"A{i}\n{d:.2f}m", p, xytext=(6, 6),
-                    textcoords="offset points", fontsize=7, color="#00695c")
+                    textcoords="offset points", color="#00695c")
 
     ax.plot(START[0], START[1], "go", markersize=11, zorder=10, label="start")
     ax.plot(GOAL[0], GOAL[1], "r*", markersize=15, zorder=10, label="goal")
@@ -127,12 +129,11 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
     handles.append(mpatches.Patch(color="#c62828", alpha=0.35,
                                   label="baseline edge that would collide"))
     labels.append("baseline edge that would collide")
-    ax.legend(handles, labels, loc="upper left", fontsize=8)
+    ax.legend(handles, labels, loc="upper left")
 
     ax.set_title(
         "tall_wall demo: baseline (clearance off) vs ballistic (clearance on)\n"
-        "labels show waypoint distance to the wall's XY bounding box",
-        fontsize=11,
+        "labels show waypoint distance to the wall's XY bounding box", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)
@@ -150,7 +151,7 @@ def draw_arc_strip(
     n_base = len(path_base) - 1
     n_ball = len(path_ball) - 1
     ncols = max(n_base, n_ball)
-    fig, axes = plt.subplots(2, ncols, figsize=(3.6 * ncols, 5.6),
+    fig, axes = plt.subplots(2, ncols, figsize=arcs_figsize(ncols),
                              squeeze=False)
 
     obs_fill = ballistic_planner._obstacle_fill
@@ -169,7 +170,7 @@ def draw_arc_strip(
             if not d["feasible"]:
                 ax.set_facecolor("#fbe9e7")
                 ax.text(0.5, 0.5, "INFEASIBLE\n(no valid alpha_s)",
-                        ha="center", va="center", fontsize=9,
+                        ha="center", va="center",
                         transform=ax.transAxes)
                 ax.set_xticks([]); ax.set_yticks([])
             else:
@@ -185,18 +186,16 @@ def draw_arc_strip(
                 )
                 ax.set_ylim(-0.05, ymax)
             if i == 0:
-                ax.set_ylabel(f"{label}\nz (m)", fontsize=10)
-            ax.set_xlabel(
-                f"hop {i}: ({path[i][0]:.1f},{path[i][1]:.1f}) "
-                f"→ ({path[i+1][0]:.1f},{path[i+1][1]:.1f})",
-                fontsize=8,
-            )
+                ax.set_ylabel(f"{label}\nz (m)")
+            # Terse: at 5 panels across a slide each is under 2.7 in wide.
+            ax.set_xlabel(f"hop {i}   {path[i][0]:.1f}→{path[i+1][0]:.1f} m")
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
 
     fig.suptitle(
-        "Per-hop side view: baseline (top) vs ballistic (bottom).\n"
-        f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate. Green arc = clears.  "
-        "All edges judged by the same ballistic criterion.",
-        fontsize=11,
+        "Per-hop side view — baseline (top) vs ballistic (bottom)\n"
+        f"red = below the {config.MIN_CLEARANCE} m clearance gate  ·  "
+        "both paths judged by the same criterion", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     save(fig, save_path)
@@ -205,6 +204,7 @@ def draw_arc_strip(
 # --- Main ---------------------------------------------------------------- #
 
 def main() -> int:
+    print(param_caption())
     m = build_tall_wall()
 
     planner_base = make_planner(m, True, START, GOAL)

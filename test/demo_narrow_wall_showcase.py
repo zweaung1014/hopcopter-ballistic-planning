@@ -105,7 +105,7 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
             ax.annotate(
                 f"COLLIDES\nmc={d['mc']:+.3f} m",
                 (mx, my), xytext=(0, 22), textcoords="offset points",
-                ha="center", fontsize=9, color="#b71c1c", fontweight="bold",
+                ha="center", color="#b71c1c", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.25", fc="white",
                           ec="#b71c1c", lw=1.2), zorder=11,
             )
@@ -120,11 +120,11 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
     for i, p in enumerate(path_base):
         d = distance_to_wall(p)
         ax.annotate(f"B{i}\n{d:.2f}m", p, xytext=(6, -14),
-                    textcoords="offset points", fontsize=7, color="#e65100")
+                    textcoords="offset points", color="#e65100")
     for i, p in enumerate(path_ball):
         d = distance_to_wall(p)
         ax.annotate(f"A{i}\n{d:.2f}m", p, xytext=(6, 6),
-                    textcoords="offset points", fontsize=7, color="#00695c")
+                    textcoords="offset points", color="#00695c")
 
     # Arrow pointing out the x-shift
     base_idx = wall_crossing_hop(path_base, m)
@@ -136,8 +136,7 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
             ax.annotate(
                 f"← {bx - ax_x:.2f} m left",
                 xy=(ax_x, ay), xytext=(bx + 0.1, ay + 0.45),
-                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.5),
-                fontsize=9, color="#1565c0", fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.5), color="#1565c0", fontweight="bold",
             )
 
     ax.plot(START[0], START[1], "go", markersize=11, zorder=10, label="start")
@@ -147,14 +146,13 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
     handles.append(mpatches.Patch(color="#d50000", alpha=0.65,
                                   label="baseline edge that would collide"))
     labels.append("baseline edge that would collide")
-    ax.legend(handles, labels, loc="upper left", fontsize=8)
+    ax.legend(handles, labels, loc="upper left")
 
     ax.set_title(
         f"tall_narrow_wall demo: baseline (clearance off) vs ballistic (clearance on)\n"
-        f"wall at x=[{WALL_XMIN},{WALL_XMAX}] h={WALL_HEIGHT} m  |  "
+        f"wall at x=[{WALL_XMIN},{WALL_XMAX}] h={WALL_HEIGHT:.2f} m  |  "
         f"clearance threshold = {H_CLEAR:.2f} m\n"
-        f"ballistic backs the takeoff off the wall — its body cannot stand that close",
-        fontsize=11,
+        f"ballistic backs the takeoff off the wall — its body cannot stand that close", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)
@@ -192,8 +190,7 @@ def draw_arc_strip(
             d = diags[i]
             if not d["feasible"]:
                 ax.set_facecolor("#fbe9e7")
-                ax.text(0.5, 0.5, "INFEASIBLE", ha="center", va="center",
-                        fontsize=9, transform=ax.transAxes)
+                ax.text(0.5, 0.5, "INFEASIBLE", ha="center", va="center", transform=ax.transAxes)
                 ax.set_xticks([]); ax.set_yticks([])
             else:
                 p0 = path[i]; p1 = path[i + 1]
@@ -215,8 +212,7 @@ def draw_arc_strip(
                     ax.axhline(H_CLEAR, color="#f57f17", linewidth=1.2,
                                linestyle=":", zorder=4)
                     ax.text(0.02, H_CLEAR + 0.01, f"threshold={H_CLEAR:.2f}m",
-                            transform=ax.get_yaxis_transform(),
-                            fontsize=7, color="#f57f17", va="bottom")
+                            transform=ax.get_yaxis_transform(), color="#f57f17", va="bottom")
                     # Annotate the u_enter clearance value
                     u_enter = abs(WALL_XMIN - p0[0])
                     X = d["X"]
@@ -225,25 +221,22 @@ def draw_arc_strip(
                         f"z(u={u_enter:.2f})={z_at_entry:.3f}m",
                         xy=(WALL_XMIN, z_at_entry),
                         xytext=(WALL_XMIN + 0.05, z_at_entry + 0.06),
-                        fontsize=7,
                         arrowprops=dict(arrowstyle="->", lw=0.8,
                                         color="gray"),
                     )
 
             if i == 0:
-                ax.set_ylabel(f"{label}\nz (m)", fontsize=10)
+                ax.set_ylabel(f"{label}\nz (m)")
             ax.set_xlabel(
                 f"hop {i}: ({path[i][0]:.1f},{path[i][1]:.1f})"
                 f" → ({path[i+1][0]:.1f},{path[i+1][1]:.1f})",
-                fontsize=8,
             )
 
     fig.suptitle(
         f"Per-hop side view: baseline (top) vs ballistic (bottom).\n"
         f"Orange dashed = clearance threshold {H_CLEAR:.2f} m.  "
         f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate.  Green arc = clears.  "
-        f"Both judged by the same criterion.",
-        fontsize=11,
+        f"Both judged by the same criterion.", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     save(fig, save_path)
@@ -254,6 +247,7 @@ def draw_arc_strip(
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    print(param_caption())
     m = build_map()
 
     planner_base = make_planner(m, True, START, GOAL)

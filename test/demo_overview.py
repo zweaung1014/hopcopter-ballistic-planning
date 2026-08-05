@@ -58,6 +58,7 @@ SCENARIOS = [
 
 
 def main() -> int:
+    print(param_caption())
     fig, axes = plt.subplots(2, 3, figsize=(17, 11), squeeze=False)
     n_failed = 0
 
@@ -71,10 +72,8 @@ def main() -> int:
 
         if path is None:
             n_failed += 1
-            ax.text(0.5, 0.5, "NO PATH", ha="center", va="center",
-                    fontsize=16, color="#b71c1c", transform=ax.transAxes)
-            ax.set_title(f"{idx + 1}. {title}\n{subtitle}\nNO PATH FOUND",
-                         fontsize=TITLE_FS - 2, color="#b71c1c")
+            ax.text(0.5, 0.5, "NO PATH", ha="center", va="center", color="#b71c1c", transform=ax.transAxes)
+            ax.set_title(f"{idx + 1}. {title}\n{subtitle}\nNO PATH FOUND", color="#b71c1c", wrap=True)
             continue
 
         diags = diagnose_path(planner, m, path)
@@ -93,8 +92,7 @@ def main() -> int:
             f"{idx + 1}. {title}\n{subtitle}\n"
             f"{len(path) - 1} hops · "
             f"goal z={m.get_elevation(*path[-1]):.2f} m · "
-            f"{bad} hop(s) clipping",
-            fontsize=TITLE_FS - 3,
+            f"{bad} hop(s) clipping", wrap=True
         )
         print(f"{idx + 1}. {title:<20} {len(path)-1} hops  "
               f"goal z={m.get_elevation(*path[-1]):.2f}  bad={bad}")
@@ -107,13 +105,10 @@ def main() -> int:
         plt.Line2D([], [], color="red", marker="*", linestyle="none",
                    markersize=12, label="goal"),
     ]
-    fig.legend(handles=handles, loc="lower center", ncol=3,
-               fontsize=LABEL_FS, frameon=False, bbox_to_anchor=(0.5, 0.005))
+    fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 0.005))
 
     fig.suptitle(
-        "Ballistic hopping planner — scenario overview\n"
-        f"{param_caption()}",
-        fontsize=TITLE_FS + 1,
+        "Ballistic hopping planner — scenario overview", wrap=True
     )
     fig.tight_layout(rect=(0, 0.035, 1, 0.93))
     save(fig, out_path("overview_contact_sheet.png"))

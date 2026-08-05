@@ -92,25 +92,23 @@ def draw_topdown(m, path_base, path_ball, diags_base, n_base_bad, save_path):
 
     for x_bnd, label, col in [
         (RAMP_X0,  f"ramp toe\nz=0", "#33691e"),
-        (RAMP_X1,  f"crest\nz={CREST_Z}", "#bf360c"),
+        (RAMP_X1,  f"crest\nz={CREST_Z:.2f}", "#bf360c"),
         (CREST_X1, "crest end", "#bf360c"),
-        (TOP_X0,   f"plateau\nz={TOP_Z}", "#4a148c"),
+        (TOP_X0,   f"plateau\nz={TOP_Z:.2f}", "#4a148c"),
     ]:
         ax.axvline(x_bnd, color=col, linewidth=1.5, linestyle="--",
                    alpha=0.75, zorder=4)
-        ax.text(x_bnd + 0.03, 0.12, label, color=col, fontsize=ANNOT_FS - 1,
+        ax.text(x_bnd + 0.03, 0.12, label, color=col,
                 va="bottom", zorder=5)
 
     draw_ab_paths(ax, path_base, path_ball, diags_base)
 
     for i, p in enumerate(path_base):
         ax.annotate(f"B{i}\nz={m.get_elevation(*p):.2f}", p,
-                    xytext=(-20, -20), textcoords="offset points",
-                    fontsize=ANNOT_FS - 1, color=C_BASE, zorder=10)
+                    xytext=(-20, -20), textcoords="offset points", color=C_BASE, zorder=10)
     for i, p in enumerate(path_ball):
         ax.annotate(f"A{i}\nz={m.get_elevation(*p):.2f}", p,
-                    xytext=(6, 8), textcoords="offset points",
-                    fontsize=ANNOT_FS - 1, color=C_BALL, zorder=10)
+                    xytext=(6, 8), textcoords="offset points", color=C_BALL, zorder=10)
 
     ax.plot(*START, "go", markersize=11, zorder=11, label="start  z=0.00")
     ax.plot(*GOAL, "r*", markersize=15, zorder=11,
@@ -121,9 +119,7 @@ def draw_topdown(m, path_base, path_ball, diags_base, n_base_bad, save_path):
         f"slope_crest: continuous {RAMP_GRADE:.2f}-grade ramp to a convex crest "
         f"standing {CREST_Z - TOP_Z:.2f} m above the far shelf\n"
         f"Baseline route contains {n_base_bad} hop(s) the ballistic gate rejects; "
-        f"ballistic launches from further back so its arc peaks over the brow\n"
-        f"{param_caption()}",
-        fontsize=TITLE_FS - 2,
+        f"ballistic launches from further back so its arc peaks over the brow", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)
@@ -154,7 +150,7 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
             if not d["feasible"]:
                 ax.set_facecolor("#fbe9e7")
                 ax.text(0.5, 0.5, "INFEASIBLE\n(physics gate)", ha="center",
-                        va="center", fontsize=9, transform=ax.transAxes)
+                        va="center", transform=ax.transAxes)
                 ax.set_xticks([]); ax.set_yticks([])
             else:
                 p0, p1 = path[i], path[i + 1]
@@ -172,19 +168,17 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
                            linestyle=":", alpha=0.8, zorder=4)
 
             if i == 0:
-                ax.set_ylabel(f"{row_label}\nz (m)", fontsize=LABEL_FS)
+                ax.set_ylabel(f"{row_label}\nz (m)")
             ax.set_xlabel(
                 f"hop {i}: ({path[i][0]:.1f},{path[i][1]:.1f})"
                 f" → ({path[i+1][0]:.1f},{path[i+1][1]:.1f})",
-                fontsize=ANNOT_FS,
             )
 
     fig.suptitle(
         "Per-hop side view — baseline (top) vs ballistic (bottom)\n"
-        f"Dotted: crest z={CREST_Z} m · plateau z={TOP_Z} m · "
+        f"Dotted: crest z={CREST_Z:.2f} m · plateau z={TOP_Z:.2f} m · "
         f"Red arc = below the {config.MIN_CLEARANCE} m clearance gate · "
-        "Green = clears · Dashed = underside of the robot's body",
-        fontsize=TITLE_FS - 2,
+        "Green = clears · Dashed = underside of the robot's body", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.90))
     save(fig, save_path)
@@ -245,8 +239,7 @@ def draw_profile(m, path_base, diags_base, path_ball, diags_ball, save_path):
             ax.plot([p0[0]], [d["z0"]], "|", color="#37474f",
                     markersize=7, zorder=7)
             ax.annotate(f"{i}", (p0[0], d["z0"]), xytext=(0, -14),
-                        textcoords="offset points", ha="center",
-                        fontsize=ANNOT_FS, color="#37474f")
+                        textcoords="offset points", ha="center", color="#37474f")
 
             if clips:
                 # Mark how far the arc dips below the required clearance.
@@ -254,8 +247,7 @@ def draw_profile(m, path_base, diags_base, path_ball, diags_ball, save_path):
                     f"CLIPS CREST\nmc = {d['mc']:+.3f} m",
                     xy=(0.5 * (RAMP_X1 + CREST_X1), CREST_Z),
                     xytext=(-140, 46), textcoords="offset points",
-                    arrowprops=dict(arrowstyle="->", color="#b71c1c", lw=1.6),
-                    fontsize=ANNOT_FS + 2, color="#b71c1c", fontweight="bold",
+                    arrowprops=dict(arrowstyle="->", color="#b71c1c", lw=1.6), color="#b71c1c", fontweight="bold",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white",
                               ec="#b71c1c", lw=1.3), zorder=12,
                 )
@@ -263,19 +255,16 @@ def draw_profile(m, path_base, diags_base, path_ball, diags_ball, save_path):
         ax.plot([path[-1][0]], [m.get_elevation(*path[-1])], "r*",
                 markersize=15, zorder=8)
         ax.set_ylim(-0.15, CREST_Z + 0.55)
-        ax.set_ylabel("z  (m)", fontsize=LABEL_FS)
+        ax.set_ylabel("z  (m)")
         ax.set_title(
             f"{label}   —   {len(path) - 1} hops, "
-            f"{n_bad_hops(diags)} clipping terrain",
-            fontsize=TITLE_FS - 1, loc="left",
+            f"{n_bad_hops(diags)} clipping terrain", loc="left", wrap=True
         )
-        ax.legend(fontsize=ANNOT_FS, loc="upper left")
+        ax.legend(loc="upper left")
 
-    axes[1, 0].set_xlabel("x  (m)   —   direction of travel", fontsize=LABEL_FS)
+    axes[1, 0].set_xlabel("x  (m)   —   direction of travel")
     fig.suptitle(
-        "Climbing the slope: every hop drawn on the real terrain profile (y = 2.5 m)\n"
-        f"{param_caption()}",
-        fontsize=TITLE_FS,
+        "Climbing the slope: every hop drawn on the real terrain profile (y = 2.5 m)", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     save(fig, save_path)
@@ -287,6 +276,7 @@ def draw_profile(m, path_base, diags_base, path_ball, diags_ball, save_path):
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    print(param_caption())
     m = build_map()
 
     planner_base = make_planner(m, True, START, GOAL)
@@ -316,7 +306,7 @@ def main() -> int:
               f"{path_ball[ai+1][0]:.2f}, mc={diags_ball[ai]['mc']:+.4f} m")
 
     print(f"\nGoal elevation reached: {m.get_elevation(*path_ball[-1]):.2f} m "
-          f"(far shelf z={TOP_Z} m)")
+          f"(far shelf z={TOP_Z:.2f} m)")
 
     draw_topdown(m, path_base, path_ball, diags_base, n_base_bad,
                  out_path("slope_crest_topdown.png"))

@@ -113,8 +113,8 @@ def main() -> int:
         iv = feasible_alpha_interval(X, Z, V_MAX, G)
         if iv is None:
             print(f"takeoff_x={xs:.2f}  X={X:.2f}   INFEASIBLE (no valid alpha)")
-            axes_top[i].set_title(f"x_s={xs}  INFEASIBLE", fontsize=9)
-            axes_side[i].set_title("INFEASIBLE", fontsize=9)
+            axes_top[i].set_title(f"x_s={xs}  INFEASIBLE")
+            axes_side[i].set_title("INFEASIBLE")
             n_reject += 1
             continue
         alpha_min, alpha_max = iv
@@ -163,7 +163,7 @@ def main() -> int:
             fill=False, edgecolor="k", linewidth=1.2, zorder=6,
         ))
         top.set_title(
-            f"x_s={xs:.2f}   X={X:.2f} m   {verdict}", fontsize=9,
+            f"x_s={xs:.2f}   X={X:.2f} m   {verdict}",
         )
 
         # --- side-view panel ---
@@ -181,8 +181,7 @@ def main() -> int:
 
     fig.suptitle(
         "Ballistic clearance sweep: takeoff moves toward the pillar\n"
-        "(shorter hop -> lower arc peak over pillar -> collision)",
-        fontsize=11,
+        "(shorter hop -> lower arc peak over pillar -> collision)", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.96))
 
