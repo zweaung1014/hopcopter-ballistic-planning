@@ -172,6 +172,8 @@ def make_planner(
         g=config.G_ACCEL,
         V_max=V_max,
         robot_radius=config.ROBOT_RADIUS,
+        leg_radius=config.LEG_CYLINDER_RADIUS,
+        foot_radius=config.FOOT_TIP_RADIUS,
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
         alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
@@ -217,7 +219,7 @@ def diagnose_edge(
                 "mc": -math.inf, "z0": z0, "z1": z1}
     profile = terrain_profile(
         (p0[0], p0[1], z0), (p1[0], p1[1], z1),
-        m, planner.robot_radius, planner.leg_length,
+        m, planner.robot_radius, planner.leg_radius, planner.foot_radius, planner.leg_length,
         planner.arc_max_step, planner._obstacle_fill, planner.n_lateral,
         min_clearance_gate=planner.min_clearance_gate,
     )
@@ -370,7 +372,7 @@ def enumerate_ring_candidates(
             continue
 
         profile = terrain_profile(
-            c_s, c_g, m, planner.robot_radius, planner.leg_length,
+            c_s, c_g, m, planner.robot_radius, planner.leg_radius, planner.foot_radius, planner.leg_length,
             planner.arc_max_step, obs, planner.n_lateral,
         )
         gate = planner.min_clearance_gate

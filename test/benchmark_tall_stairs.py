@@ -55,6 +55,8 @@ def make_planner(m: Map2D5, disable_clearance: bool) -> HoppingAStarPlanner:
         g=config.G_ACCEL,
         V_max=V_MAX,
         robot_radius=config.ROBOT_RADIUS,
+        leg_radius=config.LEG_CYLINDER_RADIUS,
+        foot_radius=config.FOOT_TIP_RADIUS,
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
         alpha_margin_frac=config.ALPHA_MARGIN_FRAC,

@@ -177,19 +177,21 @@ class Map2D5:
 
     def standable_mask(
         self,
-        radius: float,
+        com_radius: float,
+        leg_radius: float,
         clearance: float,
         leg_length: float,
         leg_clearance_start_frac: float = 1.0 / 3.0,
     ) -> np.ndarray:
         """Boolean grid of cells where the robot can stand without clipping terrain.
 
-        The body has two collision components at stance:
+        The body has two collision components at stance, each with its own
+        radius:
 
-          * a sphere of `radius` centred at `center_z = grid[r, c] + leg_length`
-            (the CoM the ballistic arc tracks);
+          * a sphere of `com_radius` centred at `center_z = grid[r, c] +
+            leg_length` (the CoM the ballistic arc tracks);
           * the SIDES of the leg cylinder from `foot_z + leg_length * frac` up
-            to `center_z`, radius `radius`, where `foot_z = grid[r, c]` and
+            to `center_z`, radius `leg_radius`, where `foot_z = grid[r, c]` and
             `frac = leg_clearance_start_frac`. The BOTTOM `frac` of the leg is
             deliberately exempt from the check — the foot is on the ground by
             definition, and without an exempt slab any rigid-vertical-leg model
@@ -212,23 +214,29 @@ class Map2D5:
         z-range, so the distance to the leg axis is exactly `d`; below the
         exempt threshold the leg check is skipped (return `+inf`).
 
-        Combined body distance = min(sphere, leg). Cell is standable iff
-        `min_dist - radius >= clearance` at every relevant offset.
+        Combined margin = min(sphere_dist - com_radius, leg_dist - leg_radius).
+        Cell is standable iff that combined margin is `>= clearance` at every
+        relevant offset — taking the min of the two independently-adjusted
+        margins (rather than combining raw distances first) is what lets the
+        two components carry different radii while still correctly reporting
+        a collision if *either* one is too close.
 
-        Max standable constant grade with `frac=1/3` at shipped geometry
-        (L=0.4, R=0.2, MIN_CLEARANCE=0.15): `(L * frac) / (R + clearance)`
-        ≈ 0.133 / 0.35 ≈ 0.38. Anything steeper is un-standable everywhere
-        under the rigid-vertical-leg model.
+        Max standable constant grade: the leg-cylinder-sides ceiling is
+        `(L * frac) / (leg_radius + clearance)`, and the CoM-sphere-alone
+        ceiling is `sqrt((L / (com_radius + clearance))^2 - 1)`; the tighter
+        of the two governs. See `config.py`'s `LEG_CLEARANCE_START_FRAC`
+        comment for the shipped values. Anything steeper than the tighter
+        ceiling is un-standable everywhere under the rigid-vertical-leg model.
 
-        Only offsets closer than `radius + clearance` can ever fail (beyond
-        that even an infinitely tall column is far enough away), so the
-        neighbourhood is bounded by that. OBSTACLE columns are treated as
-        infinitely tall. Off-map neighbours are ignored.
+        Only offsets closer than `max(com_radius, leg_radius) + clearance` can
+        ever fail (beyond that even an infinitely tall column is far enough
+        away), so the neighbourhood is bounded by that. OBSTACLE columns are
+        treated as infinitely tall. Off-map neighbours are ignored.
 
         Computed once per planner. Screening landing cells against this is far
         cheaper than discovering the same collision by marching an arc.
         """
-        reach = radius + clearance
+        reach = max(com_radius, leg_radius) + clearance
         r_cells = int(math.ceil(reach / self.resolution))
 
         filled = np.where(self.grid == self.OBSTACLE, np.inf, self.grid)
@@ -241,7 +249,7 @@ class Map2D5:
         # Top of the exempt slab — any neighbour column whose top rises above
         # this triggers the leg-cylinder-sides check.
         leg_exempt_top = self.grid + leg_length * leg_clearance_start_frac
-        min_dist = np.full(self.grid.shape, np.inf)
+        min_margin = np.full(self.grid.shape, np.inf)
 
         for dr in range(-r_cells, r_cells + 1):
             for dc in range(-r_cells, r_cells + 1):
@@ -260,12 +268,12 @@ class Map2D5:
                 # when the column top rises into the checked zone; otherwise
                 # `+inf` so it never becomes the minimum.
                 leg_dist = np.where(h >= leg_exempt_top, d, np.inf)
-                dist = np.minimum(sphere_dist, leg_dist)
+                margin = np.minimum(sphere_dist - com_radius, leg_dist - leg_radius)
                 # Off-map neighbours (-inf) impose no constraint.
-                dist = np.where(np.isneginf(h), np.inf, dist)
-                min_dist = np.minimum(min_dist, dist)
+                margin = np.where(np.isneginf(h), np.inf, margin)
+                min_margin = np.minimum(min_margin, margin)
 
-        return (min_dist - radius >= clearance) & (self.grid != self.OBSTACLE)
+        return (min_margin >= clearance) & (self.grid != self.OBSTACLE)
 
     def set_obstacle(self, x: float, y: float):
         """Mark the cell at world position (x, y) as an obstacle."""

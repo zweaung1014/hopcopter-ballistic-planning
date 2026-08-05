@@ -54,9 +54,19 @@ HOP_FIXED_COST = 0.05  # per-hop constant added to every edge. Without it, N sho
 
 # Robot geometry
 # -----------------------------------------------------------------------------
-# The robot is a sphere of ROBOT_RADIUS whose center (the CoM that the ballistic
-# arc actually tracks) sits LEG_LENGTH above the contact point.
-ROBOT_RADIUS = 0.2   # m; body radius — both lateral half-width and vertical half-height
+# The robot's collision volume is a capsule from the foot to the CoM (the point
+# the ballistic arc actually tracks), which sits LEG_LENGTH above the contact
+# point. The capsule has three independently-sized parts: a sphere of
+# ROBOT_RADIUS at the CoM (the robot's actual body), a much thinner cylinder of
+# LEG_CYLINDER_RADIUS along the leg, and a small hemisphere of FOOT_TIP_RADIUS
+# at the foot. See `hopping_astar_planner.clearance_for_alpha` for how the three
+# regions are distinguished and `Map2D5.standable_mask` for the stance-time
+# sphere + leg-cylinder-sides check (no foot-tip component at stance — the foot
+# is on the ground by definition).
+ROBOT_RADIUS = 0.15         # m; CoM sphere radius — the robot's actual body.
+LEG_CYLINDER_RADIUS = 0.01  # m; leg cylinder sides — the leg is thin.
+FOOT_TIP_RADIUS = 0.02      # m; hemispherical foot tip — slightly fatter than
+                            # the leg (a rounded foot pad), but still thin.
 LEG_LENGTH = 0.4     # m; CoM height above the foot. Hop arcs start and end at
                      # `terrain_z + LEG_LENGTH`, not at terrain level.
 LEG_CLEARANCE_START_FRAC = 1.0 / 3.0
@@ -68,16 +78,27 @@ LEG_CLEARANCE_START_FRAC = 1.0 / 3.0
     # checked at stance (in addition to the CoM sphere).
     #
     # This sets the maximum standable constant grade under a rigid vertical
-    # leg. On a slope of grade `g`, the terrain at horizontal distance
-    # `R + MIN_CLEARANCE` uphill rises by `g * (R + MIN_CLEARANCE)`; the leg
-    # sides start firing at height `L * frac` above the foot, so
+    # leg, and there are now two independent ceilings depending on which
+    # component (leg-cylinder sides or CoM sphere) fires first. On a slope of
+    # grade `g`, the leg-cylinder-sides ceiling is
     #
-    #     g_max = (L * frac) / (R + MIN_CLEARANCE)
-    #           = (0.4 * 1/3) / (0.2 + 0.15)
-    #           ≈ 0.38
+    #     g_max_leg = (L * frac) / (LEG_CYLINDER_RADIUS + MIN_CLEARANCE)
+    #               = (0.4 * 1/3) / (0.01 + 0.10)
+    #               ≈ 1.21
     #
-    # Anything steeper is un-standable everywhere. This is why
-    # `maps/slope_crest.py` uses grade 0.35, not the earlier 0.5.
+    # and the CoM-sphere-alone ceiling (from the sphere reaching the terrain
+    # at horizontal distance `ROBOT_RADIUS + MIN_CLEARANCE`) is
+    #
+    #     g_max_sphere = sqrt((L / (ROBOT_RADIUS + MIN_CLEARANCE))^2 - 1)
+    #                  = sqrt((0.4 / 0.25)^2 - 1)
+    #                  ≈ 1.25
+    #
+    # The tighter of the two (g_max_leg ≈ 1.21) governs, since standability
+    # requires clearing BOTH components. Both ceilings now sit above grade 1.0
+    # (45°) — steeper than any realistic map grade in this repo (the steepest,
+    # `maps/slope_crest.py`, ships at 0.35) — so neither is actually binding
+    # for real terrain; this stance check now mainly guards against near-
+    # vertical walls, not graded slopes.
     #
     # DOES NOT apply during flight: `terrain_profile` uses the full capsule
     # (sphere + full cylinder + bottom hemisphere at the foot). The exempt
@@ -101,32 +122,45 @@ ALPHA_MARGIN_FRAC = 0.5  # where in [alpha_min, alpha_max] the default takeoff a
                          # escalates above this only when the gate demands it.
 ARC_SAMPLE_MAX_STEP = 0.05  # m; upper bound on sampling step along the arc's XY line
 ARC_LATERAL_SAMPLES = 5  # terrain samples across the body's width, spanning
-                         # [-(ROBOT_RADIUS + MIN_CLEARANCE),
-                         #  +(ROBOT_RADIUS + MIN_CLEARANCE)] perpendicular to
-                         # travel. The corridor half-width includes MIN_CLEARANCE
-                         # because the leg-cylinder's safety margin extends past
-                         # the body radius. 1 collapses to a centreline-only
-                         # check.
+                         # [-(R_max + MIN_CLEARANCE), +(R_max + MIN_CLEARANCE)]
+                         # perpendicular to travel, where R_max is the largest
+                         # of the three capsule radii (ROBOT_RADIUS, since the
+                         # CoM sphere is by far the widest part — see the
+                         # ROBOT_RADIUS >= ... assert below). The corridor
+                         # half-width includes MIN_CLEARANCE because the
+                         # safety margin extends past the body radius. 1
+                         # collapses to a centreline-only check.
                          #
                          # Bumped from 3 to 5 when the corridor widened
-                         # (ROBOT_RADIUS → ROBOT_RADIUS + MIN_CLEARANCE) so the
-                         # inter-sample gap stays ≤ 0.2 m: with 3 samples across
-                         # a 0.7 m corridor the gap is 0.35 m, wide enough for
-                         # a narrow (~20 cm) obstacle to slip through undetected.
+                         # (R_max → R_max + MIN_CLEARANCE) so the inter-sample
+                         # gap stays ≤ 0.2 m: with 3 samples across a 0.7 m
+                         # corridor the gap is 0.35 m, wide enough for a
+                         # narrow (~20 cm) obstacle to slip through undetected.
 OBSTACLE_WALL_EXTRA = 1.5  # m; added on top of map_max_z to treat OBSTACLE cells as
                            # tall walls. Must exceed the tallest arc the robot can
-                           # fly over a cell, else OBSTACLEs become jumpable:
-                           #   LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE
-                           #   = 0.4 + 1.2 - 0.2 - 0.15 = 1.25 m
+                           # fly over a cell, else OBSTACLEs become jumpable. The
+                           # binding case is the foot-tip bottom-cap check (the
+                           # lowest point of the capsule, closest to terrain):
+                           #   LEG_LENGTH + MAX_APEX_HEIGHT - FOOT_TIP_RADIUS - MIN_CLEARANCE
+                           #   = 0.4 + 1.2 - 0.02 - 0.10 = 1.48 m
 
 # A hop's clearance at takeoff/landing is exactly LEG_LENGTH - ROBOT_RADIUS (the
-# body's underside above its own contact point). If that ever drops below
-# MIN_CLEARANCE, every edge in the graph is rejected and plan() silently returns
-# None everywhere — a failure mode with no obvious symptom, so assert it here.
+# CoM sphere's underside above its own contact point — this is the stance
+# self-check `standable_mask` runs against a robot's own flat cell). If that
+# ever drops below MIN_CLEARANCE, every edge in the graph is rejected and
+# plan() silently returns None everywhere — a failure mode with no obvious
+# symptom, so assert it here.
 assert LEG_LENGTH - ROBOT_RADIUS > MIN_CLEARANCE, (
     f"LEG_LENGTH - ROBOT_RADIUS = {LEG_LENGTH - ROBOT_RADIUS:.3f} m must exceed "
     f"MIN_CLEARANCE = {MIN_CLEARANCE} m, or no hop can ever satisfy the gate."
 )
 assert OBSTACLE_WALL_EXTRA >= (
-    LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE
+    LEG_LENGTH + MAX_APEX_HEIGHT - FOOT_TIP_RADIUS - MIN_CLEARANCE
 ), "OBSTACLE_WALL_EXTRA too small — obstacle cells would be jumpable."
+
+# terrain_profile's lateral sampling corridor (ARC_LATERAL_SAMPLES, above) and
+# clearance_for_alpha's above-CoM branch both assume the CoM sphere is the
+# widest part of the capsule.
+assert ROBOT_RADIUS >= LEG_CYLINDER_RADIUS and ROBOT_RADIUS >= FOOT_TIP_RADIUS, (
+    "ROBOT_RADIUS (CoM sphere) must be the largest of the three capsule radii."
+)

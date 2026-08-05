@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — split the capsule into three independent radii (CoM, leg, foot)
+
+The collision capsule previously used one shared `ROBOT_RADIUS` for the CoM
+sphere, the leg-cylinder sides, and the foot-tip hemisphere. It now has three
+independent radii, since a 0.2 m-thick leg and foot were unrealistically fat:
+`ROBOT_RADIUS = 0.15` m (CoM sphere, revised down from 0.2), new
+`LEG_CYLINDER_RADIUS = 0.01` m (leg sides), new `FOOT_TIP_RADIUS = 0.02` m
+(foot-tip hemisphere). `MIN_CLEARANCE` is unchanged.
+
+- **Flight** — [hopping_astar_planner.py](hopping_astar_planner.py)
+  `clearance_for_alpha` now selects both the axis distance *and* the radius
+  per terrain sample from three regions instead of one: below the foot uses
+  `FOOT_TIP_RADIUS` (bottom hemisphere, unchanged formula), at-or-above the
+  foot now splits by height into the leg segment (`LEG_CYLINDER_RADIUS`) vs.
+  above the CoM (`ROBOT_RADIUS`) — previously that whole region shared one
+  radius, which would have silently shrunk the CoM sphere to leg-radius
+  during flight for any terrain taller than the current arc height, exactly
+  the case that matters most for obstacle detection. `ArcProfile` and
+  `terrain_profile` carry `com_radius`/`leg_radius`/`foot_radius` instead of
+  one `robot_radius`; the endpoint-transition mask now sizes off
+  `foot_radius`. Monotonicity in `tan(alpha)` still holds except for a
+  sub-centimeter, single-crossing dip where the radius switches from
+  `LEG_CYLINDER_RADIUS` to the larger `FOOT_TIP_RADIUS` — well below
+  `MIN_CLEARANCE`, not worth correcting with exact nearest-point-on-cone
+  geometry.
+- **Stance** — [map2d5.py](map2d5.py) `standable_mask` takes `com_radius` and
+  `leg_radius` separately and combines them as
+  `min(sphere_dist - com_radius, leg_dist - leg_radius) >= clearance` instead
+  of subtracting one shared radius after the min. At `CELL_RESOLUTION = 0.1 m`,
+  `LEG_CYLINDER_RADIUS (0.01 m)` is smaller than a grid cell, so in practice
+  the leg-cylinder-sides check no longer binds before the CoM sphere does —
+  the max standable grade is now governed by the sphere ceiling
+  (`sqrt((LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE))^2 - 1) ≈ 1.25`, not the
+  leg-cylinder formula's ≈1.21), both now far steeper than any map in this
+  repo (steepest ships at 0.35).
+- **Config**: `OBSTACLE_WALL_EXTRA`'s assert is re-derived against
+  `FOOT_TIP_RADIUS` (the bottom-cap/obstacle-height concern) instead of
+  `ROBOT_RADIUS`; new assert that `ROBOT_RADIUS` is the largest of the three
+  radii, since `terrain_profile`'s lateral sampling corridor is sized off the
+  largest one.
+- **Threaded through**: [main.py](main.py), [visualizer.py](visualizer.py)
+  (`draw_arc_side_view` gained keyword-only `leg_radius`/`foot_radius`
+  defaults so its "authoritative" clearance number stays correct without
+  updating every call site), and all `test/demo_*.py` scripts that construct
+  `HoppingAStarPlanner` or call `terrain_profile` directly.
+- **Tests**: [test/test_clearance_rejection.py](test/test_clearance_rejection.py)
+  call signatures updated for the new `standable_mask`/`terrain_profile`
+  params; case (6a)'s stance-ceiling comparison rewritten to reflect the
+  sphere-governs-in-practice finding above. Case (1)'s `PILLAR_H = 0.45`
+  calibration and cases (6b)/(6c) still assume the old, much larger foot-tip
+  radius and have **not** been re-tuned — the suite currently fails on case
+  (1) until those constants are re-derived against the new geometry.
+- **Not yet revisited** (deferred): the numeric constants in
+  `maps/barely_jumpable_wall.py`, `maps/slope_crest.py`, `maps/tall_stairs.py`,
+  `maps/stairs_with_curb.py`, and the demos built around them were calibrated
+  assuming a single 0.2 m radius everywhere; their margins loosen substantially
+  under the new geometry and have not been re-verified.
+
 ### Changed — leg safety margin (stance leg-cylinder sides + flight capsule)
 
 The body's collision volume is now the full leg-to-CoM capsule of radius

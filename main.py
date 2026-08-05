@@ -41,6 +41,8 @@ def main():
         g=config.G_ACCEL,
         V_max=config.V_MAX,
         robot_radius=config.ROBOT_RADIUS,
+        leg_radius=config.LEG_CYLINDER_RADIUS,
+        foot_radius=config.FOOT_TIP_RADIUS,
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
         alpha_margin_frac=config.ALPHA_MARGIN_FRAC,

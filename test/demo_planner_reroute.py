@@ -101,6 +101,8 @@ def make_planner(m: Map2D5) -> HoppingAStarPlanner:
         g=config.G_ACCEL,
         V_max=V_MAX,
         robot_radius=config.ROBOT_RADIUS,
+        leg_radius=config.LEG_CYLINDER_RADIUS,
+        foot_radius=config.FOOT_TIP_RADIUS,
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
         alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
@@ -160,7 +162,7 @@ def enumerate_ring_candidates(planner: HoppingAStarPlanner, parent_cell):
             out.append(entry)
             continue
         profile = terrain_profile(
-            c_s, c_g, m, planner.robot_radius, planner.leg_length,
+            c_s, c_g, m, planner.robot_radius, planner.leg_radius, planner.foot_radius, planner.leg_length,
             planner.arc_max_step, obs_fill, planner.n_lateral,
         )
         a, mc = alpha_for_clearance(

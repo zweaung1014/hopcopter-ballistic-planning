@@ -23,6 +23,8 @@ from map2d5 import Map2D5
 
 G = config.G_ACCEL
 ROBOT_R = config.ROBOT_RADIUS
+LEG_R = config.LEG_CYLINDER_RADIUS
+FOOT_R = config.FOOT_TIP_RADIUS
 LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
@@ -75,7 +77,7 @@ def _mc_for(xs: float, goal_x: float, pillar_h: float) -> float:
     if iv is None:
         return -math.inf  # infeasible counts as rejection
     profile = terrain_profile(
-        c_s, c_g, m, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
+        c_s, c_g, m, ROBOT_R, LEG_R, FOOT_R, LEG, MAX_STEP, obs, N_LAT,
         min_clearance_gate=GATE,
     )
     _alpha, mc = alpha_for_clearance(
@@ -138,7 +140,7 @@ def main() -> int:
     m.set_obstacle_region(2.4, 1.35, 2.6, 1.65)
     iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G)
     profile = terrain_profile(
-        (1.5, 1.5, 0.0), (3.5, 1.5, 0.0), m, ROBOT_R, LEG,
+        (1.5, 1.5, 0.0), (3.5, 1.5, 0.0), m, ROBOT_R, LEG_R, FOOT_R, LEG,
         MAX_STEP, _obs_fill(m), N_LAT,
         min_clearance_gate=GATE,
     )
@@ -147,7 +149,7 @@ def main() -> int:
 
     # OBSTACLE_WALL_EXTRA must be large enough that the tallest arc the robot
     # can fly still cannot clear an obstacle cell.
-    reach = LEG + config.MAX_APEX_HEIGHT - ROBOT_R - GATE
+    reach = LEG + config.MAX_APEX_HEIGHT - FOOT_R - GATE
     ok = WALL_EXTRA >= reach
     print(f"  [{'PASS' if ok else 'FAIL'}] OBSTACLE_WALL_EXTRA={WALL_EXTRA} m >= "
           f"max flyable height {reach:.2f} m")
@@ -174,7 +176,7 @@ def main() -> int:
     # A flat cell must be standable; a cell alongside a tall step must not be.
     mm = Map2D5(2.0, 2.0, 0.1)
     mm.paint_region(0.8, x_min=1.0)
-    sm = mm.standable_mask(ROBOT_R, GATE, LEG)
+    sm = mm.standable_mask(ROBOT_R, LEG_R, GATE, LEG)
     row = mm.rows // 2
     ok = bool(sm[row, 2]) and not bool(sm[row, 9])
     print(f"  [{'PASS' if ok else 'FAIL'}] flat ground standable, "
@@ -188,31 +190,44 @@ def main() -> int:
     # in case (1) still happens to pass.
     print("\n(6) Capsule stance + flight geometry:")
 
-    # (6a) Leg cylinder sides catch a wider un-standable band. The old
-    # sphere-only stance ceiling admitted grades up to
-    # sqrt((LEG/(R+GATE))^2 - 1) ≈ 0.55. The new leg-cylinder-sides check
-    # brings that ceiling down to (L * frac) / (R + GATE) ≈ 0.38 — a slope
-    # at grade 0.50 sits between the two.
+    # (6a) Leg-cylinder-sides ceiling vs. CoM-sphere-alone ceiling. With
+    # LEG_R = 0.01 m (much thinner than the old shared 0.2 m radius), the
+    # closed-form leg-cylinder ceiling is nominally the tighter of the two:
+    #
+    #     g_max_capsule = (L * frac) / (LEG_R + GATE)  ≈ 1.212
+    #     g_max_sphere  = sqrt((L / (ROBOT_R + GATE))^2 - 1)  ≈ 1.249
+    #
+    # But LEG_R (0.01 m) is now smaller than CELL_RESOLUTION (0.1 m), and
+    # `standable_mask`'s neighbour search only ever fires the leg-cylinder
+    # check at discretized offsets (0.1, 0.1414, 0.2 m, ...) — by the time a
+    # neighbouring cell has risen enough to cross the exempt-slab threshold,
+    # its horizontal distance already clears the (tiny) LEG_R + GATE margin
+    # comfortably. So in practice, at this map's resolution, the leg-cylinder
+    # check never actually binds and the CoM sphere alone determines
+    # standability — empirically confirmed to switch at exactly g_max_sphere
+    # (grade 1.249 stands, 1.250 does not). The two ceilings' ordering below
+    # is still a valid sanity check on the formulas themselves; the slope
+    # sweep is calibrated against the *observed* (sphere-governed) cutoff,
+    # not the theoretical leg-cylinder one.
     frac = 1.0 / 3.0
-    g_max_capsule = (LEG * frac) / (ROBOT_R + GATE)
+    g_max_capsule = (LEG * frac) / (LEG_R + GATE)
     g_max_sphere = math.sqrt((LEG / (ROBOT_R + GATE)) ** 2 - 1)
-    ok = g_max_capsule < 0.50 < g_max_sphere
+    ok = g_max_capsule < g_max_sphere
     print(f"  [{'PASS' if ok else 'FAIL'}] capsule g_max ≈ {g_max_capsule:.3f} "
-          f"< 0.50 < sphere g_max ≈ {g_max_sphere:.3f}")
+          f"< sphere g_max ≈ {g_max_sphere:.3f} (formula ordering; grid "
+          f"resolution makes the sphere ceiling the one that actually binds)")
     all_ok &= ok
-    # Grade-0.35 slope: standable (under new ceiling of 0.38).
-    # Grade-0.50 slope: un-standable under the capsule check.
     slope_ok = True
-    for grade, expect in [(0.35, True), (0.50, False)]:
+    for grade, expect in [(g_max_sphere - 0.05, True), (g_max_sphere + 0.05, False)]:
         mm = Map2D5(3.0, 2.0, 0.1)
         for col in range(mm.cols):
             mm.grid[:, col] = grade * ((col + 0.5) * mm.resolution)
-        sm = mm.standable_mask(ROBOT_R, GATE, LEG, leg_clearance_start_frac=frac)
+        sm = mm.standable_mask(ROBOT_R, LEG_R, GATE, LEG, leg_clearance_start_frac=frac)
         # Interior cell, avoiding boundary effects.
         stands_somewhere = bool(sm[mm.rows // 2, mm.cols // 2])
         row_ok = (stands_somewhere == expect)
         slope_ok &= row_ok
-        print(f"  [{'PASS' if row_ok else 'FAIL'}] grade {grade} slope "
+        print(f"  [{'PASS' if row_ok else 'FAIL'}] grade {grade:.3f} slope "
               f"{'standable' if stands_somewhere else 'un-standable'} "
               f"(expected {'standable' if expect else 'un-standable'})")
     all_ok &= slope_ok
@@ -227,7 +242,7 @@ def main() -> int:
     c_g = (2.4, 1.0, 0.0)   # X=2.0 flat, well inside V_MAX
     iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G)
     prof = terrain_profile(
-        c_s, c_g, mm, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
+        c_s, c_g, mm, ROBOT_R, LEG_R, FOOT_R, LEG, MAX_STEP, obs, N_LAT,
         min_clearance_gate=GATE,
     )
     _, mc_capsule = alpha_for_clearance(
@@ -253,7 +268,7 @@ def main() -> int:
     c_g = (2.4, 1.0, 0.0)
     iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G)
     prof = terrain_profile(
-        c_s, c_g, mm, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
+        c_s, c_g, mm, ROBOT_R, LEG_R, FOOT_R, LEG, MAX_STEP, obs, N_LAT,
         min_clearance_gate=GATE,
     )
     _, mc_wall = alpha_for_clearance(
