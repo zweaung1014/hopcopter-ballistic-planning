@@ -93,7 +93,7 @@ V_MAX = math.sqrt(2.0 * G_ACCEL * MAX_APEX_HEIGHT)  # 4.852 m/s
         # this affords is V_MAX^2 / g = 2.40 m, and a flat hop of distance X
         # needs v_s >= sqrt(g*X), so HOP_RADIUS must stay well under that.
 
-MIN_CLEARANCE = 0.15  # m; HARD gate — an arc whose body-to-terrain clearance ever
+MIN_CLEARANCE = 0.10  # m; HARD gate — an arc whose body-to-terrain clearance ever
                       # drops below this is rejected outright. Clearance does NOT
                       # enter the edge cost; it is purely a feasibility test.
 ALPHA_MARGIN_FRAC = 0.5  # where in [alpha_min, alpha_max] the default takeoff angle

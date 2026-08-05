@@ -261,8 +261,10 @@ def draw_topdown(
         f"stance {tally['stance']} · physics {tally['physics']} · "
         f"off-map {tally['bounds']}\n"
         f"The risers are well inside the leg's budget, so what prunes the search "
-        f"is the robot's body: it cannot stand within {config.ROBOT_RADIUS:.1f} m "
-        f"of a riser, and flat approach arcs clip the step edge.", wrap=True
+        f"is the robot's body: it cannot stand within "
+        f"{config.ROBOT_RADIUS + config.MIN_CLEARANCE:.2f} m of a riser "
+        f"(sphere at CoM + leg cylinder sides), and flat approach arcs clip the "
+        f"step edge.", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)

@@ -4,13 +4,11 @@ Unlike the tall-wall demo (where the wall is too wide to arc over and the
 planner goes *around* in y), the narrow wall here cannot be bypassed in y
 either.  The robot must cross it in the x direction.
 
-With hop_radius = 1.5 m and grid resolution 0.2 m:
-  • The eastward ring candidate from the baseline intermediate (x ≈ 2.1)
-    enters the wall at u ≈ 0.2 m, where the arc is only 0.175 m high —
-    below the clearance threshold of 0.25 m.  The baseline accepts it anyway.
-  • The ballistic planner rejects that hop and instead routes through an
-    intermediate at x ≈ 1.9 m (one grid cell to the LEFT), where the arc
-    enters the wall at u ≈ 0.4 m, height 0.30 m — safely above threshold.
+The baseline planner (clearance and stance OFF) picks the takeoff cell
+closest to the wall.  The ballistic planner rejects that cell — usually
+on stance, since the body + upper leg cylinder cannot rest that close —
+and picks a cell one grid step further back.  Runtime coordinates and
+`mc` values are printed to the console and drawn on the figures.
 
 Two figures:
   test/prof_narrow_wall_topdown.png  — A/B overlay on the map
@@ -126,7 +124,8 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
         ax.annotate(f"A{i}\n{d:.2f}m", p, xytext=(6, 6),
                     textcoords="offset points", color="#00695c")
 
-    # Arrow pointing out the x-shift
+    # Arrow between the two takeoff cells. No caption — the B{i} and A{i}
+    # markers are already labelled with coordinates.
     base_idx = wall_crossing_hop(path_base, m)
     ball_idx = wall_crossing_hop(path_ball, m)
     if base_idx is not None and ball_idx is not None:
@@ -134,9 +133,9 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
         ax_x, ay = path_ball[ball_idx]
         if abs(bx - ax_x) > 0.05:
             ax.annotate(
-                f"← {bx - ax_x:.2f} m left",
-                xy=(ax_x, ay), xytext=(bx + 0.1, ay + 0.45),
-                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.5), color="#1565c0", fontweight="bold",
+                "",
+                xy=(ax_x, ay), xytext=(bx, ay),
+                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.8),
             )
 
     ax.plot(START[0], START[1], "go", markersize=11, zorder=10, label="start")
@@ -152,7 +151,8 @@ def draw_topdown(m: Map2D5, path_base, path_ball, diags_base, save_path: str):
         f"tall_narrow_wall demo: baseline (clearance off) vs ballistic (clearance on)\n"
         f"wall at x=[{WALL_XMIN},{WALL_XMAX}] h={WALL_HEIGHT:.2f} m  |  "
         f"clearance threshold = {H_CLEAR:.2f} m\n"
-        f"ballistic backs the takeoff off the wall — its body cannot stand that close", wrap=True
+        f"ballistic rejects the closer takeoff — its body or leg would clip the wall — "
+        f"and picks one grid step further back", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)

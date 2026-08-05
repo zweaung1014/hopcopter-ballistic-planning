@@ -1,13 +1,13 @@
-"""Barely-jumpable wall demo: ballistic planner finds the one valid takeoff cell.
+"""Barely-jumpable wall demo: ballistic planner finds a valid takeoff cell.
 
-Wall height = 0.22 m — only 0.055 m of clearance remains at the optimal
-takeoff x = 1.7 m (wall at arc midpoint).  One grid cell (0.2 m) either
-side of that position fails clearance entirely (mc ≈ −0.02 m).
-
-The baseline planner (no clearance) charges straight through (takeoff at
-x = 2.1 m, mc ≈ −0.145 m).  The ballistic planner backs off 0.4 m to
-x = 1.7 m so the wall lands at u = 0.6 m–1.0 m — symmetric around the
-arc apex at u = 0.8 m.
+The wall is tall enough that only a narrow band of takeoff cells passes both
+the stance and flight-capsule gates.  The baseline planner (clearance OFF)
+picks a cell closer to the wall and its arc clips through it, while the
+ballistic planner backs off to a takeoff whose arc clears and whose landing
+pose is standable.  The exact takeoff coordinates, per-hop `mc` values, and
+shift magnitude are printed to the console at run time and drawn on the
+figures below — the docstring stays silent on them so this file does not
+need re-editing every time a parameter drifts.
 
 Figures produced
 ----------------
@@ -148,7 +148,10 @@ def draw_topdown(
         ax.annotate(f"A{i}\n{distance_to_wall(p):.2f}m", p,
                     xytext=(6, 6), textcoords="offset points", color="#00695c")
 
-    # Arrow showing x-shift at crossing
+    # Arrow showing the x-shift between the two takeoff cells. No caption:
+    # the B{i} and A{i} markers are already labelled with coordinates, and any
+    # numerical text here would drift whenever the map or hop radius is
+    # re-tuned. The arrow's direction and length carry the story.
     base_idx = wall_crossing_hop(path_base, m)
     ball_idx = wall_crossing_hop(path_ball, m)
     if base_idx is not None and ball_idx is not None:
@@ -157,9 +160,9 @@ def draw_topdown(
         shift = bx - ax_x
         if abs(shift) > 0.05:
             ax.annotate(
-                f"← {shift:.2f} m left\n(ballistic steps back\nfor arc clearance)",
-                xy=(ax_x, ay), xytext=(bx + 0.15, ay + 0.50),
-                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.5), color="#1565c0", fontweight="bold",
+                "",
+                xy=(ax_x, ay), xytext=(bx, ay),
+                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1.8),
             )
 
     ax.plot(START[0], START[1], "go", markersize=11, zorder=10, label="start")
@@ -172,8 +175,7 @@ def draw_topdown(
     ax.set_title(
         f"barely_jumpable_wall: baseline vs ballistic\n"
         f"wall x=[{WALL_XMIN},{WALL_XMAX}] h={WALL_HEIGHT:.2f} m  |  "
-        f"clearance threshold H_clear={H_CLEAR:.2f} m\n"
-        f"ballistic backs off 0.4 m so wall falls at arc midpoint (u=0.6–1.0 m)", wrap=True
+        f"clearance threshold H_clear={H_CLEAR:.2f} m", wrap=True
     )
     fig.tight_layout()
     save(fig, save_path)
@@ -382,9 +384,7 @@ def draw_crossing_comparison(
     fig.suptitle(
         f"Wall-crossing hop — focused side view\n"
         f"Wall  h = {WALL_HEIGHT:.2f} m,   robot_radius = {config.ROBOT_RADIUS:.2f} m,   "
-        f"H_clear = {H_CLEAR:.2f} m,   arc apex ≈ 0.400 m\n"
-        f"Baseline (top): arc clips through wall  |  "
-        f"Ballistic (bottom): arc clears with Δz ≈ +0.055 m", wrap=True
+        f"H_clear = {H_CLEAR:.2f} m", wrap=True
     )
     fig.tight_layout(rect=(0, 0, 1, 0.86))
     save(fig, save_path)
@@ -451,12 +451,10 @@ def main() -> int:
         ax_x = path_ball[ball_hi][0]
         shift = bx - ax_x
         if shift > 0.05:
-            print(
-                f"\nBallistic takeoff x={ax_x:.2f} m is {shift:.2f} m LEFT of "
-                f"baseline takeoff x={bx:.2f} m.\n"
-                f"Stepping back ensures the wall falls between u=0.6–1.0 m "
-                f"(symmetric around the arc apex at u=0.8 m)."
-            )
+            # The waypoint tables above already print the exact coordinates,
+            # so just note the qualitative relationship here.
+            print("\nBallistic takeoff is upstream of baseline takeoff "
+                  "(see coordinates in the tables above).")
         elif abs(shift) <= 0.05:
             print("\nWARNING: both planners use the same takeoff x — "
                   "wall height may need adjusting.")
