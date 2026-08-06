@@ -40,6 +40,7 @@ def main():
         alpha_downhill=config.ALPHA_DOWNHILL,
         g=config.G_ACCEL,
         V_max=config.V_MAX,
+        mu=config.MU,
         robot_radius=config.ROBOT_RADIUS,
         leg_radius=config.LEG_CYLINDER_RADIUS,
         foot_radius=config.FOOT_TIP_RADIUS,

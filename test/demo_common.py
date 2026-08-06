@@ -171,6 +171,7 @@ def make_planner(
         alpha_downhill=config.ALPHA_DOWNHILL,
         g=config.G_ACCEL,
         V_max=V_max,
+        mu=config.MU,
         robot_radius=config.ROBOT_RADIUS,
         leg_radius=config.LEG_CYLINDER_RADIUS,
         foot_radius=config.FOOT_TIP_RADIUS,
@@ -187,6 +188,34 @@ def make_planner(
     )
     kwargs.update(overrides)
     return HoppingAStarPlanner(**kwargs)
+
+
+def planner_alpha_interval(
+    planner: HoppingAStarPlanner,
+    m: Map2D5,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    X: float,
+    Z: float,
+) -> tuple[float, float] | None:
+    """`feasible_alpha_interval` fed the planner's own friction-cone inputs.
+
+    The cone depends on the surface normals at both contacts and on the hop
+    heading, none of which are recoverable from `X` and `Z` alone. Calling the
+    bare function would silently fall back to level-ground normals, so every
+    diagnostic on sloped terrain would disagree with the planner it is meant to
+    be explaining. `Map2D5.surface_normals` is memoised, so this is cheap.
+    """
+    normals = m.surface_normals()
+    r0, c0 = m.world_to_grid(p0[0], p0[1])
+    r1, c1 = m.world_to_grid(p1[0], p1[1])
+    return feasible_alpha_interval(
+        X, Z, planner.V_max, planner.g,
+        mu=planner.mu,
+        n_s=tuple(normals[r0, c0]),
+        n_g=tuple(normals[r1, c1]),
+        theta=math.atan2(p1[1] - p0[1], p1[0] - p0[0]),
+    )
 
 
 def diagnose_edge(
@@ -212,7 +241,7 @@ def diagnose_edge(
     # this check, so it is exactly where baseline paths tend to go wrong.
     landing = m.world_to_grid(p1[0], p1[1])
     standable = bool(planner._standable[landing[0], landing[1]])
-    iv = feasible_alpha_interval(X, Z, planner.V_max, planner.g)
+    iv = planner_alpha_interval(planner, m, p0, p1, X, Z)
     if iv is None:
         return {"feasible": False, "standable": standable,
                 "X": X, "Z": Z, "alpha_s": None,
@@ -364,10 +393,10 @@ def enumerate_ring_candidates(
             out.append(entry)
             continue
 
-        iv = feasible_alpha_interval(X, Z, planner.V_max, planner.g)
+        iv = planner_alpha_interval(planner, m, (px, py), (nx, ny), X, Z)
         if iv is None:
             entry["gate"] = "physics"
-            entry["reason"] = "infeasible (V_max / geometry)"
+            entry["reason"] = "infeasible (friction cone / V_max / geometry)"
             out.append(entry)
             continue
 

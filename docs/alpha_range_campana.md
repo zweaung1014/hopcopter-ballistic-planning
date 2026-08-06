@@ -1,3 +1,22 @@
+> **STATUS: implemented. Two errata found — read before using this document.**
+>
+> This spec was the input to the friction-cone work; the shipped implementation lives in
+> `hopping_astar_planner.feasible_alpha_interval` and is described in
+> `docs/alpha_range_new.md`. Section 6 below correctly warned that the OCR'd formulas needed
+> numeric validation. They did. Two are wrong as written:
+>
+> 1. **Section 3, constraint (2): the sign of the `2*Z/X_theta` term is wrong.** It is
+>    `arctan(+2*Z/X_theta - tan(alpha_g))`, not `-2*Z/X_theta`. Derivation and numbers in
+>    `docs/alpha_range_new.md`; the error is invisible when `Z = 0`, which is presumably how
+>    it survived. Case (4) of `test/test_friction_cone.py` pins it against the flown arc.
+> 2. **Section 3, constraints (3) and (4): the `arctan()` suspicion was correct.** Those
+>    fractions are `tan(alpha)` values and do need `arctan`. Confirmed by deriving the
+>    quadratic in `tan(alpha)` directly; case (6) of the test anchors it against the
+>    superseded `asin(K)` formulation.
+>
+> Also note: the implementation replaces Algorithm 1's case split on `sign(gamma_g)` with a
+> single branch, because heightmap normals always give `gamma_g` in `(0, pi)`.
+
 Task: Implement friction-cone-constrained ballistic jump validity check
 Implement the BEAM(cs, cg, mu, Vmax) and STEER(cs, cg, mu, Vmax, n_limit) functions from Campana & Laumond, "Ballistic Motion Planning" (IROS 2016), Sections III–V. These determine whether a parabolic jump between two contact points is admissible (non-sliding + bounded velocity) and, if so, pick a concrete takeoff angle.
 1. Setup per candidate jump (cs -> cg)

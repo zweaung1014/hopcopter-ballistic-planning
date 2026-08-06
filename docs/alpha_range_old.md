@@ -1,3 +1,10 @@
+> **SUPERSEDED by `docs/alpha_range_new.md`.** This describes the two-constraint,
+> map-free interval that shipped before the friction cone. Kept as the "before"
+> record - its "Modeling gaps" section is what motivated the change, and its final
+> paragraph correctly predicted how the cone would slot in. `feasible_alpha_interval`
+> now implements Campana's full BEAM (five constraints, with surface normals threaded
+> in).
+
 Takeoff angle (α) selection in hopping_astar_planner.py
 Repo: planning_2p5Dmap — ballistic hop planner on a 2.5D grid, physics from Campana & Laumond (2016). α is measured from the world horizontal, not from the local surface.
 Stage 1 — build the feasible interval: feasible_alpha_interval(X, Z, V_max, g) (line 64)

@@ -26,10 +26,14 @@ class Map2D5:
         # caching is safe; `paint_region`/`set_obstacle*` invalidate it anyway.
         self._fill_cache_key: float | None = None
         self._fill_cache_grid: np.ndarray | None = None
+        # Memo for the per-cell surface normals (see `surface_normals`).
+        self._normal_cache: np.ndarray | None = None
 
-    def _invalidate_fill_cache(self) -> None:
+    def _invalidate_caches(self) -> None:
+        """Drop every grid-derived memo. Call after any write to `self.grid`."""
         self._fill_cache_key = None
         self._fill_cache_grid = None
+        self._normal_cache = None
 
     def _filled_grid(self, obstacle_fill: float | None) -> np.ndarray:
         """`self.grid` with OBSTACLE cells replaced by `obstacle_fill`.
@@ -173,7 +177,7 @@ class Map2D5:
             rmask &= row_centers < y_max - eps
 
         self.grid[np.ix_(rmask, cmask)] = z
-        self._invalidate_fill_cache()
+        self._invalidate_caches()
 
     def standable_mask(
         self,
@@ -275,18 +279,108 @@ class Map2D5:
 
         return (min_margin >= clearance) & (self.grid != self.OBSTACLE)
 
+    def _min_abs_slope(self, axis: int) -> np.ndarray:
+        """Per-cell terrain slope along one grid axis, in the min-|.| sense.
+
+        `axis=1` differences along columns (the world x direction), `axis=0`
+        along rows (world y). See `surface_normals` for why the smaller-
+        magnitude one-sided difference is the right estimate.
+
+        OBSTACLE cells participate in no difference at all (their `-1.0` is a
+        sentinel, not an elevation), so a cell beside an obstacle falls back to
+        its other neighbour, and a cell with no valid neighbour on either side
+        reads as flat.
+        """
+        z = self.grid
+        ok = z != self.OBSTACLE
+        res = self.resolution
+
+        fwd = np.full(z.shape, np.nan)
+        bwd = np.full(z.shape, np.nan)
+
+        if axis == 1:
+            d = (z[:, 1:] - z[:, :-1]) / res
+            pair_ok = ok[:, 1:] & ok[:, :-1]
+            d = np.where(pair_ok, d, np.nan)
+            fwd[:, :-1] = d   # slope looking forward from column c
+            bwd[:, 1:] = d    # ...is the same slope looking back from c+1
+        else:
+            d = (z[1:, :] - z[:-1, :]) / res
+            pair_ok = ok[1:, :] & ok[:-1, :]
+            d = np.where(pair_ok, d, np.nan)
+            fwd[:-1, :] = d
+            bwd[1:, :] = d
+
+        # Keep whichever one-sided difference is smaller in magnitude. A missing
+        # neighbour reads as `inf` magnitude so it always loses to a real one;
+        # when both are missing the `np.where` yields NaN, which becomes 0.
+        mag_f = np.where(np.isnan(fwd), np.inf, np.abs(fwd))
+        mag_b = np.where(np.isnan(bwd), np.inf, np.abs(bwd))
+        return np.nan_to_num(np.where(mag_f <= mag_b, fwd, bwd), nan=0.0)
+
+    def surface_normals(self) -> np.ndarray:
+        """Per-cell outward unit surface normals, shape `(rows, cols, 3)`.
+
+        A 2.5D grid stores no normals, so they have to be inferred by
+        differencing neighbouring elevations. The estimator matters: a
+        **central** difference is wrong at every terrain discontinuity, because
+        it averages the flat ground and the vertical face into one fictitious
+        ramp. On `maps/tall_stairs.py` (0.4 m riser, 0.1 m cells) the cell at
+        `x in [1.9, 2.0)` — flat ground at the foot of the step — reads a grade
+        of `0.4 / 0.2 = 2.0`, a 63 degree surface, when the foot is in fact
+        resting on level ground.
+
+        That matters here because the friction cone keys off this normal: at
+        grade 2.0 the cone-plane intersection is degenerate (`cos(beta)/A > 1`)
+        and *no* takeoff is possible from precisely the cell the planner most
+        needs.
+
+        So each axis takes the **smaller-magnitude of the two one-sided
+        differences** instead:
+
+          * at the foot of a riser, forward reads 4.0 and backward reads 0, so
+            0 wins — the foot is on a flat tread, and the riser belongs to the
+            neighbouring cell's contact plane, not this one;
+          * on a uniform grade the two one-sided differences agree, so the
+            grade is recovered exactly (`maps/slope_crest.py`'s ramp reads
+            0.35, not an averaged value).
+
+        The normal of the surface `z = f(x, y)` is `(-df/dx, -df/dy, 1)`,
+        normalised. `n_z > 0` always, which the friction-cone code relies on
+        (it puts the in-plane cone axis `gamma` in `(0, pi)`).
+
+        OBSTACLE cells get `(0, 0, 1)`. The value is inert: obstacle cells are
+        never standable and are rejected as landing cells outright, so no cone
+        is ever built on one.
+
+        Memoised — the planner reads this once per construction, like
+        `standable_mask`.
+        """
+        if self._normal_cache is not None:
+            return self._normal_cache
+
+        s_x = self._min_abs_slope(axis=1)
+        s_y = self._min_abs_slope(axis=0)
+
+        n = np.stack([-s_x, -s_y, np.ones_like(s_x)], axis=-1)
+        n /= np.linalg.norm(n, axis=-1, keepdims=True)
+        n[self.grid == self.OBSTACLE] = (0.0, 0.0, 1.0)
+
+        self._normal_cache = n
+        return n
+
     def set_obstacle(self, x: float, y: float):
         """Mark the cell at world position (x, y) as an obstacle."""
         row, col = self.world_to_grid(x, y)
         self.grid[row, col] = self.OBSTACLE
-        self._invalidate_fill_cache()
+        self._invalidate_caches()
 
     def set_obstacle_region(self, x_min: float, y_min: float, x_max: float, y_max: float):
         """Mark a rectangular region as obstacles."""
         r_min, c_min = self.world_to_grid(x_min, y_min)
         r_max, c_max = self.world_to_grid(x_max, y_max)
         self.grid[r_min:r_max + 1, c_min:c_max + 1] = self.OBSTACLE
-        self._invalidate_fill_cache()
+        self._invalidate_caches()
 
     def is_within_bounds(self, x: float, y: float) -> bool:
         """Check if (x, y) is within map boundaries."""

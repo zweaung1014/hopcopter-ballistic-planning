@@ -114,6 +114,23 @@ V_MAX = math.sqrt(2.0 * G_ACCEL * MAX_APEX_HEIGHT)  # 4.852 m/s
         # this affords is V_MAX^2 / g = 2.40 m, and a flat hop of distance X
         # needs v_s >= sqrt(g*X), so HOP_RADIUS must stay well under that.
 
+MU = 1.2  # Coulomb friction coefficient, uniform over the environment (as in
+          # Campana & Laumond). Sets the friction cone's half-angle
+          # `beta = atan(MU)` = 50.19 deg at this value.
+          #
+          # This is a real constraint on the takeoff angle, not a safety factor.
+          # On FLAT ground the cone alone forces `alpha >= atan(1/MU)` = 39.79
+          # deg at both contact points — push any shallower and the foot slips.
+          # For reference, the paper benchmarks MU in {0.5, 1.2}; MU = 0.5 would
+          # put the flat-ground floor at 63.43 deg.
+          #
+          # It also caps how steep a surface the robot can contact at all: a
+          # cross-slope of grade > MU makes the cone-plane intersection
+          # degenerate (see `hopping_astar_planner.inplane_friction_cone`), so
+          # no hop can start or land there. At MU = 1.2 that limit (1.2) sits
+          # just below `standable_mask`'s geometric ceiling (~1.21), so friction
+          # is now the binding standability limit — by a hair.
+
 MIN_CLEARANCE = 0.10  # m; HARD gate — an arc whose body-to-terrain clearance ever
                       # drops below this is rejected outright. Clearance does NOT
                       # enter the edge cost; it is purely a feasibility test.
@@ -163,4 +180,24 @@ assert OBSTACLE_WALL_EXTRA >= (
 # widest part of the capsule.
 assert ROBOT_RADIUS >= LEG_CYLINDER_RADIUS and ROBOT_RADIUS >= FOOT_TIP_RADIUS, (
     "ROBOT_RADIUS (CoM sphere) must be the largest of the three capsule radii."
+)
+
+# Same silent-failure hazard as the MIN_CLEARANCE assert above, one gate later.
+# The friction cone raises the takeoff-angle floor to `pi/2 - atan(MU)` on flat
+# ground; if that ever rises above the leg-energy ceiling at HOP_RADIUS, the
+# feasible interval is empty for *every* flat hop and plan() returns None
+# everywhere with no obvious symptom. At shipped values the floor is 39.79 deg
+# against a ceiling of 77.66 deg.
+assert MU > 0.0, "MU must be positive."
+_FLAT_DISC = V_MAX**4 - G_ACCEL**2 * HOP_RADIUS**2
+assert _FLAT_DISC >= 0.0, (
+    f"HOP_RADIUS = {HOP_RADIUS} m exceeds the flat-hop reach of V_MAX "
+    f"({V_MAX**2 / G_ACCEL:.2f} m) — no flat hop is feasible at any angle."
+)
+assert math.pi / 2 - math.atan(MU) < math.atan(
+    (V_MAX**2 + math.sqrt(_FLAT_DISC)) / (G_ACCEL * HOP_RADIUS)
+), (
+    f"MU = {MU} is too low — the friction cone's flat-ground floor "
+    f"({math.degrees(math.pi / 2 - math.atan(MU)):.2f} deg) sits above the "
+    f"leg-energy ceiling at HOP_RADIUS, so no flat hop is feasible."
 )

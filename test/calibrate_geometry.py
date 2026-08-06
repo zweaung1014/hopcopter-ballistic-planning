@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 import config
-from demo_common import HOP_RADIUS, V_MAX, make_planner
+from demo_common import HOP_RADIUS, V_MAX, make_planner, planner_alpha_interval
 from hopping_astar_planner import (
     alpha_for_clearance,
     feasible_alpha_interval,
@@ -116,7 +116,7 @@ def probe(m: Map2D5, x_takeoff: float, x_landing: float, planner) -> dict:
         res.update(gate="out of range", mc=None, alpha_s=None)
         return res
 
-    iv = feasible_alpha_interval(X, Z, planner.V_max, planner.g)
+    iv = planner_alpha_interval(planner, m, p0, p1, X, Z)
     if iv is None:
         res.update(gate="physics", mc=None, alpha_s=None)
         return res

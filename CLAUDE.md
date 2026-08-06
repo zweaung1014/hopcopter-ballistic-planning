@@ -33,6 +33,7 @@ python main.py tall_stairs   # positional arg selects maps/<name>.py; run with a
 
 # Numeric correctness checks (prints PASS/FAIL per case, exits 1 on any failure)
 python test/test_clearance_rejection.py
+python test/test_friction_cone.py       # BEAM / friction-cone ground-truth validation
 
 # Timing/scaling benchmark (ballistic vs. baseline planner on the same scenario)
 python test/benchmark_tall_stairs.py
@@ -45,6 +46,7 @@ python test/time_deck.py results/after_LS_recs/timings.md
 # Open the generated PNGs to inspect results.
 python test/demo_tall_stairs.py
 python test/demo_clearance_sweep.py
+python test/demo_friction_cone.py
 python test/demo_barely_jumpable.py
 python test/demo_narrow_wall_showcase.py
 python test/demo_planner_reroute.py
@@ -67,7 +69,7 @@ hopping_astar_planner.py ← HoppingAStarPlanner: the active planner (ballistic 
 visualizer.py            ← Visualizer: matplotlib rendering (grid, arcs, path)
 main.py                  ← entry point: load_map(name) → plan() → visualize
 test/                     ← demo scripts (produce PNGs), a benchmark, a timing
-                            harness, and one assertion-based numeric test (no pytest)
+                            harness, and two assertion-based numeric tests (no pytest)
 results/                  ← generated figures + timing tables, one dir per run
 ```
 
@@ -84,7 +86,16 @@ memoised), `get_elevation_bilinear` (scalar wrapper over it), `set_obstacle_regi
 `(1 - LEG_CLEARANCE_START_FRAC)` of the leg cylinder sides, radius
 `LEG_CYLINDER_RADIUS` — at shipped values `LEG_CYLINDER_RADIUS` is thinner than
 `CELL_RESOLUTION`, so in practice the CoM sphere, not the leg-cylinder-sides
-channel, governs the max standable grade, ~1.25 at shipped values).
+channel, governs the max standable grade, ~1.25 at shipped values),
+`surface_normals` (per-cell outward unit normals for the friction cone; memoised).
+
+**`surface_normals` uses min-|slope| one-sided differences, not a central
+difference,** and that is a correctness requirement, not a refinement. A central
+difference straddles a discontinuity and reports a fictitious ramp: at the foot of
+`tall_stairs`' 0.4 m riser it reads grade 2.0, which makes the friction cone
+degenerate and kills takeoff from exactly the cell the planner needs. Taking the
+smaller-magnitude one-sided difference per axis picks the flat tread the foot
+actually rests on, while still recovering a uniform grade exactly.
 
 **Always paint terrain with `paint_region`,** which takes world-metre bounds. Raw
 column slices (`grid[:, 10:13]`) hard-code a cell count, and `world_to_grid(...)`
@@ -94,7 +105,7 @@ physical terrain when `CELL_RESOLUTION` changes.
 ### Maps (`maps/`)
 
 Each module (`stairs.py`, `tall_stairs.py`, `tall_wall.py`, `tall_narrow_wall.py`,
-`barely_jumpable_wall.py`) exposes `build() -> Map2D5` and hand-paints elevation
+`barely_jumpable_wall.py`, `slope_crest.py`, `cross_slope.py`) exposes `build() -> Map2D5` and hand-paints elevation
 regions directly into `env_map.grid`. `main.py` dynamically imports `maps.<name>` based
 on the CLI arg. Add a new scenario by adding a new module here with a `build()`
 function — no registration step needed.
@@ -121,9 +132,13 @@ neighbor generation and edge validation are non-trivial:
   2. **stance gate** (`Map2D5.standable_mask`, precomputed once): reject if the
      robot's body cannot rest at the landing cell without overlapping nearby
      terrain;
-  3. **feasibility gate** (`feasible_alpha_interval`): reject unless some takeoff
-     angle `alpha` satisfies both Campana Eq. 4 validity and the leg-energy limit
-     `v_s = xdot/cos(alpha) <= V_max`;
+  3. **feasibility gate** (`feasible_alpha_interval`) — Campana's BEAM: reject
+     unless some takeoff angle `alpha` satisfies all five of Eq. 4 validity, the
+     Coulomb friction cone at the takeoff contact, the friction cone at the
+     landing contact (mapped back through the arc), the takeoff leg-energy limit
+     `v_s <= V_max`, and the landing limit `v_g <= V_max`. This is the only gate
+     that depends on the hop's *heading*, because it is the only one that sees the
+     surface normals. See `docs/alpha_range_new.md`;
   4. **clearance gate**: `terrain_profile` samples the corridor the body sweeps,
      then `alpha_for_clearance` picks a takeoff angle and reports the resulting
      clearance; reject if it is below `min_clearance_gate`;
@@ -134,6 +149,9 @@ neighbor generation and edge validation are non-trivial:
   physics feasibility gate — used only for A/B baseline comparisons (e.g. in
   `test/benchmark_tall_stairs.py`), never for real planning. Note this is now a
   *feasibility* A/B ("which candidates exist"), not a cost-shaping one.
+- `mu=None` is the analogous knob for the friction cone: it drops BEAM constraints
+  (1) and (2) while keeping Eq. 4 validity and both velocity limits. A/B baselines
+  only (`test/demo_friction_cone.py`), never real planning.
 
 ### The robot model — three things that are easy to get wrong
 
@@ -194,6 +212,15 @@ ballistic/clearance parameter, add it to `config.py` and thread it through both
 `main.py` and any test/demo script that constructs a `HoppingAStarPlanner`.
 
 Notable non-obvious parameters:
+- `MU` (Coulomb friction, 1.2) is a **hard physical constraint**, not a safety
+  factor. On flat ground the cone alone forces `alpha >= atan(1/MU)` = 39.8°, well
+  above the 12.3° the pre-cone interval allowed for a 1 m hop, so it changes the
+  chosen angle on essentially every edge. It also caps the steepest contactable
+  cross-slope at `MU` itself — which at 1.2 sits just under `standable_mask`'s
+  geometric ceiling (~1.21), making friction the binding standability limit by a
+  hair. `config.py` asserts the flat-ground cone floor stays below the leg-energy
+  ceiling at `HOP_RADIUS`; violating it empties the interval for *every* flat hop
+  and `plan()` returns None everywhere with no other symptom.
 - `V_MAX` is **derived**, not tuned: `sqrt(2 * G_ACCEL * MAX_APEX_HEIGHT)`, i.e. the
   speed needed to raise the CoM `MAX_APEX_HEIGHT` on a vertical in-place hop. The
   longest feasible flat hop it affords is `V_MAX^2 / G_ACCEL`, and a flat hop of
@@ -244,6 +271,11 @@ they need more specialized plots than the generic `Visualizer` provides.
   and baseline (`disable_clearance=True`) planners, save annotated PNGs via
   `demo_common.out_path()` (`results/after_LS_recs/` by default, override with
   `$PLANNER_OUT_DIR`).
+- **Diagnostics that re-score an edge outside the planner must go through
+  `demo_common.planner_alpha_interval`,** never a bare `feasible_alpha_interval(X, Z,
+  V_max, g)`. The friction cone needs both surface normals and the heading, none of
+  which are recoverable from `X` and `Z`; the bare call silently assumes level ground,
+  so on sloped terrain the diagnostic disagrees with the planner it is explaining.
 - `CHANGELOG.md` (Keep a Changelog format) is actively maintained — update it under
   `[Unreleased]` when making a notable change to the planner or its parameters.
 - Pure, unit-testable physics functions (`feasible_alpha_interval`, `predict_trajectory`,

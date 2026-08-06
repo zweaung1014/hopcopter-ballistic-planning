@@ -61,39 +61,197 @@ from map2d5 import Map2D5
 _ALPHA_EPS = 1e-6
 
 
+#: Normal of perfectly level ground — the default when no terrain normal is
+#: supplied. Gives `gamma = pi/2`, `delta = beta`, i.e. the textbook flat-ground
+#: friction cone `alpha in [pi/2 - atan(mu), pi/2 + atan(mu)]`.
+_FLAT_NORMAL = (0.0, 0.0, 1.0)
+
+
+def inplane_friction_cone(
+    n: tuple[float, float, float],
+    theta: float,
+    mu: float,
+) -> tuple[float, float] | None:
+    """Reduce a 3D Coulomb friction cone to a 2D wedge in the hop plane.
+
+    A contact velocity does not slip iff it lies within the cone of half-angle
+    `beta = atan(mu)` around the surface normal `n`. The whole parabola lives in
+    the vertical plane through the hop heading `theta`, so only that cone's
+    intersection with the plane matters — itself an angular wedge, returned as
+    `(gamma, delta)`: axis direction and half-angle, both measured in-plane from
+    the horizontal.
+
+    Campana & Laumond state this reduction (Sec. IV-A) but omit the formula for
+    `delta` (their footnote 1). It is the standard cone/plane intersection: with
+    `n_xt` the normal's component along the in-plane horizontal axis and `A` the
+    length of the normal's projection into the plane,
+
+        gamma = atan2(n_z, n_xt)
+        A     = hypot(n_xt, n_z)          <= 1, since `n` also has an
+                                          out-of-plane component
+        delta = acos(cos(beta) / A)       <= beta, matching the paper's
+                                          stated property
+
+    Returns `None` when `cos(beta) / A > 1`: the plane then touches the cone
+    only at its apex, so the wedge degenerates to a single direction and no jump
+    is possible at this contact (paper, Fig. 1). Concretely this is what
+    happens on a cross-slope steeper than `mu` — a surface the robot could not
+    stand on without sliding.
+
+    `gamma` is always in `(0, pi)` for terrain from a 2.5D grid, because
+    `Map2D5.surface_normals` always yields `n_z > 0`. `_landing_cone_alpha_s`
+    relies on that.
+    """
+    n_xt = n[0] * math.cos(theta) + n[1] * math.sin(theta)
+    n_z = n[2]
+
+    A = math.hypot(n_xt, n_z)
+    if A < 1e-12:
+        return None  # normal perpendicular to the hop plane — no usable wedge
+
+    c = math.cos(math.atan(mu)) / A
+    if c > 1.0:
+        return None  # degenerate: plane meets the cone only at the apex
+    return math.atan2(n_z, n_xt), math.acos(min(1.0, max(-1.0, c)))
+
+
+def _speed_tan_interval(
+    X: float,
+    Z: float,
+    W: float,
+    g: float,
+) -> tuple[float, float] | None:
+    """`tan(alpha_s)` interval satisfying the takeoff-speed bound `v_s^2 <= W`.
+
+    Substituting Campana Eq. 4 into `v_s = xdot / cos(alpha)` and writing
+    `T = tan(alpha_s)` gives `v_s^2 = g X^2 (1 + T^2) / (2 (X T - Z))`, so
+    `v_s^2 <= W` is the quadratic
+
+        g X^2 T^2  -  2 W X T  +  (g X^2 + 2 W Z)  <=  0
+
+    whose roots are `T = (W +- sqrt(D)) / (g X)` with
+    `D = W^2 - g^2 X^2 - 2 g Z W`. A negative `D` means no angle meets the
+    bound.
+
+    One helper covers **both** of Campana's velocity constraints, because
+    energy conservation on the CoM gives `v_g^2 = v_s^2 - 2 g Z`:
+
+        (3) takeoff, `v_s <= V_max`:  W = V_max^2
+            -> D = V_max^4 - 2 g Z V_max^2 - g^2 X^2   (the paper's `Delta`)
+        (4) landing, `v_g <= V_max`:  W = V_max^2 + 2 g Z
+            -> D = V_max^4 + 2 g Z V_max^2 - g^2 X^2   (the paper's `Lambda`)
+
+    Note these are `tan(alpha)` values, not angles — the caller must `atan`
+    them. (`docs/alpha_range_campana.md` flags the paper's notation as
+    ambiguous here; the derivation above settles it.)
+
+    `W <= 0` (only reachable for constraint 4, on a drop so large that
+    `2 g |Z|` alone exceeds the landing budget) returns `None`.
+    """
+    if W <= 0.0:
+        return None
+    D = W * W - g * g * X * X - 2.0 * g * Z * W
+    if D < 0.0:
+        return None
+    s = math.sqrt(D)
+    return (W - s) / (g * X), (W + s) / (g * X)
+
+
+def _landing_cone_alpha_s(
+    X: float,
+    Z: float,
+    gamma_g: float,
+    delta_g: float,
+) -> tuple[float, float] | None:
+    """Landing non-sliding constraint, expressed as an interval on `alpha_s`.
+
+    The robot arrives at the goal contact moving *into* the surface, so it is
+    the reversed velocity `-v_g` that must lie inside the landing cone. In
+    terms of the in-plane arrival angle `alpha_g` that reads
+
+        alpha_g + pi  in  [gamma_g - delta_g, gamma_g + delta_g]
+
+    Relating `alpha_g` to the takeoff angle: differentiating Campana Eq. 2 and
+    substituting Eq. 4 (`g / xdot^2 = 2 (X tan(alpha_s) - Z) / X^2`) gives
+
+        tan(alpha_g) = tan(alpha_s) - 2 (X tan(alpha_s) - Z) / X
+                     = -tan(alpha_s) + 2 Z / X
+
+    so `tan(alpha_s) = 2 Z / X - tan(alpha_g)`, a strictly **decreasing** map:
+    the interval endpoints swap. (Note the sign of the `2 Z / X` term — it is
+    positive. `docs/alpha_range_campana.md` transcribes it as negative, which
+    only coincides when `Z = 0`; see that file's errata note.)
+
+    Rather than the paper's Algorithm 1 case split on `sign(gamma_g)`, this
+    clamps the `alpha_g` interval to the range a real descending parabola can
+    actually produce, `(-pi/2, atan2(Z, X))`, and maps the endpoints. That
+    subsumes the algorithm's `no_solution` / `undefined` branches, keeps `tan`
+    finite, and needs no case split: `gamma_g` is always in `(0, pi)` for
+    heightmap terrain, so only the paper's `gamma_g > 0` branch can ever occur.
+    """
+    gamma_r = gamma_g - math.pi  # reversed cone axis; in (-pi, 0)
+
+    lo_g = max(gamma_r - delta_g, -0.5 * math.pi + _ALPHA_EPS)
+    hi_g = min(gamma_r + delta_g, math.atan2(Z, X))
+    if lo_g >= hi_g:
+        return None
+
+    k = 2.0 * Z / X
+    return math.atan(k - math.tan(hi_g)), math.atan(k - math.tan(lo_g))
+
+
 def feasible_alpha_interval(
     X: float,
     Z: float,
     V_max: float,
     g: float,
+    *,
+    mu: float | None = 1.2,
+    n_s: tuple[float, float, float] | None = None,
+    n_g: tuple[float, float, float] | None = None,
+    theta: float = 0.0,
 ) -> tuple[float, float] | None:
     """Feasible takeoff-angle interval [alpha_min, alpha_max] for a hop.
 
-    Combines two constraints:
+    This is Campana & Laumond's BEAM: the intersection of four physical
+    constraints plus the geometric validity of Eq. 4. Given `X` and `Z`,
+    choosing `alpha` fixes the parabola completely, so every constraint reduces
+    to an interval on `alpha`.
 
-    (i)  Campana Eq. 4 validity: `X*tan(alpha) - Z > 0`, i.e.
-         `alpha in (atan2(Z, X), pi/2)`. This branch of atan2 naturally
-         handles Z < 0 (downhill): atan2 returns a negative angle, so the
-         geometric lower bound simply moves below 0 and the feasibility
-         interval widens.
+    (i)   Campana Eq. 4 validity: `X*tan(alpha) - Z > 0`, i.e.
+          `alpha in (atan2(Z, X), pi/2)`. Physically, a projectile falls below
+          its launch ray, so you must aim above the chord to the target.
 
-    (ii) Leg energy: `v_s(alpha) = xdot(alpha)/cos(alpha) <= V_max`. From
-         Campana Eq. 4 this rearranges to
-              X * sin(2 alpha) - Z * cos(2 alpha)  >=  g X^2 / V_max^2 + Z
-         Writing the LHS as `R * sin(2 alpha + psi)` with
-              R   = sqrt(X^2 + Z^2)
-              psi = atan2(-Z, X)
-         and letting `K = (g X^2 / V_max^2 + Z) / R`:
-           * K >  1  -> no alpha satisfies (ii): leg too weak. Return None.
-           * K < -1  -> every alpha satisfies (ii); the velocity interval is
-                        the whole real line.
-           * else    -> `sin(2 alpha + psi) >= K` gives
-                        2 alpha + psi in [asin K, pi - asin K], i.e.
-                        alpha_lo_v = (asin K - psi) / 2
-                        alpha_hi_v = (pi - asin K - psi) / 2
+    (1)   Takeoff non-sliding: the takeoff direction *is* `alpha_s`, so the
+          friction wedge at the start contact applies directly —
+          `alpha in [gamma_s - delta_s, gamma_s + delta_s]`.
 
-    The final interval is the intersection of (i) and (ii), shrunk by
-    `_ALPHA_EPS` at each end for numerical safety. Returns `None` if empty.
+    (2)   Landing non-sliding: see `_landing_cone_alpha_s`.
+
+    (3)   Takeoff leg energy, `v_s <= V_max`.
+
+    (4)   Landing leg energy, `v_g <= V_max` — the leg must absorb the arrival
+          as well as produce the departure. Since `v_g^2 = v_s^2 - 2 g Z`, this
+          is slack relative to (3) on uphill hops and tighter on downhill ones.
+
+    (3) and (4) share `_speed_tan_interval`; (1) and (2) share
+    `inplane_friction_cone`.
+
+    Parameters
+    ----------
+    mu : friction coefficient. `None` disables constraints (1) and (2) entirely
+        — for A/B baselines that isolate what the friction cone contributes,
+        mirroring `HoppingAStarPlanner.disable_clearance`. Do NOT use `None`
+        for real planning; constraints (i), (3) and (4) still apply.
+    n_s, n_g : outward unit surface normals at the takeoff and landing contacts,
+        from `Map2D5.surface_normals()`. Default to level ground.
+    theta : hop heading, `atan2(dy, dx)`. Only the normals' components in the
+        hop plane matter, and `theta` is what defines that plane; it is
+        irrelevant when both normals are vertical.
+
+    Returns the interval shrunk by `_ALPHA_EPS` at each end for numerical
+    safety, or `None` if any constraint is unsatisfiable or the intersection is
+    empty.
     """
     if X < 1e-9:
         # Degenerate horizontal displacement: not a real hop. The planner's
@@ -101,27 +259,41 @@ def feasible_alpha_interval(
         # defensive.
         return None
 
-    # (i) Geometric interval from Campana Eq. 4 validity.
-    alpha_lo_geom = math.atan2(Z, X)
-    alpha_hi_geom = 0.5 * math.pi
+    # (i) Geometric interval from Campana Eq. 4 validity. This branch of atan2
+    # naturally handles Z < 0 (downhill): the bound simply moves below 0.
+    alpha_lo = math.atan2(Z, X)
+    alpha_hi = 0.5 * math.pi
 
-    # (ii) Velocity interval from v_s <= V_max.
-    R = math.hypot(X, Z)
-    psi = math.atan2(-Z, X)
-    K = (g * X * X / (V_max * V_max) + Z) / R
+    # (3) Takeoff leg energy, and (4) landing leg energy.
+    for W in (V_max * V_max, V_max * V_max + 2.0 * g * Z):
+        tan_iv = _speed_tan_interval(X, Z, W, g)
+        if tan_iv is None:
+            return None
+        alpha_lo = max(alpha_lo, math.atan(tan_iv[0]))
+        alpha_hi = min(alpha_hi, math.atan(tan_iv[1]))
 
-    if K > 1.0:
-        return None  # even the min v_s exceeds V_max -> leg too weak
-    if K < -1.0:
-        alpha_lo_vel = -math.inf
-        alpha_hi_vel = math.inf
-    else:
-        asin_K = math.asin(K)
-        alpha_lo_vel = 0.5 * (asin_K - psi)
-        alpha_hi_vel = 0.5 * (math.pi - asin_K - psi)
+    if mu is not None:
+        # (1) Takeoff non-sliding — the wedge applies to alpha_s directly.
+        cone_s = inplane_friction_cone(n_s if n_s is not None else _FLAT_NORMAL,
+                                       theta, mu)
+        if cone_s is None:
+            return None
+        alpha_lo = max(alpha_lo, cone_s[0] - cone_s[1])
+        alpha_hi = min(alpha_hi, cone_s[0] + cone_s[1])
 
-    alpha_min = max(alpha_lo_geom, alpha_lo_vel) + _ALPHA_EPS
-    alpha_max = min(alpha_hi_geom, alpha_hi_vel) - _ALPHA_EPS
+        # (2) Landing non-sliding — mapped back through the parabola.
+        cone_g = inplane_friction_cone(n_g if n_g is not None else _FLAT_NORMAL,
+                                       theta, mu)
+        if cone_g is None:
+            return None
+        land_iv = _landing_cone_alpha_s(X, Z, cone_g[0], cone_g[1])
+        if land_iv is None:
+            return None
+        alpha_lo = max(alpha_lo, land_iv[0])
+        alpha_hi = min(alpha_hi, land_iv[1])
+
+    alpha_min = alpha_lo + _ALPHA_EPS
+    alpha_max = alpha_hi - _ALPHA_EPS
 
     if alpha_min >= alpha_max:
         return None
@@ -526,8 +698,9 @@ class HoppingAStarPlanner:
     current cell. A hop is accepted only when a ballistic (parabolic) arc
     exists that:
 
-      * lands within the leg's takeoff-speed budget `V_max`
-        (Campana Eq. 4 + `v_s = xdot / cos(alpha) <= V_max`);
+      * satisfies Campana's BEAM — Eq. 4 validity, the Coulomb friction cone
+        at both the takeoff and landing contacts, and the leg's speed budget
+        `V_max` at both ends (`v_s` to produce the hop, `v_g` to absorb it);
       * keeps the robot's body at least `min_clearance_gate` clear of the
         terrain across the whole corridor it sweeps.
 
@@ -554,6 +727,10 @@ class HoppingAStarPlanner:
         # Ballistic / clearance parameters (defaults match config.py).
         g: float = 9.81,
         V_max: float = 4.852,
+        # Coulomb friction coefficient (Campana's BEAM constraints 1 and 2).
+        # `None` drops the two friction-cone constraints — an A/B baseline knob
+        # only, like `disable_clearance`; the Eq. 4 and leg-energy gates stay.
+        mu: float | None = 1.2,
         robot_radius: float = 0.15,
         leg_radius: float = 0.01,
         foot_radius: float = 0.02,
@@ -582,10 +759,11 @@ class HoppingAStarPlanner:
         # short hops; `hop_fixed_cost` is what keeps it from abusing them.
         min_hop_radius: float = 0.0,
         # Demo/analysis flag: when True, skip the clearance gate entirely. The
-        # Campana Eq. 4 + `v_s <= V_max` feasibility gate and the standability
-        # check still run (they guard physics and static pose, not arc
-        # clearance). Intended for A/B baselines that isolate what the clearance
-        # gate contributes; do NOT use for real planning.
+        # BEAM feasibility gate and the standability check still run (they guard
+        # physics and static pose, not arc clearance). Intended for A/B
+        # baselines that isolate what the clearance gate contributes; do NOT use
+        # for real planning. To isolate the friction cone instead, pass
+        # `mu=None`.
         disable_clearance: bool = False,
     ):
         self.map_env = map_env
@@ -602,6 +780,7 @@ class HoppingAStarPlanner:
         # Ballistic parameters.
         self.g = g
         self.V_max = V_max
+        self.mu = mu
         self.robot_radius = robot_radius
         self.leg_radius = leg_radius
         self.foot_radius = foot_radius
@@ -629,6 +808,10 @@ class HoppingAStarPlanner:
             robot_radius, leg_radius, min_clearance_gate, leg_length,
             leg_clearance_start_frac=leg_clearance_start_frac,
         )
+
+        # Per-cell outward surface normals, for the friction cone at both
+        # contact points. Like `_standable`, computed once and read per edge.
+        self._normals = map_env.surface_normals()
 
         # Convert start/goal to grid coordinates
         self.start_cell = map_env.world_to_grid(start[0], start[1])
@@ -783,8 +966,9 @@ class HoppingAStarPlanner:
           (a) reject if the landing cell itself is an obstacle;
           (b) STANCE GATE: reject if the robot's body cannot sit at the landing
               cell without overlapping nearby terrain (precomputed mask);
-          (c) FEASIBILITY GATE: reject if no `alpha_s` satisfies both
-              Campana Eq. 4 validity and `v_s <= V_max`;
+          (c) FEASIBILITY GATE: reject if no `alpha_s` satisfies Campana Eq. 4
+              validity, the friction cones at both contacts, and the takeoff
+              and landing leg-energy limits (BEAM);
           (d) CLEARANCE GATE: pick the shallowest takeoff angle whose arc keeps
               the body `min_clearance_gate` clear of the terrain, and reject if
               no feasible angle manages it;
@@ -807,8 +991,15 @@ class HoppingAStarPlanner:
         X = float(math.hypot(nx - cx, ny - cy))
         Z = float(neighbor_z - current_z)
 
-        # (c) Ballistic feasibility (Campana Eq. 4 + leg-energy limit).
-        interval = feasible_alpha_interval(X, Z, self.V_max, self.g)
+        # (c) Ballistic feasibility (Campana BEAM: Eq. 4 validity + friction
+        # cones at both contacts + takeoff and landing leg-energy limits).
+        interval = feasible_alpha_interval(
+            X, Z, self.V_max, self.g,
+            mu=self.mu,
+            n_s=tuple(self._normals[current[0], current[1]]),
+            n_g=tuple(self._normals[neighbor[0], neighbor[1]]),
+            theta=math.atan2(ny - cy, nx - cx),
+        )
         if interval is None:
             return None
         alpha_min, alpha_max = interval

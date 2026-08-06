@@ -27,6 +27,7 @@ LEG_R = config.LEG_CYLINDER_RADIUS
 FOOT_R = config.FOOT_TIP_RADIUS
 LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
+MU = config.MU
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
 N_LAT = config.ARC_LATERAL_SAMPLES
 WALL_EXTRA = config.OBSTACLE_WALL_EXTRA
@@ -113,7 +114,10 @@ def main() -> int:
     all_ok &= _check("xs=1.9 (X=1.3)",       _mc_for(1.9, GOAL_X, PILLAR_H), expect_accept=True)
     all_ok &= _check("xs=2.4 (X=0.8, near)", _mc_for(2.4, GOAL_X, PILLAR_H), expect_accept=False)
 
-    # -- Feasibility gate: leg too weak. --
+    # -- Feasibility gate: leg too weak, and the friction cone on top of it. --
+    # `feasible_alpha_interval` is Campana's BEAM: Eq. 4 validity, the friction
+    # cone at both contacts, and the leg-speed budget at takeoff AND landing.
+    # These calls pass no normals, so they exercise the flat-ground cone.
     print("\n(2) feasible_alpha_interval boundaries:")
     iv = feasible_alpha_interval(2.0, 0.0, 4.5, G)
     ok = iv is not None
@@ -124,10 +128,23 @@ def main() -> int:
     print(f"  [{'PASS' if ok else 'FAIL'}] X=5, Z=0, V_max=4.5 -> infeasible: {iv is None}")
     all_ok &= ok
     # The shipped V_MAX is exactly the speed for a 2.40 m flat hop, so that is
-    # the boundary of what the robot can reach on level ground.
+    # the boundary of what the robot can reach on level ground. The cone raises
+    # the floor of the interval but never its ceiling, so this reach is unchanged.
     ok = (feasible_alpha_interval(2.3, 0.0, config.V_MAX, G) is not None
           and feasible_alpha_interval(2.5, 0.0, config.V_MAX, G) is None)
     print(f"  [{'PASS' if ok else 'FAIL'}] shipped V_MAX reaches 2.3 m but not 2.5 m")
+    all_ok &= ok
+    # On level ground both cones reduce to the textbook Coulomb bound, so the
+    # shallowest producible takeoff is atan(1/MU) — a shallower push would slide
+    # the foot out. Comparing against `mu=None` isolates the cone's contribution.
+    iv_cone = feasible_alpha_interval(1.0, 0.0, config.V_MAX, G)
+    iv_bare = feasible_alpha_interval(1.0, 0.0, config.V_MAX, G, mu=None)
+    ok = (abs(iv_cone[0] - math.atan(1.0 / MU)) < 1e-5
+          and abs(iv_cone[1] - iv_bare[1]) < 1e-9)
+    print(f"  [{'PASS' if ok else 'FAIL'}] flat-ground cone floor = atan(1/MU) = "
+          f"{math.degrees(math.atan(1.0 / MU)):.2f}° "
+          f"(was {math.degrees(iv_bare[0]):.2f}°, ceiling unchanged at "
+          f"{math.degrees(iv_cone[1]):.2f}°)")
     all_ok &= ok
 
     # -- OBSTACLE cells in the arc's XY path should always reject. --
@@ -155,15 +172,61 @@ def main() -> int:
           f"max flyable height {reach:.2f} m")
     all_ok &= ok
 
-    # -- Downhill jump widens the feasible interval vs a flat jump of same X. --
-    print("\n(4) Downhill jump widens the feasible interval:")
-    iv_flat = feasible_alpha_interval(2.0, 0.0, 4.5, G)
-    iv_down = feasible_alpha_interval(2.0, -0.5, 4.5, G)
-    flat_w = (iv_flat[1] - iv_flat[0]) if iv_flat else 0.0
-    down_w = (iv_down[1] - iv_down[0]) if iv_down else 0.0
-    ok = iv_down is not None and down_w > flat_w
-    print(f"  [{'PASS' if ok else 'FAIL'}] flat width={math.degrees(flat_w):.1f}° "
-          f"vs downhill width={math.degrees(down_w):.1f}°")
+    # -- Downhill jumps: what the two new BEAM constraints changed. --
+    # This section used to assert "downhill widens the interval". That was true
+    # of the pre-BEAM physics and is no longer, for two independent reasons, one
+    # per new constraint. Both are checked here.
+    print("\n(4) Downhill jumps under the cone and the landing budget:")
+
+    # (4a) The takeoff cone floors alpha_min. Dropping the target lowers the
+    # geometric bound atan2(Z, X) below zero, and the old interval followed it
+    # down — asking a push-only leg to thrust *below* the horizon. The cone
+    # replaces that with the Coulomb floor, which does not depend on Z at all.
+    iv_down = feasible_alpha_interval(1.0, -0.4, config.V_MAX, G)
+    iv_down_bare = feasible_alpha_interval(1.0, -0.4, config.V_MAX, G, mu=None)
+    ok = (iv_down_bare[0] < 0.0 < iv_down[0]
+          and abs(iv_down[0] - math.atan(1.0 / MU)) < 1e-5)
+    print(f"  [{'PASS' if ok else 'FAIL'}] X=1.0, Z=-0.4: alpha_min "
+          f"{math.degrees(iv_down_bare[0]):+.1f}° -> {math.degrees(iv_down[0]):+.1f}° "
+          f"(no longer aims into the ground)")
+    all_ok &= ok
+
+    # (4b) The landing-speed constraint caps how far the robot may drop: the leg
+    # has to absorb the arrival, and `v_g^2 = v_s^2 - 2 g Z` grows with the fall.
+    # The ceiling is V_max^2 / (2 g) — the fall that spends the entire budget on
+    # vertical speed alone — and it is only attained in the limit of a
+    # straight-down hop, since any horizontal travel needs speed of its own.
+    max_drop = config.V_MAX ** 2 / (2.0 * G)
+    ok = (feasible_alpha_interval(0.05, -(max_drop - 0.05), config.V_MAX, G) is not None
+          and feasible_alpha_interval(0.05, -(max_drop + 0.05), config.V_MAX, G) is None)
+    print(f"  [{'PASS' if ok else 'FAIL'}] near-vertical drop capped at "
+          f"V_MAX^2/(2g) = {max_drop:.2f} m (accepts {max_drop - 0.05:.2f} m, "
+          f"rejects {max_drop + 0.05:.2f} m)")
+    all_ok &= ok
+
+    # ...and the cap tightens as the hop gets longer, because horizontal speed
+    # competes with the fall for the same budget.
+    def _max_drop(X: float) -> float:
+        lo, hi = 0.0, 3.0
+        for _ in range(50):
+            mid = 0.5 * (lo + hi)
+            if feasible_alpha_interval(X, -mid, config.V_MAX, G) is not None:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    drops = [(X, _max_drop(X)) for X in (0.05, 0.5, 1.0, 1.5)]
+    ok = all(a[1] > b[1] for a, b in zip(drops, drops[1:])) and drops[0][1] < max_drop
+    print(f"  [{'PASS' if ok else 'FAIL'}] max drop shrinks with hop distance: "
+          + ", ".join(f"X={X}->{d:.2f} m" for X, d in drops))
+    all_ok &= ok
+
+    # The old geometry for this section (X=2.0, Z=-0.5, V_max=4.5) is now
+    # infeasible outright: it needs |v_g| = 5.01 m/s to land, over that budget.
+    ok = feasible_alpha_interval(2.0, -0.5, 4.5, G) is None
+    print(f"  [{'PASS' if ok else 'FAIL'}] the pre-BEAM downhill case "
+          f"(X=2.0, Z=-0.5, V_max=4.5) is rejected by the landing budget")
     all_ok &= ok
 
     # -- The leg/body/gate geometry must leave room to stand at all. --

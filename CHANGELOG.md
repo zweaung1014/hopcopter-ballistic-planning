@@ -7,6 +7,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — friction cone at both contacts (Campana BEAM constraints 1–4)
+
+`feasible_alpha_interval` was pure and map-free: it saw only `X`, `Z`, `V_max` and
+`g`, and applied two constraints (Campana Eq. 4 validity + the takeoff leg-energy
+limit). Nothing about the terrain's surface normal reached it, so the interval
+admitted takeoff angles a real push-only leg cannot produce — most starkly on a
+downhill hop, where `alpha_min` went *negative*, i.e. thrust aimed into the ground.
+`docs/alpha_range_old.md` had flagged this as the largest open modelling gap.
+
+It now implements Campana & Laumond's full **BEAM**: five constraints intersected on
+`alpha`, of which four are physical and one is the pre-existing parabola-validity
+bound. See [docs/alpha_range_new.md](docs/alpha_range_new.md) for the derivations.
+
+- **Physics** — [hopping_astar_planner.py](hopping_astar_planner.py) gains three pure
+  free functions beside `feasible_alpha_interval`, kept unit-testable in isolation per
+  the repo convention:
+  - `inplane_friction_cone(n, theta, mu)` reduces the 3D Coulomb cone (half-angle
+    `beta = atan(mu)`) to the 2D wedge `(gamma, delta)` it cuts in the hop plane, with
+    `delta = acos(cos(beta)/A)`. The paper states this reduction (Sec. IV-A) but omits
+    the formula (its footnote 1); this is the standard cone/plane intersection and
+    reproduces the property the paper does state, `delta <= beta`. Returns `None` when
+    the plane meets the cone only at its apex — a cross-slope steeper than `mu`.
+  - `_speed_tan_interval(X, Z, W, g)` covers **both** velocity constraints, since
+    `v_g^2 = v_s^2 - 2 g Z` makes the landing bound the same quadratic in `tan(alpha)`
+    with `W = V_max^2 + 2 g Z`. Expanding that reproduces the paper's `Delta` and
+    `Lambda` exactly. It replaces the old `asin(K)/psi` formulation, which is
+    algebraically the same constraint (its `K < -1` "unbounded" branch was provably
+    unreachable for `X > 0`).
+  - `_landing_cone_alpha_s` maps the landing wedge back onto `alpha_s` through
+    `tan(alpha_s) = 2Z/X - tan(alpha_g)`. Replaces the paper's Algorithm 1 case split
+    on `sign(gamma_g)` with a single branch: heightmap normals always give
+    `gamma_g in (0, pi)`, so only one branch can occur, and clamping `alpha_g` to what
+    a real descending parabola produces subsumes the algorithm's `no_solution` and
+    `undefined` flags.
+- **Surface normals** — [map2d5.py](map2d5.py) gains `surface_normals()` (memoised
+  alongside the existing fill cache, which `_invalidate_fill_cache` was renamed to
+  `_invalidate_caches` to cover). It uses **min-|slope| one-sided differences**, not a
+  central difference, and that is a correctness requirement: a central difference
+  straddles a discontinuity and invents a ramp, reading grade 2.0 at the foot of
+  `tall_stairs`' 0.4 m riser. That makes `cos(beta)/A = 1.43 > 1` — a degenerate cone
+  at exactly the cell the planner needs to take off from, which would have made the
+  stair maps unplannable. The one-sided rule picks the flat tread the foot actually
+  rests on, while recovering a uniform grade exactly (`slope_crest`'s ramp reads 0.35).
+- **Config** — `MU = 1.2` (the paper benchmarks 0.5 and 1.2). Asserted `> 0`, and
+  asserted that the flat-ground cone floor `pi/2 - atan(MU)` stays below the leg-energy
+  ceiling at `HOP_RADIUS` — otherwise the interval is empty for *every* flat hop and
+  `plan()` returns None everywhere with no other symptom, the same silent-failure class
+  the `MIN_CLEARANCE` assert already guards.
+- **What it changes.** On flat ground both cones collapse to `alpha >= atan(1/MU)` =
+  39.81°, up from 12.31° for a 1 m hop; the chosen angle moves 45.0° → 58.7°. On uphill
+  landings the *landing* cone binds hardest (stair hop `X=0.6, Z=0.4`: `[41.7°, 82.0°]`
+  → `[65.2°, 82.0°]`, chosen 61.9° → 73.6°). Because clearance is monotone in
+  `tan(alpha)`, steeper arcs mean clearance only improves. Constraint (4) is
+  implemented for correctness but never binds on current maps (`Lambda >= 0` needs
+  `Z >= -7.2 m` at `X = 1.5`).
+- **What it deliberately does not change.** The cone cannot make a standable slope
+  impassable — standing requires grade `<= MU`, and the fall-line floor
+  `pi/2 + atan(grade) - atan(MU)` stays under `pi/2` exactly when `grade < MU`, while
+  the energy ceiling tends to `pi/2` as hops shorten. It caps hop *length* by heading,
+  not reachability. `alpha_for_clearance` is untouched: its monotonicity argument
+  depends only on `_arc_z`, not on where the interval came from.
+- **Threaded through**: `mu=config.MU` into all four `HoppingAStarPlanner`
+  construction sites — [main.py](main.py),
+  [test/demo_common.py](test/demo_common.py) `make_planner` (which every other demo
+  goes through), [test/benchmark_tall_stairs.py](test/benchmark_tall_stairs.py) and
+  [test/demo_planner_reroute.py](test/demo_planner_reroute.py).
+
+  Separately, every diagnostic that re-scores an edge outside the planner now goes
+  through a new `demo_common.planner_alpha_interval` helper. The cone needs the two
+  surface normals and the heading, none of which are recoverable from `X` and `Z`, so
+  a bare `feasible_alpha_interval(X, Z, V_max, g)` call silently falls back to level
+  ground — meaning every diagnostic on sloped terrain would quietly disagree with the
+  planner it exists to explain. Fixed in `diagnose_edge` and
+  `enumerate_ring_candidates` ([test/demo_common.py](test/demo_common.py)),
+  `enumerate_ring_candidates` ([test/demo_planner_reroute.py](test/demo_planner_reroute.py),
+  its own copy) and `classify` ([test/calibrate_geometry.py](test/calibrate_geometry.py)).
+- **New scenario**: [maps/cross_slope.py](maps/cross_slope.py), a grade-0.9 side-hill —
+  the only map here traversed in enough directions for the cone to decide anything.
+  [test/demo_friction_cone.py](test/demo_friction_cone.py) plots the result: at
+  mid-hillside the longest feasible hop is 1.50 m across the fall line but only 0.55 m
+  along it, and the planned path takes 7 waypoints with the cone against 5 without,
+  with the extra hops landing on the grade — the effect the paper reports in Table I.
+- **Tests**: [test/test_friction_cone.py](test/test_friction_cone.py) implements the
+  validation checklist that `docs/alpha_range_campana.md` Section 6 asks for, and it
+  earned its keep (see errata below). For each of 14 geometries it samples the returned
+  interval, reconstructs the takeoff and landing velocity **vectors** from Eq. 2/4, and
+  confirms each lies inside its contact's cone and under `V_max` — ground truth that
+  reuses none of the interval formulas. A tightness pass checks just outside each
+  endpoint to catch over-conservatism.
+  [test/test_clearance_rejection.py](test/test_clearance_rejection.py) sections (2) and
+  (4) were rewritten for the new physics; case (4) used to assert "downhill widens the
+  interval", which is no longer true, and its old geometry (`X=2.0, Z=-0.5, V_max=4.5`)
+  is now rejected outright because landing would need 5.01 m/s.
+- **Errata found in [docs/alpha_range_campana.md](docs/alpha_range_campana.md)** (noted
+  in a banner at the top of that file, since it was reconstructed from an OCR'd PDF):
+  1. the landing-cone mapping's `2*Z/X_theta` term is **positive**, not negative — the
+     two agree only when `Z = 0`, so a flat-ground test would not have caught it. For
+     `X=1, Z=1, alpha_s=80°` the flown arc lands at −74.76°; the correct sign gives
+     −74.76°, the document's gives −82.57°;
+  2. that file's suspicion about the missing `arctan()` on the velocity bounds was
+     correct — those fractions are `tan(alpha)` values.
+- **Measured on the existing deck** (`mu=None` vs `mu=1.2`, same map and endpoints):
+
+  | scenario | without cone | with cone |
+  |---|---|---|
+  | `stairs_with_curb` | 6 waypoints, α = [45 75 62 61 45]° | 6 waypoints, α = [59 78 74 61 62]° |
+  | `slope_crest` | 5 waypoints, α = [55 55 79 **29**]° | 5 waypoints, α = [68 63 52 61]°, **different waypoints** |
+  | `cross_slope` | 5 waypoints | 7 waypoints, extra hops on the grade |
+
+  `stairs_with_curb` keeps its route and only steepens. `slope_crest` genuinely
+  reroutes, and the reason is visible in the table: its old path contained a 29°
+  takeoff, below the flat-ground cone floor of 39.81°, so that hop is now illegal.
+- **Not yet revisited** (deferred): `test/test_clearance_rejection.py` case (1) and
+  cases (6b)/(6c) still fail on constants left stale by the capsule-radius split. That
+  failure predates this change and was verified unchanged against `HEAD` (same three
+  cases, same `mc` values).
+
 ### Changed — split the capsule into three independent radii (CoM, leg, foot)
 
 The collision capsule previously used one shared `ROBOT_RADIUS` for the CoM

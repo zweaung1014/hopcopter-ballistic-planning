@@ -4,9 +4,11 @@
 > that was the original planner. It is retained as a reference implementation and is
 > **not** what `main.py` runs. The active planner is `HoppingAStarPlanner` in
 > `hopping_astar_planner.py`, which models each move as a ballistic hop and replaces the
-> hard `MAX_JUMP_HEIGHT` cutoff described below with a physics feasibility gate, a
-> stance check and an arc-clearance gate. See `CLAUDE.md` for the current design and
-> `CHANGELOG.md` for how it got there.
+> hard `MAX_JUMP_HEIGHT` cutoff described below with a physics feasibility gate (Campana's
+> BEAM: parabola validity, a Coulomb friction cone at both contacts, and the leg-speed
+> budget at takeoff and landing), a stance check and an arc-clearance gate. See
+> `CLAUDE.md` for the current design, `docs/alpha_range_new.md` for the takeoff-angle
+> math, and `CHANGELOG.md` for how it got there.
 
 ## Overview
 

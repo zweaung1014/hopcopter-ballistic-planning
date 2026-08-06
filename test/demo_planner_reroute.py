@@ -38,7 +38,7 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 import config
-from demo_common import out_path
+from demo_common import out_path, planner_alpha_interval
 from hopping_astar_planner import (
     HoppingAStarPlanner,
     alpha_for_clearance,
@@ -100,6 +100,7 @@ def make_planner(m: Map2D5) -> HoppingAStarPlanner:
         alpha_downhill=config.ALPHA_DOWNHILL,
         g=config.G_ACCEL,
         V_max=V_MAX,
+        mu=config.MU,
         robot_radius=config.ROBOT_RADIUS,
         leg_radius=config.LEG_CYLINDER_RADIUS,
         foot_radius=config.FOOT_TIP_RADIUS,
@@ -156,9 +157,9 @@ def enumerate_ring_candidates(planner: HoppingAStarPlanner, parent_cell):
             entry["reason"] = "landing is OBSTACLE"
             out.append(entry)
             continue
-        iv = feasible_alpha_interval(X, Z, planner.V_max, planner.g)
+        iv = planner_alpha_interval(planner, m, (px, py), (nx, ny), X, Z)
         if iv is None:
-            entry["reason"] = "no feasible alpha (leg energy / geometry)"
+            entry["reason"] = "no feasible alpha (friction cone / leg energy / geometry)"
             out.append(entry)
             continue
         profile = terrain_profile(
