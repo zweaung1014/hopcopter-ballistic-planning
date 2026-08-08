@@ -32,20 +32,42 @@ MAX_STEP = config.ARC_SAMPLE_MAX_STEP
 N_LAT = config.ARC_LATERAL_SAMPLES
 WALL_EXTRA = config.OBSTACLE_WALL_EXTRA
 
-# Geometry is sized for the derived V_MAX (4.85 m/s), whose longest feasible
-# flat hop is V_MAX^2 / g = 2.40 m. Spans here are 2.1/1.8/1.3/0.8 m so the
-# physics gate never fires and every verdict below is genuinely about clearance.
+# Spans here are 2.1/1.8/1.3/0.8 m, well inside the flat-hop reach
+# V_MAX^2 / g = 5.50 m, so the reach never fires and every verdict below is
+# genuinely about clearance.
 GOAL_X = 3.2
 PILLAR_X = 2.7
-PILLAR_H = 0.45  # calibrated for the capsule (bottom-cap + cylinder-side) gate.
-                 # The old sphere-only check used 0.9 and needed only the CoM to
-                 # clear the pillar top by (R + gate) = 0.35 m. The capsule check
-                 # instead requires the foot tip to clear by (R + gate), which
-                 # is L = 0.4 m stricter — so a 0.9 m pillar is un-jumpable at
-                 # every takeoff x. 0.45 restores the "only midrange clears"
-                 # sweep because the pillar's TRAILING edge (arc descending
-                 # limb) blocks far-back takeoffs and the LEADING edge (arc
-                 # hasn't risen yet) blocks close-in takeoffs.
+PILLAR_H = 1.6   # calibrated twice, for two successive model changes.
+                 #
+                 # It was 0.9 under a sphere-only clearance check, which needed
+                 # only the CoM to clear the pillar top by (R + gate) = 0.35 m.
+                 # The capsule check instead requires the FOOT TIP to clear by
+                 # (R + gate), which is L = 0.4 m stricter, so 0.9 became
+                 # un-jumpable at every takeoff x and it dropped to 0.45.
+                 #
+                 # The energy chain then undid that: the robot cannot shed the
+                 # speed it arrives with, so a SHORT hop is forced steep (the
+                 # sweep below runs 39.8 deg of takeoff-angle floor at X=2.1 up
+                 # to 78.2 deg at X=0.8). A near-vertical arc clears a low
+                 # pillar trivially, so 0.45 became jumpable from everywhere.
+                 # 1.6 restores the "only midrange clears" sweep, still for the
+                 # original two opposite reasons: the pillar's TRAILING edge
+                 # (arc descending limb) blocks far-back takeoffs and the
+                 # LEADING edge (arc hasn't risen yet) blocks close-in ones.
+
+# The energy state these clearance tests are evaluated in. The chain's seed —
+# the robot at the start of a plan, with sqrt(2 g H_INITIAL) of takeoff speed —
+# because it is config-derived rather than magic, and because it is the HIGHEST
+# energy the chain ever holds. That makes it the most permissive ceiling, so a
+# REJECT here is a rejection for every state the robot can be in.
+V_G_IN = math.sqrt(2.0 * G * config.H_INITIAL / config.ETA_HOP)
+ENERGY_KW = dict(
+    v_s_min=math.sqrt(config.ETA_HOP) * V_G_IN,
+    e_inject_max=config.E_INJECT_MAX,
+    mass=config.ROBOT_MASS,
+    min_apex=config.MIN_APEX_HEIGHT,
+    V_g_max=config.V_G_MAX,
+)
 
 
 def _obs_fill(m: Map2D5) -> float:
@@ -74,7 +96,7 @@ def _mc_for(xs: float, goal_x: float, pillar_h: float) -> float:
     obs = _obs_fill(m)
     c_s = (xs, 1.5, 0.0)
     c_g = (goal_x, 1.5, 0.0)
-    iv = feasible_alpha_interval(goal_x - xs, 0.0, config.V_MAX, G)
+    iv = feasible_alpha_interval(goal_x - xs, 0.0, config.V_MAX, G, **ENERGY_KW)
     if iv is None:
         return -math.inf  # infeasible counts as rejection
     profile = terrain_profile(
@@ -82,7 +104,7 @@ def _mc_for(xs: float, goal_x: float, pillar_h: float) -> float:
         min_clearance_gate=GATE,
     )
     _alpha, mc = alpha_for_clearance(
-        profile, iv[0], iv[1], GATE, config.ALPHA_MARGIN_FRAC
+        profile, iv[0], iv[1], GATE
     )
     return mc
 
@@ -127,12 +149,17 @@ def main() -> int:
     ok = iv is None
     print(f"  [{'PASS' if ok else 'FAIL'}] X=5, Z=0, V_max=4.5 -> infeasible: {iv is None}")
     all_ok &= ok
-    # The shipped V_MAX is exactly the speed for a 2.40 m flat hop, so that is
-    # the boundary of what the robot can reach on level ground. The cone raises
-    # the floor of the interval but never its ceiling, so this reach is unchanged.
-    ok = (feasible_alpha_interval(2.3, 0.0, config.V_MAX, G) is not None
-          and feasible_alpha_interval(2.5, 0.0, config.V_MAX, G) is None)
-    print(f"  [{'PASS' if ok else 'FAIL'}] shipped V_MAX reaches 2.3 m but not 2.5 m")
+    # A flat hop of distance X needs v_s >= sqrt(g X), so V_MAX reaches exactly
+    # V_MAX^2 / g on level ground. The cone raises the floor of the interval but
+    # never its ceiling, so this reach is unaffected by MU. Derived rather than
+    # written as a literal: this used to read "2.3 but not 2.5", which silently
+    # encoded a tuned V_MAX = 4.85 m/s and broke when V_MAX became a derived
+    # worst case of the energy chain (reach 2.40 m -> 5.50 m).
+    reach = config.V_MAX ** 2 / G
+    ok = (feasible_alpha_interval(reach * 0.96, 0.0, config.V_MAX, G) is not None
+          and feasible_alpha_interval(reach * 1.04, 0.0, config.V_MAX, G) is None)
+    print(f"  [{'PASS' if ok else 'FAIL'}] flat-hop reach = V_MAX^2/g = "
+          f"{reach:.2f} m (reaches {reach * 0.96:.2f} m, not {reach * 1.04:.2f} m)")
     all_ok &= ok
     # On level ground both cones reduce to the textbook Coulomb bound, so the
     # shallowest producible takeoff is atan(1/MU) — a shallower push would slide
@@ -155,13 +182,13 @@ def main() -> int:
     print("\n(3) OBSTACLE region under the arc:")
     m = _pillar_map(0.0)  # ground zero everywhere
     m.set_obstacle_region(2.4, 1.35, 2.6, 1.65)
-    iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G)
+    iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G, **ENERGY_KW)
     profile = terrain_profile(
         (1.5, 1.5, 0.0), (3.5, 1.5, 0.0), m, ROBOT_R, LEG_R, FOOT_R, LEG,
         MAX_STEP, _obs_fill(m), N_LAT,
         min_clearance_gate=GATE,
     )
-    _a, mc = alpha_for_clearance(profile, iv[0], iv[1], GATE, config.ALPHA_MARGIN_FRAC)
+    _a, mc = alpha_for_clearance(profile, iv[0], iv[1], GATE)
     all_ok &= _check("arc over OBSTACLE region", mc, expect_accept=False)
 
     # OBSTACLE_WALL_EXTRA must be large enough that the tallest arc the robot
@@ -303,13 +330,13 @@ def main() -> int:
     obs = _obs_fill(mm)
     c_s = (0.4, 1.0, 0.0)
     c_g = (2.4, 1.0, 0.0)   # X=2.0 flat, well inside V_MAX
-    iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G)
+    iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G, **ENERGY_KW)
     prof = terrain_profile(
         c_s, c_g, mm, ROBOT_R, LEG_R, FOOT_R, LEG, MAX_STEP, obs, N_LAT,
         min_clearance_gate=GATE,
     )
     _, mc_capsule = alpha_for_clearance(
-        prof, iv[0], iv[1], GATE, config.ALPHA_MARGIN_FRAC,
+        prof, iv[0], iv[1], GATE,
     )
     # For reference, what the sphere-only check would have said:
     # (foot_h at bump's u would be foot_h(u_bump); the sphere check only
@@ -324,21 +351,26 @@ def main() -> int:
     # (6c) Endpoint-transition mask does not hide walls. A wall between the
     # endpoints that the arc barely fails to clear must still register as a
     # reject even though the near-endpoint samples are masked.
+    #
+    # 1.9 m, up from 1.10 m: the arc that has to fail here is the one at
+    # alpha_max, and alpha_max at X=2.0 rose from 61.8 to 75.0 deg with the
+    # energy chain. Measured boundary at the shipped parameters: 1.7 m is the
+    # tallest wall this hop still clears, 1.75 m the shortest it does not.
     mm = Map2D5(3.0, 2.0, 0.1)
-    mm.paint_region(1.10, x_min=1.35, x_max=1.65, y_min=0.85, y_max=1.15)
+    mm.paint_region(1.90, x_min=1.35, x_max=1.65, y_min=0.85, y_max=1.15)
     obs = _obs_fill(mm)
     c_s = (0.4, 1.0, 0.0)
     c_g = (2.4, 1.0, 0.0)
-    iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G)
+    iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G, **ENERGY_KW)
     prof = terrain_profile(
         c_s, c_g, mm, ROBOT_R, LEG_R, FOOT_R, LEG, MAX_STEP, obs, N_LAT,
         min_clearance_gate=GATE,
     )
     _, mc_wall = alpha_for_clearance(
-        prof, iv[0], iv[1], GATE, config.ALPHA_MARGIN_FRAC,
+        prof, iv[0], iv[1], GATE,
     )
     ok = mc_wall < GATE
-    print(f"  [{'PASS' if ok else 'FAIL'}] flat hop over a 1.10 m wall: "
+    print(f"  [{'PASS' if ok else 'FAIL'}] flat hop over a 1.90 m wall: "
           f"mc={mc_wall:+.3f} m -> "
           f"{'ACCEPT' if mc_wall >= GATE else 'REJECT'} (expected REJECT)")
     all_ok &= ok

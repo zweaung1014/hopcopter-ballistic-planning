@@ -330,9 +330,16 @@ def main() -> int:
         f"alpha_min {math.degrees(no_cone[0]):.2f} -> {math.degrees(with_cone[0]):.2f} deg, "
         f"alpha_max unchanged at {math.degrees(with_cone[1]):.2f} deg",
     )
+    # Derived from V_MAX rather than hard-coded: a flat hop of distance X needs
+    # v_s >= sqrt(g X), so the reach is V_MAX^2 / g. Writing the literal here
+    # made this test track a tuned V_MAX = 4.85 m/s (reach 2.40 m); V_MAX is now
+    # derived from the energy chain and the reach moved to 5.50 m.
+    _flat_reach = V_MAX * V_MAX / G
     all_ok &= _check(
         "a hop beyond V_max is still rejected with mu=None",
-        feasible_alpha_interval(5.0, 0.0, V_MAX, G, mu=None) is None,
+        feasible_alpha_interval(_flat_reach * 1.1, 0.0, V_MAX, G, mu=None) is None,
+        f"flat reach = V_MAX^2/g = {_flat_reach:.2f} m; "
+        f"{_flat_reach * 1.1:.2f} m rejected",
     )
 
     # ------------------------------------------------------------------ #

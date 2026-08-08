@@ -100,13 +100,19 @@ def make_planner(m: Map2D5) -> HoppingAStarPlanner:
         alpha_downhill=config.ALPHA_DOWNHILL,
         g=config.G_ACCEL,
         V_max=V_MAX,
+        mass=config.ROBOT_MASS,
+        eta=config.ETA_HOP,
+        e_inject_max=config.E_INJECT_MAX,
+        min_apex=config.MIN_APEX_HEIGHT,
+        h_initial=config.H_INITIAL,
+        V_g_max=config.V_G_MAX,
+        speed_bin=config.SPEED_BIN,
         mu=config.MU,
         robot_radius=config.ROBOT_RADIUS,
         leg_radius=config.LEG_CYLINDER_RADIUS,
         foot_radius=config.FOOT_TIP_RADIUS,
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
-        alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
@@ -168,7 +174,7 @@ def enumerate_ring_candidates(planner: HoppingAStarPlanner, parent_cell):
         )
         a, mc = alpha_for_clearance(
             profile, iv[0], iv[1],
-            planner.min_clearance_gate, planner.alpha_margin_frac,
+            planner.min_clearance_gate,
         )
         entry["alpha_s"] = a
         entry["mc"] = mc

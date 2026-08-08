@@ -129,7 +129,7 @@ def probe(m: Map2D5, x_takeoff: float, x_landing: float, planner) -> dict:
     )
     a, mc = alpha_for_clearance(
         profile, iv[0], iv[1],
-        planner.min_clearance_gate, planner.alpha_margin_frac,
+        planner.min_clearance_gate,
     )
     if math.isinf(mc):
         gate = "off-map"

@@ -1,6 +1,7 @@
 """Entry point for the A* 2.5D map planning simulation."""
 
 import importlib
+import math
 import sys
 
 import config
@@ -40,13 +41,19 @@ def main():
         alpha_downhill=config.ALPHA_DOWNHILL,
         g=config.G_ACCEL,
         V_max=config.V_MAX,
+        mass=config.ROBOT_MASS,
+        eta=config.ETA_HOP,
+        e_inject_max=config.E_INJECT_MAX,
+        min_apex=config.MIN_APEX_HEIGHT,
+        h_initial=config.H_INITIAL,
+        V_g_max=config.V_G_MAX,
+        speed_bin=config.SPEED_BIN,
         mu=config.MU,
         robot_radius=config.ROBOT_RADIUS,
         leg_radius=config.LEG_CYLINDER_RADIUS,
         foot_radius=config.FOOT_TIP_RADIUS,
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
-        alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
@@ -60,6 +67,16 @@ def main():
         print("No path found.")
     else:
         print(f"Path found with {len(path)} waypoints.")
+        # The energy chain is the whole point of this planner, so show it: each
+        # hop's takeoff speed is bounded below by the previous hop's landing
+        # speed and cannot be undone by replanning that hop alone.
+        print(f"{'hop':>3}  {'X':>5} {'Z':>6}  {'alpha':>6}  "
+              f"{'v_s':>5} {'v_g':>5}  {'drop':>5}  {'E_inj':>6}")
+        for i, h in enumerate(planner.path_hops):
+            print(f"{i + 1:>3}  {h['X']:5.2f} {h['Z']:+6.2f}  "
+                  f"{math.degrees(h['alpha_s']):5.1f}°  "
+                  f"{h['v_s']:5.2f} {h['v_g']:5.2f}  "
+                  f"{h['apex_drop']:5.2f}  {h['e_inject']:6.2f} J")
 
     # Visualize
     vis = Visualizer(env_map)

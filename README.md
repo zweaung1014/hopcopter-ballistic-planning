@@ -90,7 +90,7 @@ python test/calibrate_geometry.py         # sweeps obstacle heights for the maps
 python test/demo_overview.py              # contact sheet of all six scenarios
 ```
 
-Demos write PNGs to `results/after_LS_recs/`; set `$PLANNER_OUT_DIR` to redirect
+Demos write PNGs to `results/energy_aware_planning/`; set `$PLANNER_OUT_DIR` to redirect
 (relative paths resolve against the repo root).
 
 ## Project Structure

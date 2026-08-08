@@ -11,7 +11,24 @@ on Campana & Laumond (2016), "Ballistic motion planning":
     Eq. 4:  xdot(alpha) = sqrt( g * X^2 / (2 * (X * tan(alpha) - Z)) )
     Eq. 2:  z(u) = z_s + u * tan(alpha) - g * u^2 / (2 * xdot^2)
 
-Combined with a leg-energy limit `v_s = xdot / cos(alpha) <= V_max`.
+The energy chain
+----------------
+This robot HOPS rather than jumps: hops are not independent, because the
+takeoff speed of one is set by the landing speed of the last. Flight is
+lossless (`v_g^2 = v_s^2 - 2 g Z`), the stance phase returns a fixed fraction
+`eta` of the arriving kinetic energy (`v_s = sqrt(eta) * v_g`), and the
+propellers may then inject up to `e_inject_max` — but only ADD, never shed.
+
+So the takeoff speed is bounded on BOTH sides by the previous hop, and since
+`(X, Z, alpha)` determines `v_s` outright, that band is a band of takeoff
+angles: every parabola below the one the incoming speed produces is
+unreachable, and every parabola above what full thrust affords is too. On top
+of it, `min_apex` requires a minimum fall from apex to landing, or the elastic
+leg never compresses enough for the controller to register a stance phase.
+
+Two consequences for the search: the state is `(cell, speed_bin)` rather than
+`cell`, and among the surviving angles the planner flies the one needing the
+least injected energy — energy spent now is energy the next hop lacks.
 
 Robot model
 -----------
@@ -44,6 +61,7 @@ a hop either has an arc that stays clear of the terrain or it does not exist.
 
 import heapq
 import math
+from collections import OrderedDict
 from typing import NamedTuple
 
 import numpy as np
@@ -59,6 +77,11 @@ from map2d5 import Map2D5
 # and away from the singularities `X*tan(alpha) = Z` (xdot -> inf) and
 # `cos(alpha) = 0` (v_s -> inf).
 _ALPHA_EPS = 1e-6
+
+
+#: Cache-miss sentinel. `None` is a legitimate cached value (a degenerate hop),
+#: so it cannot double as "absent".
+_MISS = object()
 
 
 #: Normal of perfectly level ground — the default when no terrain normal is
@@ -200,6 +223,140 @@ def _landing_cone_alpha_s(
     return math.atan(k - math.tan(hi_g)), math.atan(k - math.tan(lo_g))
 
 
+def min_apex_tan(X: float, Z: float, h_min: float) -> float | None:
+    """Lower bound on `tan(alpha_s)` so the CoM falls at least `h_min` before landing.
+
+    The mechanism needs a minimum DROP, not a minimum rise: the elastic leg has
+    to compress enough for the controller to detect the stance phase, and what
+    compresses it is the fall from the apex down to the landing contact. On an
+    uphill hop the robot can rise 0.3 m and still land while barely descending,
+    which is why this is measured apex -> landing rather than takeoff -> apex.
+
+    Differentiating Campana Eq. 2 and substituting Eq. 4 gives the vertical
+    velocity at landing,
+
+        v_z_g = v_s cos(alpha) * (2 Z / X - tan(alpha))
+
+    so the robot is descending at all only when `X tan(alpha) > 2 Z`. The fall
+    from the apex is `h = v_z_g^2 / (2 g)`; substituting Eq. 4 once more clears
+    `v_s` out of it entirely and leaves, with `T = tan(alpha)` and `s = X T - Z`,
+
+        h_drop = (X T - 2 Z)^2 / (4 (X T - Z)) = (s - Z)^2 / (4 s)
+
+    which has `d/ds = (s^2 - Z^2) / (4 s^2) >= 0` whenever `s >= |Z|` — and on
+    the domain that matters (`T >= 0` and `X T > 2 Z`) that always holds. So
+    `h_drop` is monotone in `T`, the constraint inverts to a single lower bound,
+    and no bisection is needed:
+
+        s = (Z + 2h) + 2 sqrt(h (h + Z))     ->     T = (s + Z) / X
+
+    Returns `None` when the constraint is vacuous, i.e. `h_min + Z < 0`: the
+    landing is already more than `h_min` below the takeoff, so even a horizontal
+    launch drops far enough.
+
+    Sanity check on level ground: `T = 4 h / X`, matching `apex = X tan(a) / 4`.
+    """
+    if X < 1e-9:
+        return None
+    w = h_min + Z
+    if w < 0.0:
+        return None  # the terrain drop alone already exceeds h_min
+    return 2.0 * (Z + h_min + math.sqrt(h_min * w)) / X
+
+
+def min_energy_tan(X: float, Z: float) -> float:
+    """`tan(alpha_s)` of the cheapest parabola reaching `(X, Z)`.
+
+    `v_s^2 = g X^2 (1 + T^2) / (2 (X T - Z))` is U-shaped in `T`: it blows up
+    both as the angle flattens toward the chord (`X T -> Z`) and as it steepens
+    toward vertical. Setting the derivative to zero gives `X T^2 - 2 Z T - X = 0`,
+    whose positive root is below. On level ground it is `T = 1`, i.e. the
+    textbook 45 degrees.
+
+    This is the angle that minimises injected energy, so it is what
+    `alpha_for_clearance` aims at — but note it is usually *outside* the feasible
+    interval, below its floor, because the energy floor from the previous hop
+    starts at the steep branch. It matters only when the incoming speed is too
+    low to reach the target at all.
+    """
+    return (Z + math.hypot(Z, X)) / X
+
+
+def takeoff_speed(X: float, Z: float, alpha_s: float, g: float) -> float:
+    """CoM speed `v_s` needed to fly `(X, Z)` at takeoff angle `alpha_s`."""
+    return _xdot(X, Z, alpha_s, g) / math.cos(alpha_s)
+
+
+def landing_speed(v_s: float, Z: float, g: float) -> float:
+    """CoM speed at touchdown. Flight is lossless, so `v_g^2 = v_s^2 - 2 g Z`.
+
+    Both ends of the arc sit at `terrain + leg_length`, so the leg offset
+    cancels and `Z` is the terrain elevation change. Climbing costs speed,
+    dropping gains it.
+    """
+    return math.sqrt(max(0.0, v_s * v_s - 2.0 * g * Z))
+
+
+def injection_energy(v_s: float, v_s_min: float, mass: float) -> float:
+    """Energy the propellers must add to reach `v_s` from a `v_s_min` stance exit."""
+    return 0.5 * mass * max(0.0, v_s * v_s - v_s_min * v_s_min)
+
+
+# --------------------------------------------------------------------------- #
+# Takeoff-interval instrumentation (DIAGNOSTIC ONLY, and removable as a unit —
+# see `feasible_alpha_interval`'s `trace` parameter for how to strip it).
+# --------------------------------------------------------------------------- #
+
+#: The constraints `feasible_alpha_interval` intersects, in the order it applies
+#: them, with which end each one can move. Consumers iterate this rather than
+#: hard-coding the list, so a new constraint shows up in the diagnostics
+#: automatically instead of being silently omitted.
+_TRACE_STEPS: tuple[tuple[str, str], ...] = (
+    ("eq4",               "Eq. 4 validity (aim above the chord)"),
+    ("E1_energy_floor",   "(E1) energy floor — unshedable arrival speed"),
+    ("E2_inject_ceiling", "(E2) injection ceiling — one thrust cycle"),
+    ("E3_min_apex",       "(E3) minimum apex-to-landing drop"),
+    ("c3_takeoff_speed",  "(3) takeoff speed <= V_max"),
+    ("c4_landing_speed",  "(4) landing speed <= V_g_max"),
+    ("c1_takeoff_cone",   "(1) takeoff friction cone"),
+    ("c2_landing_cone",   "(2) landing friction cone (mapped through the arc)"),
+)
+
+
+def _trace_add(
+    trace: list,
+    name: str,
+    own_lo: float | None,
+    own_hi: float | None,
+    run_lo: float,
+    run_hi: float,
+    fatal: bool = False,
+) -> None:
+    """Record one constraint's own bound and what it actually cut.
+
+    Called AFTER the constraint has been folded into `run_lo` / `run_hi`, so
+    `cut_lo` and `cut_hi` are read off the difference against the previous
+    record rather than recomputed — which is what keeps the trace honest even
+    if a bound's formula changes.
+
+    `own_lo`/`own_hi` are `None` for a one-sided constraint (E1 and E3 only
+    raise the floor; E2 only lowers the ceiling) or for a constraint that was
+    unsatisfiable, in which case `fatal` is set and the interval is empty.
+    """
+    prev_lo, prev_hi = (trace[-1]["run_lo"], trace[-1]["run_hi"]) if trace else (run_lo, run_hi)
+    trace.append({
+        "step": len(trace),
+        "name": name,
+        "own_lo": own_lo,
+        "own_hi": own_hi,
+        "run_lo": run_lo,
+        "run_hi": run_hi,
+        "cut_lo": max(0.0, run_lo - prev_lo),   # angle removed from below
+        "cut_hi": max(0.0, prev_hi - run_hi),   # angle removed from above
+        "fatal": fatal,
+    })
+
+
 def feasible_alpha_interval(
     X: float,
     Z: float,
@@ -210,15 +367,44 @@ def feasible_alpha_interval(
     n_s: tuple[float, float, float] | None = None,
     n_g: tuple[float, float, float] | None = None,
     theta: float = 0.0,
+    v_s_min: float | None = None,
+    e_inject_max: float | None = None,
+    mass: float | None = None,
+    min_apex: float | None = None,
+    V_g_max: float | None = None,
+    trace: list | None = None,
 ) -> tuple[float, float] | None:
     """Feasible takeoff-angle interval [alpha_min, alpha_max] for a hop.
 
-    This is Campana & Laumond's BEAM: the intersection of four physical
-    constraints plus the geometric validity of Eq. 4. Given `X` and `Z`,
+    Campana & Laumond's BEAM, plus this robot's energy chain. Given `X` and `Z`,
     choosing `alpha` fixes the parabola completely, so every constraint reduces
-    to an interval on `alpha`.
+    to an interval on `alpha`. Arc height is monotone increasing in `tan(alpha)`
+    (see `alpha_for_clearance`), so "higher parabola" and "larger alpha" are the
+    same statement and every constraint below is literally a bound on how high
+    the arc may be.
 
-    (i)   Campana Eq. 4 validity: `X*tan(alpha) - Z > 0`, i.e.
+    The energy constraints are applied FIRST, before Eq. 4 validity and before
+    the cones, because they are the ones that can wipe out most of the interval:
+
+    (E1)  Energy floor. The robot arrives with a takeoff speed it cannot shed —
+          propellers only ADD energy — so every parabola *below* the one
+          `v_s_min` produces is unreachable, not merely suboptimal. Since
+          `_speed_tan_interval` returns where `v_s^2 <= W`, the floor is the
+          complement of that interval, which has two branches; we keep the
+          upper one (the higher parabola). If `v_s_min` cannot reach `(X, Z)`
+          at any angle the floor is vacuous and the lower bound falls back to
+          (E2)'s own lower root.
+
+    (E2)  Injection ceiling, `v_s <= sqrt(v_s_min^2 + 2 e_inject_max / mass)`:
+          the most one stance-plus-thrust cycle can produce.
+
+    (E3)  Minimum drop, `min_apex` — see `min_apex_tan`. A pure fallback: it is
+          `max`ed against (E1), so it changes nothing unless the incoming speed
+          produces a parabola that is *too low* to compress the leg.
+
+    Then Campana's own five:
+
+    (i)   Eq. 4 validity: `X*tan(alpha) - Z > 0`, i.e.
           `alpha in (atan2(Z, X), pi/2)`. Physically, a projectile falls below
           its launch ray, so you must aim above the chord to the target.
 
@@ -228,13 +414,17 @@ def feasible_alpha_interval(
 
     (2)   Landing non-sliding: see `_landing_cone_alpha_s`.
 
-    (3)   Takeoff leg energy, `v_s <= V_max`.
+    (3)   Takeoff speed, `v_s <= V_max`. With the energy band supplied this is
+          a backstop only — (E2) is strictly tighter, since `V_max` is the
+          global worst case over every possible parent hop.
 
-    (4)   Landing leg energy, `v_g <= V_max` — the leg must absorb the arrival
-          as well as produce the departure. Since `v_g^2 = v_s^2 - 2 g Z`, this
-          is slack relative to (3) on uphill hops and tighter on downhill ones.
+    (4)   Landing speed, `v_g <= V_g_max` — the leg must absorb the arrival as
+          well as produce the departure. Since `v_g^2 = v_s^2 - 2 g Z`, this is
+          slack on uphill hops and tight on downhill ones. This is the cap that
+          does real work: it is what stops the robot dropping off something
+          taller than it can land from.
 
-    (3) and (4) share `_speed_tan_interval`; (1) and (2) share
+    (3), (4), (E1) and (E2) all share `_speed_tan_interval`; (1) and (2) share
     `inplane_friction_cone`.
 
     Parameters
@@ -242,12 +432,31 @@ def feasible_alpha_interval(
     mu : friction coefficient. `None` disables constraints (1) and (2) entirely
         — for A/B baselines that isolate what the friction cone contributes,
         mirroring `HoppingAStarPlanner.disable_clearance`. Do NOT use `None`
-        for real planning; constraints (i), (3) and (4) still apply.
+        for real planning; the remaining constraints still apply.
     n_s, n_g : outward unit surface normals at the takeoff and landing contacts,
         from `Map2D5.surface_normals()`. Default to level ground.
     theta : hop heading, `atan2(dy, dx)`. Only the normals' components in the
         hop plane matter, and `theta` is what defines that plane; it is
         irrelevant when both normals are vertical.
+    v_s_min, e_inject_max, mass : the energy band (E1)+(E2). All three are
+        required together; passing `v_s_min=None` skips the band entirely and
+        recovers the pre-energy-chain behaviour, which is what lets the BEAM
+        ground-truth tests keep calling this with just `(X, Z, V_max, g)`.
+    min_apex : (E3). `None` skips it.
+    V_g_max : landing-speed cap for (4). Defaults to `V_max`, the pre-split
+        behaviour where one speed capped both ends.
+    trace : DIAGNOSTIC ONLY — pass a list and each constraint appends a record
+        of its own bound and what it cut, as it is applied. See
+        `_TRACE_STEPS` and `test/demo_takeoff_angle_range.py`. `None` (the
+        default, and what the planner always passes) makes this inert: the
+        arithmetic executed is identical either way.
+
+        This instrumentation is deliberately REMOVABLE. Every added block is
+        bracketed by `# --- trace ---` markers and either appends to `trace`
+        or names an expression that was previously inlined into a `max`/`min`.
+        To strip it: delete this parameter, delete every `# --- trace ---`
+        block, and re-inline the named bounds. Nothing outside this function
+        changes except its two diagnostic consumers.
 
     Returns the interval shrunk by `_ALPHA_EPS` at each end for numerical
     safety, or `None` if any constraint is unsatisfiable or the intersection is
@@ -259,43 +468,129 @@ def feasible_alpha_interval(
         # defensive.
         return None
 
+    if V_g_max is None:
+        V_g_max = V_max
+
     # (i) Geometric interval from Campana Eq. 4 validity. This branch of atan2
     # naturally handles Z < 0 (downhill): the bound simply moves below 0.
     alpha_lo = math.atan2(Z, X)
     alpha_hi = 0.5 * math.pi
+    # --- trace ---
+    if trace is not None:
+        _trace_add(trace, "eq4", alpha_lo, alpha_hi, alpha_lo, alpha_hi)
+    # --- end trace ---
 
-    # (3) Takeoff leg energy, and (4) landing leg energy.
-    for W in (V_max * V_max, V_max * V_max + 2.0 * g * Z):
+    # (E1) energy floor and (E2) injection ceiling.
+    if v_s_min is not None:
+        if e_inject_max is None or mass is None:
+            raise ValueError("v_s_min requires both e_inject_max and mass")
+        W_lo = v_s_min * v_s_min
+        # The ceiling is what one cycle can produce, never more than the global
+        # worst case; min() keeps (3) from ever being the looser of the two.
+        W_hi = min(W_lo + 2.0 * e_inject_max / mass, V_max * V_max)
+
+        iv_hi = _speed_tan_interval(X, Z, W_hi, g)
+        if iv_hi is None:
+            # --- trace ---
+            if trace is not None:
+                _trace_add(trace, "E2_inject_ceiling", None, None,
+                           alpha_lo, alpha_hi, fatal=True)
+            # --- end trace ---
+            return None  # unreachable even at full thrust
+        iv_lo = _speed_tan_interval(X, Z, W_lo, g)
+        # Upper branch of the floor when v_s_min can reach the target; when it
+        # cannot, every angle already needs injection and the binding lower
+        # bound is the ceiling interval's own lower root.
+        e1_lo = math.atan(iv_lo[1] if iv_lo else iv_hi[0])
+        e2_hi = math.atan(iv_hi[1])
+        alpha_lo = max(alpha_lo, e1_lo)
+        # --- trace ---
+        if trace is not None:
+            _trace_add(trace, "E1_energy_floor", e1_lo, None, alpha_lo, alpha_hi)
+        # --- end trace ---
+        alpha_hi = min(alpha_hi, e2_hi)
+        # --- trace ---
+        if trace is not None:
+            _trace_add(trace, "E2_inject_ceiling", None, e2_hi, alpha_lo, alpha_hi)
+        # --- end trace ---
+
+    # (E3) Minimum apex-to-landing drop. A `max` against the energy floor, so it
+    # only bites when the incoming speed's parabola is itself too low.
+    if min_apex is not None:
+        T_apex = min_apex_tan(X, Z, min_apex)
+        e3_lo = None if T_apex is None else math.atan(T_apex)
+        if e3_lo is not None:
+            alpha_lo = max(alpha_lo, e3_lo)
+        # --- trace ---
+        if trace is not None:
+            _trace_add(trace, "E3_min_apex", e3_lo, None, alpha_lo, alpha_hi)
+        # --- end trace ---
+
+    # (3) Takeoff speed, and (4) landing speed.
+    for name, W in (("c3_takeoff_speed", V_max * V_max),
+                    ("c4_landing_speed", V_g_max * V_g_max + 2.0 * g * Z)):
         tan_iv = _speed_tan_interval(X, Z, W, g)
         if tan_iv is None:
+            # --- trace ---
+            if trace is not None:
+                _trace_add(trace, name, None, None, alpha_lo, alpha_hi, fatal=True)
+            # --- end trace ---
             return None
-        alpha_lo = max(alpha_lo, math.atan(tan_iv[0]))
-        alpha_hi = min(alpha_hi, math.atan(tan_iv[1]))
+        own_lo, own_hi = math.atan(tan_iv[0]), math.atan(tan_iv[1])
+        alpha_lo = max(alpha_lo, own_lo)
+        alpha_hi = min(alpha_hi, own_hi)
+        # --- trace ---
+        if trace is not None:
+            _trace_add(trace, name, own_lo, own_hi, alpha_lo, alpha_hi)
+        # --- end trace ---
 
     if mu is not None:
         # (1) Takeoff non-sliding — the wedge applies to alpha_s directly.
         cone_s = inplane_friction_cone(n_s if n_s is not None else _FLAT_NORMAL,
                                        theta, mu)
         if cone_s is None:
+            # --- trace ---
+            if trace is not None:
+                _trace_add(trace, "c1_takeoff_cone", None, None,
+                           alpha_lo, alpha_hi, fatal=True)
+            # --- end trace ---
             return None
         alpha_lo = max(alpha_lo, cone_s[0] - cone_s[1])
         alpha_hi = min(alpha_hi, cone_s[0] + cone_s[1])
+        # --- trace ---
+        if trace is not None:
+            _trace_add(trace, "c1_takeoff_cone", cone_s[0] - cone_s[1],
+                       cone_s[0] + cone_s[1], alpha_lo, alpha_hi)
+        # --- end trace ---
 
         # (2) Landing non-sliding — mapped back through the parabola.
         cone_g = inplane_friction_cone(n_g if n_g is not None else _FLAT_NORMAL,
                                        theta, mu)
-        if cone_g is None:
-            return None
-        land_iv = _landing_cone_alpha_s(X, Z, cone_g[0], cone_g[1])
+        land_iv = (None if cone_g is None
+                   else _landing_cone_alpha_s(X, Z, cone_g[0], cone_g[1]))
         if land_iv is None:
+            # --- trace ---
+            if trace is not None:
+                _trace_add(trace, "c2_landing_cone", None, None,
+                           alpha_lo, alpha_hi, fatal=True)
+            # --- end trace ---
             return None
         alpha_lo = max(alpha_lo, land_iv[0])
         alpha_hi = min(alpha_hi, land_iv[1])
+        # --- trace ---
+        if trace is not None:
+            _trace_add(trace, "c2_landing_cone", land_iv[0], land_iv[1],
+                       alpha_lo, alpha_hi)
+        # --- end trace ---
 
     alpha_min = alpha_lo + _ALPHA_EPS
     alpha_max = alpha_hi - _ALPHA_EPS
 
     if alpha_min >= alpha_max:
+        # --- trace ---
+        if trace is not None and trace:
+            trace[-1]["fatal"] = True  # the last constraint applied is what emptied it
+        # --- end trace ---
         return None
     return alpha_min, alpha_max
 
@@ -642,52 +937,63 @@ def alpha_for_clearance(
     alpha_min: float,
     alpha_max: float,
     gate: float,
-    margin_frac: float = 0.5,
     n_bisect: int = 8,
 ) -> tuple[float, float]:
-    """Pick a takeoff angle: the *least* steep one that clears the terrain.
+    """Pick the takeoff angle needing the least injected energy that still clears.
 
     Returns `(alpha_s, clearance)`. The caller rejects the hop when the
     returned clearance is below `gate`.
 
+    Two monotonicity facts make this exact rather than a search.
+
     Clearance is monotone nondecreasing in `tan(alpha)`: from `_arc_z`,
     `dz/d(tan a) = u * (X - u) / X >= 0` for every `u` in `[0, X]`, so a
     steeper angle lifts the whole arc at once and never trades height at one
-    point for height at another. The pointwise minimum inherits that
-    monotonicity, which makes "the least steep angle that clears" both unique
-    and bisectable.
+    point for height at another. The pointwise minimum inherits that, so the
+    set of clearing angles is always an upward-closed interval
+    `[alpha_c, alpha_max]` — which makes `alpha_c` both unique and bisectable.
 
-    That monotonicity also means the maximum-clearance angle is *always*
-    `alpha_max` — but `alpha_max` is exactly where `v_s = V_max`, i.e. the leg
-    at 100% of its energy budget. So the policy is minimum sufficient effort:
+    Required speed, meanwhile, is U-shaped in alpha with its minimum at
+    `min_energy_tan` — so the least-injection angle over `[alpha_c, alpha_max]`
+    is exactly `clamp(alpha*, alpha_c, alpha_max)`, no search needed.
 
-      * take the default angle (`margin_frac` of the way up the feasible
-        interval, 0.5 = Campana's max-margin midpoint) when it already clears;
-      * give up only if even `alpha_max` cannot clear;
-      * otherwise bisect for the shallowest angle that does.
+    In practice the clamp almost always returns `alpha_c` itself: `alpha*` sits
+    below `alpha_min` whenever the previous hop's energy floor is binding, since
+    that floor starts at the steep branch above the minimum-energy angle. The
+    clamp matters only when the incoming speed is too low to reach the target
+    at all, where the floor goes vacuous and `alpha*` lands inside the interval.
 
-    The common case costs one clearance evaluation, rejection costs two, and
-    only genuinely tight hops pay for the bisection.
+    Cost: one clearance evaluation in the common case (`alpha_min` already
+    clears), two on rejection, and the bisection only on genuinely tight hops.
+
+    NOTE this replaced a max-margin-midpoint policy. The accept/reject verdict
+    is identical either way — both reject only when even `alpha_max` fails —
+    but the reported angle is now the shallowest sufficient one rather than the
+    most comfortable one, because energy spent here is energy the *next* hop
+    does not have.
     """
-    alpha_default = alpha_min + margin_frac * (alpha_max - alpha_min)
+    alpha_c = alpha_min
+    mc_c = clearance_for_alpha(profile, alpha_min)
 
-    mc = clearance_for_alpha(profile, alpha_default)
-    if mc >= gate:
-        return alpha_default, mc
+    if mc_c < gate:
+        mc_max = clearance_for_alpha(profile, alpha_max)
+        if mc_max < gate:
+            return alpha_max, mc_max  # no feasible angle clears
 
-    mc_max = clearance_for_alpha(profile, alpha_max)
-    if mc_max < gate:
-        return alpha_max, mc_max  # even full leg energy cannot clear
+        lo, hi = alpha_min, alpha_max  # clears at hi, not at lo
+        for _ in range(n_bisect):
+            mid = 0.5 * (lo + hi)
+            if clearance_for_alpha(profile, mid) >= gate:
+                hi = mid
+            else:
+                lo = mid
+        alpha_c, mc_c = hi, clearance_for_alpha(profile, hi)
 
-    lo, hi = alpha_default, alpha_max  # clears at hi, not at lo
-    for _ in range(n_bisect):
-        mid = 0.5 * (lo + hi)
-        if clearance_for_alpha(profile, mid) >= gate:
-            hi = mid
-        else:
-            lo = mid
-
-    return hi, clearance_for_alpha(profile, hi)
+    alpha_star = math.atan(min_energy_tan(profile.X, profile.Z))
+    if alpha_star <= alpha_c:
+        return alpha_c, mc_c
+    alpha_s = min(alpha_star, alpha_max)
+    return alpha_s, clearance_for_alpha(profile, alpha_s)
 
 
 class HoppingAStarPlanner:
@@ -698,11 +1004,31 @@ class HoppingAStarPlanner:
     current cell. A hop is accepted only when a ballistic (parabolic) arc
     exists that:
 
+      * fits the ENERGY BAND the previous hop leaves behind — at least the
+        speed stance returns (`sqrt(eta) * v_g`, which the robot cannot shed),
+        at most that plus one cycle's `e_inject_max`;
+      * drops at least `min_apex` from its own apex, or the elastic leg never
+        compresses enough for the controller to register a stance phase;
       * satisfies Campana's BEAM — Eq. 4 validity, the Coulomb friction cone
-        at both the takeoff and landing contacts, and the leg's speed budget
-        `V_max` at both ends (`v_s` to produce the hop, `v_g` to absorb it);
+        at both the takeoff and landing contacts, and `v_g <= V_g_max` (the
+        fastest touchdown the leg can absorb);
       * keeps the robot's body at least `min_clearance_gate` clear of the
         terrain across the whole corridor it sweeps.
+
+    Because the first two depend on how the robot ARRIVED, the search state is
+    `(cell, speed_bin)`, not `cell`. This is what makes it a hopping robot
+    rather than a jumping one: the same cell reached two different ways is two
+    different situations, and one of them may have no feasible continuation.
+
+    Neither more nor less energy dominates — more raises the floor and shuts off
+    shallow hops, less lowers the ceiling — so there is no valid dominance
+    pruning, and the speed axis is quantised (`speed_bin`) instead. In practice
+    the chain converges to a fixed point within ~3 hops, so few bins per cell
+    stay live.
+
+    Among the angles that survive every gate, the planner flies the one needing
+    the LEAST injected energy (`alpha_for_clearance`), because energy spent on
+    this hop is energy the next hop does not have.
 
     Clearance is a pure feasibility gate — it does not shape cost. Edge cost
     is `xy distance + asymmetric elevation penalty + hop_fixed_cost`. The A*
@@ -726,7 +1052,30 @@ class HoppingAStarPlanner:
         alpha_downhill: float = 0.5,
         # Ballistic / clearance parameters (defaults match config.py).
         g: float = 9.81,
-        V_max: float = 4.852,
+        # Global worst-case takeoff speed — a backstop, not the per-hop cap.
+        # The per-hop ceiling comes from the parent's energy plus one cycle of
+        # injection; see the energy parameters below.
+        V_max: float = 7.345,
+        # Energy chain. `mass`/`eta`/`e_inject_max` define the stance loss and
+        # the thrust budget; `min_apex` the stance-detection floor; `h_initial`
+        # seeds the chain at the start cell; `V_g_max` is the fastest touchdown
+        # the leg can absorb, and the cap that actually gates real hops.
+        mass: float = 0.8,
+        eta: float = 0.7,
+        e_inject_max: float = 7.848,
+        min_apex: float = 0.3,
+        h_initial: float = 1.0,
+        V_g_max: float = 7.004,
+        # Quantisation of the landing-speed axis of the search state. Too coarse
+        # and the propagated energy drifts from the arc actually flown; too fine
+        # and the state space multiplies for no modelling gain.
+        speed_bin: float = 0.25,
+        # Cap on the terrain-profile cache (see `_profile_cache`). Purely a
+        # memory/speed trade; correctness does not depend on it. Measured on
+        # `stairs`: 20k thrashes (15.0 s), 60k reaches the uncapped speed
+        # (11.2 s) at ~170 MB peak RSS, 120k costs 70 MB more for nothing.
+        # The right value scales with map area, so raise it for larger maps.
+        profile_cache_size: int = 60000,
         # Coulomb friction coefficient (Campana's BEAM constraints 1 and 2).
         # `None` drops the two friction-cone constraints — an A/B baseline knob
         # only, like `disable_clearance`; the Eq. 4 and leg-energy gates stay.
@@ -736,7 +1085,6 @@ class HoppingAStarPlanner:
         foot_radius: float = 0.02,
         leg_length: float = 0.4,
         min_clearance_gate: float = 0.15,
-        alpha_margin_frac: float = 0.5,
         arc_max_step: float = 0.05,
         n_lateral: int = 3,
         obstacle_wall_extra: float = 1.5,
@@ -786,13 +1134,27 @@ class HoppingAStarPlanner:
         self.foot_radius = foot_radius
         self.leg_length = leg_length
         self.min_clearance_gate = min_clearance_gate
-        self.alpha_margin_frac = alpha_margin_frac
         self.arc_max_step = arc_max_step
         self.n_lateral = n_lateral
         self.leg_clearance_start_frac = leg_clearance_start_frac
         self.hop_fixed_cost = hop_fixed_cost
         self.hop_scan_step = hop_scan_step
         self.disable_clearance = disable_clearance
+
+        # Energy chain.
+        self.mass = mass
+        self.eta = eta
+        self.e_inject_max = e_inject_max
+        self.min_apex = min_apex
+        self.h_initial = h_initial
+        self.V_g_max = V_g_max
+        self.speed_bin = speed_bin
+
+        # Virtual landing speed for the start cell, chosen so the uniform stance
+        # rule `v_s = sqrt(eta) * v_g` reproduces a first takeoff speed of
+        # `sqrt(2 g h_initial)` — the speed that lifts the CoM `h_initial`. The
+        # first hop then needs no special case anywhere in the search.
+        self.v_g_initial = math.sqrt(2.0 * g * h_initial / eta)
 
         # Height used in place of OBSTACLE sentinels when the arc-clearance
         # check bilinearly samples the terrain. Setting it well above the
@@ -829,9 +1191,71 @@ class HoppingAStarPlanner:
         self.n_edge_checks = 0
         self.n_edges_accepted = 0
 
+        # Per-hop record of the path plan() last returned; see `_reconstruct_path`.
+        self.path_hops: list[dict] = []
+
+        # Terrain profiles, keyed by (takeoff cell, landing cell).
+        #
+        # A profile depends only on the two endpoints and the fixed body
+        # geometry — NOT on the arc, and so not on energy. But the energy axis
+        # of the search state means the same cell is expanded once per live
+        # speed bin (~4 in practice), and each of those expansions re-samples
+        # the identical terrain for the identical neighbours. Sampling terrain
+        # is the expensive half of validating an edge, so caching it recovers
+        # most of what the energy dimension costs.
+        #
+        # Bounded, because the unbounded version is ~1.5 KB per entry over
+        # ~100k distinct cell pairs on a 50x50 map. FIFO eviction rather than
+        # LRU: A* sweeps outward, so old pairs are the ones least likely to
+        # come back, and this avoids a move_to_end on every hit.
+        self._profile_cache: OrderedDict[tuple, ArcProfile | None] = OrderedDict()
+        self._profile_cache_max = profile_cache_size
+
+    def _speed_bin(self, v_g: float) -> int:
+        """Quantise a landing speed onto the state's speed axis."""
+        return int(round(v_g / self.speed_bin))
+
+    def _terrain_profile_cached(
+        self,
+        current: tuple[int, int],
+        neighbor: tuple[int, int],
+        c_s: tuple[float, float, float],
+        c_g: tuple[float, float, float],
+    ) -> "ArcProfile | None":
+        """`terrain_profile` memoised on the cell pair. See `_profile_cache`."""
+        key = (current, neighbor)
+        cached = self._profile_cache.get(key, _MISS)
+        if cached is not _MISS:
+            return cached
+
+        profile = terrain_profile(
+            c_s, c_g,
+            self.map_env,
+            self.robot_radius,
+            self.leg_radius,
+            self.foot_radius,
+            self.leg_length,
+            self.arc_max_step,
+            self._obstacle_fill,
+            self.n_lateral,
+            min_clearance_gate=self.min_clearance_gate,
+        )
+        if len(self._profile_cache) >= self._profile_cache_max:
+            self._profile_cache.popitem(last=False)  # FIFO evict
+        self._profile_cache[key] = profile
+        return profile
+
     def plan(self) -> list[tuple[float, float]] | None:
-        """Run A* and return the path as a list of (x, y) world coords, or None."""
-        start = self.start_cell
+        """Run A* and return the path as a list of (x, y) world coords, or None.
+
+        Search states are `(cell, speed_bin)`: energy carries between hops, so a
+        cell is not one node but one node per arrival speed. The canonical speed
+        for a state is `speed_bin * self.speed_bin`, not the exact speed that
+        produced it, which is what keeps the graph deterministic and finite.
+
+        `self.path_hops` is populated with the per-hop physics of the returned
+        path (angle, speeds, injection, apex drop).
+        """
         goal = self.goal_cell
 
         # Instrumentation counters (reset per plan() call; see class docstring
@@ -839,35 +1263,39 @@ class HoppingAStarPlanner:
         self.n_expansions = 0
         self.n_edge_checks = 0
         self.n_edges_accepted = 0
+        self.path_hops = []
+        self._profile_cache.clear()
 
-        # Priority queue: (f_cost, counter, (row, col))
+        start = (self.start_cell, self._speed_bin(self.v_g_initial))
+
+        # Priority queue: (f_cost, counter, ((row, col), speed_bin))
         open_set = []
         counter = 0
         heapq.heappush(open_set, (0.0, counter, start))
 
-        # g_cost[cell] = best known cost from start to cell
+        # g_cost[state] = best known cost from start to state
         g_cost = {start: 0.0}
-        # came_from[cell] = parent cell
-        came_from: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        # came_from[state] = (parent state, the hop that got here)
+        came_from: dict[tuple, tuple | None] = {start: None}
 
         while open_set:
             f, _, current = heapq.heappop(open_set)
 
-            if current == goal:
+            if current[0] == goal:
                 return self._reconstruct_path(came_from, current)
 
             # Skip if we've already found a better path to this node
-            if f > g_cost.get(current, float("inf")) + self._heuristic(current):
+            if f > g_cost.get(current, float("inf")) + self._heuristic(current[0]):
                 continue
 
             self.n_expansions += 1
-            for neighbor, edge_cost in self._generate_hop_neighbors(current):
+            for neighbor, edge_cost, hop in self._generate_hop_neighbors(current):
                 tentative_g = g_cost[current] + edge_cost
 
                 if tentative_g < g_cost.get(neighbor, float("inf")):
                     g_cost[neighbor] = tentative_g
-                    came_from[neighbor] = current
-                    f_cost = tentative_g + self._heuristic(neighbor)
+                    came_from[neighbor] = (current, hop)
+                    f_cost = tentative_g + self._heuristic(neighbor[0])
                     counter += 1
                     heapq.heappush(open_set, (f_cost, counter, neighbor))
 
@@ -875,9 +1303,9 @@ class HoppingAStarPlanner:
 
     def _generate_hop_neighbors(
         self,
-        current: tuple[int, int],
-    ) -> list[tuple[tuple[int, int], float]]:
-        """Yield (neighbor_cell, edge_cost) pairs reachable from `current` in one hop.
+        state: tuple[tuple[int, int], int],
+    ) -> list[tuple[tuple[tuple[int, int], int], float, dict]]:
+        """Yield (neighbor_state, edge_cost, hop) triples reachable in one hop.
 
         For each of the `n_angles` sampled directions, a ray-search scans from
         `hop_radius` down to `_min_hop_radius` in steps of `hop_scan_step`, adding
@@ -891,11 +1319,18 @@ class HoppingAStarPlanner:
         A "goal-snap" edge is also added whenever the goal lies within
         `hop_radius`, so the goal can be reached regardless of angular
         alignment.
+
+        The incoming speed is fixed for the whole expansion (it comes from
+        `state`), so the dedup sets stay keyed on cells alone — a cell is
+        validated at most once here, against this one arrival energy.
         """
+        current, v_bin = state
+        v_g_in = v_bin * self.speed_bin
+
         cx, cy = self.map_env.grid_to_world(current[0], current[1])
         current_z = self.map_env.grid[current[0], current[1]]
 
-        results: list[tuple[tuple[int, int], float]] = []
+        results: list[tuple[tuple[tuple[int, int], int], float, dict]] = []
         # Two sets with distinct roles:
         #   attempted  — cells whose validity has already been checked; we never
         #                re-call _validate_and_cost for the same cell twice.
@@ -930,10 +1365,15 @@ class HoppingAStarPlanner:
 
                 if neighbor not in in_results and neighbor not in attempted:
                     attempted.add(neighbor)
-                    edge = self._validate_and_cost(current, current_z, neighbor)
+                    edge = self._validate_and_cost(
+                        current, current_z, neighbor, v_g_in,
+                    )
                     if edge is not None:
+                        cost, hop = edge
                         in_results.add(neighbor)
-                        results.append((neighbor, edge))
+                        results.append(
+                            ((neighbor, self._speed_bin(hop["v_g"])), cost, hop),
+                        )
                     # Whether valid or not, continue to shorter radii: a shorter
                     # hop in the same direction lands on a different grid cell and
                     # may open up a better multi-hop sequence.
@@ -948,9 +1388,14 @@ class HoppingAStarPlanner:
             and self.goal_cell not in in_results
             and self.goal_cell not in attempted
         ):
-            edge = self._validate_and_cost(current, current_z, self.goal_cell)
+            edge = self._validate_and_cost(
+                current, current_z, self.goal_cell, v_g_in,
+            )
             if edge is not None:
-                results.append((self.goal_cell, edge))
+                cost, hop = edge
+                results.append(
+                    ((self.goal_cell, self._speed_bin(hop["v_g"])), cost, hop),
+                )
 
         return results
 
@@ -959,21 +1404,35 @@ class HoppingAStarPlanner:
         current: tuple[int, int],
         current_z: float,
         neighbor: tuple[int, int],
-    ) -> float | None:
-        """Return edge cost if the hop is ballistically valid, else None.
+        v_g_in: float,
+    ) -> tuple[float, dict] | None:
+        """Return `(edge_cost, hop)` if the hop is valid, else None.
+
+        `v_g_in` is the speed at which the robot arrived at `current` — the
+        whole reason this is a hopping planner and not a jumping one. It sets
+        both ends of the takeoff-speed band: `sqrt(eta) * v_g_in` is the floor
+        the robot cannot shed, and one cycle of `e_inject_max` on top of that is
+        the ceiling.
+
+        `hop` carries the physics of the flown arc back out (`alpha_s`, `v_s`,
+        `v_g`, `e_inject`, `apex_drop`, ...); `v_g` is what the caller turns
+        into the successor state's speed bin.
 
         Sequence, cheapest test first:
           (a) reject if the landing cell itself is an obstacle;
           (b) STANCE GATE: reject if the robot's body cannot sit at the landing
               cell without overlapping nearby terrain (precomputed mask);
-          (c) FEASIBILITY GATE: reject if no `alpha_s` satisfies Campana Eq. 4
-              validity, the friction cones at both contacts, and the takeoff
-              and landing leg-energy limits (BEAM);
-          (d) CLEARANCE GATE: pick the shallowest takeoff angle whose arc keeps
-              the body `min_clearance_gate` clear of the terrain, and reject if
-              no feasible angle manages it;
+          (c) FEASIBILITY GATE: reject if no `alpha_s` satisfies the energy band
+              from `v_g_in`, the `min_apex` stance-detection floor, Campana
+              Eq. 4 validity, the friction cones at both contacts, and the
+              landing-speed limit;
+          (d) CLEARANCE GATE: pick the least-injection takeoff angle whose arc
+              keeps the body `min_clearance_gate` clear of the terrain, and
+              reject if no feasible angle manages it;
           (e) return the edge cost. Clearance does NOT appear here — it is a
-              feasibility test, not a cost term.
+              feasibility test, not a cost term. Neither does injected energy:
+              it is minimised *within* an edge, not traded off against distance
+              across edges, which is what keeps the heuristic admissible.
         """
         self.n_edge_checks += 1
         neighbor_z = self.map_env.grid[neighbor[0], neighbor[1]]
@@ -991,49 +1450,64 @@ class HoppingAStarPlanner:
         X = float(math.hypot(nx - cx, ny - cy))
         Z = float(neighbor_z - current_z)
 
-        # (c) Ballistic feasibility (Campana BEAM: Eq. 4 validity + friction
-        # cones at both contacts + takeoff and landing leg-energy limits).
+        # (c) Energy band from the previous hop + min-apex floor + BEAM.
+        v_s_min = math.sqrt(self.eta) * v_g_in
         interval = feasible_alpha_interval(
             X, Z, self.V_max, self.g,
             mu=self.mu,
             n_s=tuple(self._normals[current[0], current[1]]),
             n_g=tuple(self._normals[neighbor[0], neighbor[1]]),
             theta=math.atan2(ny - cy, nx - cx),
+            v_s_min=v_s_min,
+            e_inject_max=self.e_inject_max,
+            mass=self.mass,
+            min_apex=self.min_apex,
+            V_g_max=self.V_g_max,
         )
         if interval is None:
             return None
         alpha_min, alpha_max = interval
 
-        # (d) Arc-to-terrain clearance across the body's swept corridor.
+        # (d) Arc-to-terrain clearance across the body's swept corridor. This is
+        # also where the flown angle is chosen, so it must run even when the
+        # gate is disabled — the successor's energy depends on it.
+        alpha_s = alpha_min
         if not self.disable_clearance:
-            c_s = (cx, cy, float(current_z))
-            c_g = (nx, ny, float(neighbor_z))
-            profile = terrain_profile(
-                c_s, c_g,
-                self.map_env,
-                self.robot_radius,
-                self.leg_radius,
-                self.foot_radius,
-                self.leg_length,
-                self.arc_max_step,
-                self._obstacle_fill,
-                self.n_lateral,
-                min_clearance_gate=self.min_clearance_gate,
+            profile = self._terrain_profile_cached(
+                current, neighbor,
+                (cx, cy, float(current_z)), (nx, ny, float(neighbor_z)),
             )
             if profile is None:
                 return None
-            _alpha_s, mc = alpha_for_clearance(
-                profile, alpha_min, alpha_max,
-                self.min_clearance_gate,
-                self.alpha_margin_frac,
+            alpha_s, mc = alpha_for_clearance(
+                profile, alpha_min, alpha_max, self.min_clearance_gate,
             )
             if mc < self.min_clearance_gate:
                 return None  # no feasible arc clears the terrain
+        else:
+            # Same least-injection rule, without a terrain profile to consult.
+            alpha_s = min(
+                max(math.atan(min_energy_tan(X, Z)), alpha_min), alpha_max,
+            )
+
+        v_s = takeoff_speed(X, Z, alpha_s, self.g)
+        v_g = landing_speed(v_s, Z, self.g)
+        T = math.tan(alpha_s)
+        hop = {
+            "alpha_s": alpha_s,
+            "v_s": v_s,
+            "v_g": v_g,
+            "v_g_in": v_g_in,
+            "e_inject": injection_energy(v_s, v_s_min, self.mass),
+            "apex_drop": (X * T - 2.0 * Z) ** 2 / (4.0 * (X * T - Z)),
+            "X": X,
+            "Z": Z,
+        }
 
         # (e) Edge cost. `hop_fixed_cost` breaks the tie that would otherwise
         # make N micro-hops exactly as cheap as one long hop.
         self.n_edges_accepted += 1
-        return self._edge_cost(current, neighbor, Z) + self.hop_fixed_cost
+        return self._edge_cost(current, neighbor, Z) + self.hop_fixed_cost, hop
 
     def _edge_cost(
         self,
@@ -1072,15 +1546,30 @@ class HoppingAStarPlanner:
 
     def _reconstruct_path(
         self,
-        came_from: dict[tuple[int, int], tuple[int, int] | None],
-        current: tuple[int, int],
+        came_from: dict[tuple, tuple | None],
+        current: tuple,
     ) -> list[tuple[float, float]]:
-        """Trace back from goal to start, return path in world coordinates."""
+        """Trace back from goal to start, return path in world coordinates.
+
+        Also fills `self.path_hops` with the per-hop physics recorded at
+        validation time. Callers that need the takeoff angle must read it from
+        there rather than re-deriving it: with the energy chain, the angle
+        depends on the whole path leading up to the hop, so it cannot be
+        recovered from the endpoints alone.
+        """
         path_cells = []
+        hops = []
         while current is not None:
-            path_cells.append(current)
-            current = came_from[current]
+            path_cells.append(current[0])
+            edge = came_from[current]
+            if edge is None:
+                break
+            current, hop = edge
+            hops.append(hop)
         path_cells.reverse()
+        hops.reverse()
+
+        self.path_hops = hops
 
         path = []
         for row, col in path_cells:

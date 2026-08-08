@@ -3,9 +3,15 @@ arc flip from ACCEPT (green, clears the pillar) to REJECT (red, collides).
 
 Fix the pillar and goal in world coordinates; move the takeoff position
 progressively closer to the pillar. For each takeoff, compute the feasible
-takeoff-angle interval (Campana Eq. 4 + leg-energy bound), pick the
-midpoint alpha (Campana's max-margin choice), and evaluate the arc-to-
-terrain clearance with the exact same code path the planner uses.
+takeoff-angle interval (the energy band from the previous hop, the min-apex
+floor, then Campana's BEAM), pick the least-injection angle that clears, and
+evaluate the arc-to-terrain clearance with the exact same code path the
+planner uses.
+
+Watch the interval FLOOR climb as the hop shortens (39.8 deg at X=2.1 up to
+78.2 deg at X=0.8). That is the energy chain: the robot arrives with a takeoff
+speed it cannot shed, and the shorter the hop, the more surplus it has to
+dispose of — and the only way to dispose of it is to go steeper.
 
 Every column of the output figure shows:
   * top row  — top-down of the map with the XY segment overlaid;
@@ -43,18 +49,22 @@ from visualizer import Visualizer, draw_arc_side_view
 
 
 # --- Demo geometry (tuned to give a mix of ACCEPT and REJECT) ------------ #
-# Spans are sized for the derived V_MAX, whose longest feasible flat hop is
-# V_MAX^2 / g = 2.40 m. The four takeoffs give X = 2.1 / 1.8 / 1.3 / 0.8 m, so
-# the physics gate never fires and every verdict here is genuinely about
-# clearance. Matches test/test_clearance_rejection.py, which asserts the
-# numbers this demo draws.
+# The four takeoffs give X = 2.1 / 1.8 / 1.3 / 0.8 m, well inside the flat-hop
+# reach V_MAX^2 / g = 5.50 m, so the reach never fires and every verdict here is
+# genuinely about clearance. Matches test/test_clearance_rejection.py, which
+# asserts the numbers this demo draws — including PILLAR_H and the energy state
+# the sweep is evaluated in, so keep the two in step.
 MAP_X = 4.0          # m; map width
 MAP_Y = 3.0          # m; map height (narrow, we only need y ~ 1.5 corridor)
 RES = config.CELL_RESOLUTION
 PILLAR_X = 2.7       # m; pillar center x
 PILLAR_Y = 1.5       # m; pillar center y
 PILLAR_HALF = 0.15   # m; pillar half-size in x and y
-PILLAR_H = 0.9       # m; pillar height (calibrated for the leg/body geometry)
+PILLAR_H = 1.6       # m; pillar height. Calibrated for the leg/body geometry AND
+                     # for the energy chain: a robot that cannot shed the speed it
+                     # arrives with is forced steep on short hops, and a
+                     # near-vertical arc clears a low pillar trivially. See the
+                     # PILLAR_H note in test/test_clearance_rejection.py.
 GOAL_X = 3.2         # m; landing x is fixed
 Y_CORRIDOR = 1.5     # m; takeoff/landing y are on this line, z=0
 TAKEOFF_XS = [1.1, 1.4, 1.9, 2.4]  # sweep values, closer -> shorter X
@@ -70,6 +80,18 @@ LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
 WALL_EXTRA = config.OBSTACLE_WALL_EXTRA
+
+# The energy state the sweep is evaluated in: the chain's seed, i.e. the robot at
+# the start of a plan. Without it `feasible_alpha_interval` reverts to the
+# pre-chain behaviour and the demo would draw a ceiling no real hop ever gets.
+V_G_IN = math.sqrt(2.0 * G * config.H_INITIAL / config.ETA_HOP)
+ENERGY_KW = dict(
+    v_s_min=math.sqrt(config.ETA_HOP) * V_G_IN,
+    e_inject_max=config.E_INJECT_MAX,
+    mass=config.ROBOT_MASS,
+    min_apex=config.MIN_APEX_HEIGHT,
+    V_g_max=config.V_G_MAX,
+)
 
 
 def build_map() -> Map2D5:
@@ -112,7 +134,7 @@ def main() -> int:
         Z = 0.0
 
         # --- ballistic feasibility (Campana Eq. 4 + v_s <= V_max) ---
-        iv = feasible_alpha_interval(X, Z, V_MAX, G)
+        iv = feasible_alpha_interval(X, Z, V_MAX, G, **ENERGY_KW)
         if iv is None:
             print(f"takeoff_x={xs:.2f}  X={X:.2f}   INFEASIBLE (no valid alpha)")
             axes_top[i].set_title(f"x_s={xs}  INFEASIBLE")
@@ -125,10 +147,10 @@ def main() -> int:
             config.ARC_LATERAL_SAMPLES,
             min_clearance_gate=GATE,
         )
-        # Same rule the planner uses: start at the max-margin angle and only
-        # escalate to a steeper one if the gate demands it.
+        # Same rule the planner uses: the least-injection angle that clears,
+        # which is the shallowest one whenever the energy floor is binding.
         alpha_s, mc = alpha_for_clearance(
-            profile, alpha_min, alpha_max, GATE, config.ALPHA_MARGIN_FRAC,
+            profile, alpha_min, alpha_max, GATE,
         )
         verdict = "ACCEPT" if mc >= GATE else "REJECT"
         print(

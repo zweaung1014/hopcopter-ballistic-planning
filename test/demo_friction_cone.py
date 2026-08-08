@@ -256,34 +256,50 @@ def fig_paths(m) -> tuple[str, list, list]:
 # Figure 3 — which constraint decides, per heading
 # --------------------------------------------------------------------------- #
 
+#: Row labels for `_constraint_rows`, keyed by the trace names
+#: `feasible_alpha_interval` emits. Only the BEAM constraints appear — this
+#: figure is about the friction cone, so it deliberately runs without the energy
+#: chain (see `_constraint_rows`).
+_ROW_LABELS = {
+    "eq4":              "Eq. 4 validity\n(aim above the chord)",
+    "c3_takeoff_speed": "(3) takeoff speed\n$v_s \\leq V_{max}$",
+    "c4_landing_speed": "(4) landing speed\n$v_g \\leq V_{g,max}$",
+    "c1_takeoff_cone":  "(1) takeoff friction\n$\\gamma_s \\pm \\delta_s$",
+    "c2_landing_cone":  "(2) landing friction\n(mapped through the arc)",
+}
+
+
 def _constraint_rows(X, Z, n, theta, mu):
     """The five BEAM intervals for one candidate hop, before intersection.
 
-    Mirrors `feasible_alpha_interval` term by term so the figure shows the same
-    numbers the planner gates on. Unbounded ends are clipped to the plot range.
+    Read out of `feasible_alpha_interval`'s own `trace`, NOT re-derived here.
+    This function used to mirror the constraint stack term by term, and it had
+    already drifted: it predated the energy chain, so it still showed five
+    constraints when there are eight, and it passed `V_MAX` to constraint (4)
+    where the planner now uses `V_G_MAX` — every number it printed for that row
+    was wrong. Sourcing them from the function makes that class of bug
+    impossible.
+
+    Deliberately called with `v_s_min=None` and `min_apex=None`: this figure is
+    about what the friction cone contributes, so the energy chain is left out
+    and the trace yields exactly the five BEAM rows. Unbounded ends are clipped
+    to the plot range by the caller.
     """
+    trace: list = []
+    feasible_alpha_interval(
+        X, Z, V_MAX, G, mu=mu, n_s=n, n_g=n, theta=theta,
+        V_g_max=config.V_G_MAX, trace=trace,
+    )
+    by_name = {r["name"]: r for r in trace}
     rows = []
-    rows.append(("Eq. 4 validity\n(aim above the chord)",
-                 math.atan2(Z, X), 0.5 * math.pi))
-
-    t3 = _speed_tan_interval(X, Z, V_MAX * V_MAX, G)
-    rows.append(("(3) takeoff speed\n$v_s \\leq V_{max}$",
-                 math.atan(t3[0]) if t3 else None,
-                 math.atan(t3[1]) if t3 else None))
-
-    t4 = _speed_tan_interval(X, Z, V_MAX * V_MAX + 2.0 * G * Z, G)
-    rows.append(("(4) landing speed\n$v_g \\leq V_{max}$",
-                 math.atan(t4[0]) if t4 else None,
-                 math.atan(t4[1]) if t4 else None))
-
-    cone = inplane_friction_cone(n, theta, mu)
-    rows.append(("(1) takeoff friction\n$\\gamma_s \\pm \\delta_s$",
-                 cone[0] - cone[1] if cone else None,
-                 cone[0] + cone[1] if cone else None))
-
-    land = _landing_cone_alpha_s(X, Z, cone[0], cone[1]) if cone else None
-    rows.append(("(2) landing friction\n(mapped through the arc)",
-                 land[0] if land else None, land[1] if land else None))
+    for key, label in _ROW_LABELS.items():
+        rec = by_name.get(key)
+        # Absent (an earlier constraint was unsatisfiable so this one never ran)
+        # or present-but-fatal both render as "unsatisfiable".
+        if rec is None or rec["fatal"]:
+            rows.append((label, None, None))
+        else:
+            rows.append((label, rec["own_lo"], rec["own_hi"]))
     return rows
 
 

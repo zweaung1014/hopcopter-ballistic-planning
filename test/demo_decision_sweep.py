@@ -81,14 +81,22 @@ def classify(m: Map2D5, path: list, h: float) -> tuple[str, str]:
 
 
 def path_cost(planner, m: Map2D5, path: list) -> float:
-    """Sum the planner's own edge costs along `path` (includes every penalty)."""
+    """Sum the planner's own edge costs along `path` (includes every penalty).
+
+    Chained, not mapped: `_validate_and_cost` needs the speed the robot arrived
+    with, and it returns the speed it leaves with. Feeding each hop the
+    start-of-chain energy instead would price hops the robot could not fly.
+    """
     total = 0.0
+    v_g = planner.v_g_initial
     for i in range(len(path) - 1):
         a = m.world_to_grid(*path[i])
         b = m.world_to_grid(*path[i + 1])
-        c = planner._validate_and_cost(a, m.grid[a[0], a[1]], b)
-        if c is not None:
-            total += c
+        edge = planner._validate_and_cost(a, m.grid[a[0], a[1]], b, v_g)
+        if edge is not None:
+            cost, hop = edge
+            total += cost
+            v_g = hop["v_g"]
     return total
 
 

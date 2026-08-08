@@ -9,6 +9,13 @@
 > budget at takeoff and landing), a stance check and an arc-clearance gate. See
 > `CLAUDE.md` for the current design, `docs/alpha_range_new.md` for the takeoff-angle
 > math, and `CHANGELOG.md` for how it got there.
+>
+> **One structural difference is worth flagging up front**, because everything below
+> assumes otherwise: hops are no longer independent. The active planner carries energy
+> along the path — each hop's takeoff speed is floored by the previous hop's landing
+> speed, since the robot cannot shed energy — so its search state is
+> `(cell, speed_bin)`, not `cell`, and the same cell reached two ways is two different
+> nodes. The grid A* described here has no such notion.
 
 ## Overview
 

@@ -32,7 +32,10 @@ from hopping_astar_planner import (
     HoppingAStarPlanner,
     alpha_for_clearance,
     feasible_alpha_interval,
+    injection_energy,
+    landing_speed,
     min_clearance,
+    takeoff_speed,
     terrain_profile,
 )
 from map2d5 import Map2D5
@@ -123,20 +126,38 @@ C_ANNOT   = "#0277bd"   # measurement annotations (Δz arrows etc.)
 TIGHT_BAND = 0.05
 
 
-def param_caption() -> str:
+def param_caption(planner: HoppingAStarPlanner | None = None) -> str:
     """One-line physics summary of the run.
 
     Printed to stdout by each demo rather than stamped on the figures: at
     presentation type size this is ~150 characters of parameter soup that
     crowds out the actual title, and nobody reads eight parameters off a
     projected slide. The values are also recorded in the results README.
+
+    **Pass the planner** whenever the demo overrode a parameter. Without it this
+    reports this module's deck defaults (`HOP_RADIUS` = 1.5 m), which is a
+    caption that quietly lies about the figure beneath it — a demo running at
+    `config.HOP_RADIUS` = 1.0 would still be labelled 1.5. Given a planner, the
+    values are read off the object that actually produced the result, and the
+    energy chain is reported too.
     """
+    if planner is None:
+        return (
+            f"hop_radius={HOP_RADIUS} m · V_max={V_MAX:.2f} m/s "
+            f"(apex {config.MAX_APEX_HEIGHT} m) · leg={config.LEG_LENGTH} m · "
+            f"robot_radius={config.ROBOT_RADIUS} m · "
+            f"min_clearance={config.MIN_CLEARANCE} m · res={config.CELL_RESOLUTION} m · "
+            f"α_uphill={config.ALPHA_UPHILL} · α_downhill={config.ALPHA_DOWNHILL}"
+        )
     return (
-        f"hop_radius={HOP_RADIUS} m · V_max={V_MAX:.2f} m/s "
-        f"(apex {config.MAX_APEX_HEIGHT} m) · leg={config.LEG_LENGTH} m · "
-        f"robot_radius={config.ROBOT_RADIUS} m · "
-        f"min_clearance={config.MIN_CLEARANCE} m · res={config.CELL_RESOLUTION} m · "
-        f"α_uphill={config.ALPHA_UPHILL} · α_downhill={config.ALPHA_DOWNHILL}"
+        f"hop_radius={planner.hop_radius} m · leg={planner.leg_length} m · "
+        f"robot_radius={planner.robot_radius} m · "
+        f"min_clearance={planner.min_clearance_gate} m · "
+        f"res={planner.map_env.resolution} m · μ={planner.mu}\n"
+        f"energy chain: η={planner.eta} · m={planner.mass} kg · "
+        f"E_inject_max={planner.e_inject_max:.2f} J · "
+        f"min_apex={planner.min_apex} m · V_g_max={planner.V_g_max:.2f} m/s · "
+        f"V_max={planner.V_max:.2f} m/s · speed_bin={planner.speed_bin} m/s"
     )
 
 
@@ -175,9 +196,15 @@ def make_planner(
         robot_radius=config.ROBOT_RADIUS,
         leg_radius=config.LEG_CYLINDER_RADIUS,
         foot_radius=config.FOOT_TIP_RADIUS,
+        mass=config.ROBOT_MASS,
+        eta=config.ETA_HOP,
+        e_inject_max=config.E_INJECT_MAX,
+        min_apex=config.MIN_APEX_HEIGHT,
+        h_initial=config.H_INITIAL,
+        V_g_max=config.V_G_MAX,
+        speed_bin=config.SPEED_BIN,
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
-        alpha_margin_frac=config.ALPHA_MARGIN_FRAC,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
@@ -197,15 +224,23 @@ def planner_alpha_interval(
     p1: tuple[float, float],
     X: float,
     Z: float,
+    v_g_in: float | None = None,
 ) -> tuple[float, float] | None:
-    """`feasible_alpha_interval` fed the planner's own friction-cone inputs.
+    """`feasible_alpha_interval` fed the planner's own inputs.
 
-    The cone depends on the surface normals at both contacts and on the hop
-    heading, none of which are recoverable from `X` and `Z` alone. Calling the
-    bare function would silently fall back to level-ground normals, so every
-    diagnostic on sloped terrain would disagree with the planner it is meant to
-    be explaining. `Map2D5.surface_normals` is memoised, so this is cheap.
+    Two things are invisible in `X` and `Z` alone, and a diagnostic that guesses
+    at either will silently disagree with the planner it is meant to explain:
+
+      * the friction cone needs the surface normals at both contacts plus the
+        hop heading. The bare function falls back to level ground, so on sloped
+        terrain the numbers diverge. `Map2D5.surface_normals` is memoised, so
+        looking them up is cheap.
+      * the energy band needs the speed the robot ARRIVED at. Defaults to the
+        planner's start-of-chain speed, which is right only for the first hop
+        — `diagnose_path` threads the real value through for the rest.
     """
+    if v_g_in is None:
+        v_g_in = planner.v_g_initial
     normals = m.surface_normals()
     r0, c0 = m.world_to_grid(p0[0], p0[1])
     r1, c1 = m.world_to_grid(p1[0], p1[1])
@@ -215,6 +250,11 @@ def planner_alpha_interval(
         n_s=tuple(normals[r0, c0]),
         n_g=tuple(normals[r1, c1]),
         theta=math.atan2(p1[1] - p0[1], p1[0] - p0[0]),
+        v_s_min=math.sqrt(planner.eta) * v_g_in,
+        e_inject_max=planner.e_inject_max,
+        mass=planner.mass,
+        min_apex=planner.min_apex,
+        V_g_max=planner.V_g_max,
     )
 
 
@@ -223,6 +263,7 @@ def diagnose_edge(
     m: Map2D5,
     p0: tuple[float, float],
     p1: tuple[float, float],
+    v_g_in: float | None = None,
 ) -> dict:
     """Re-score one hop with the ballistic criterion, whichever planner produced it.
 
@@ -230,22 +271,36 @@ def diagnose_edge(
     that is what makes the A/B comparison honest: both paths are judged by the
     same gate.  All physics parameters are read off the planner, so the
     diagnosis can never drift from what the planner itself evaluated.
+
+    `v_g_in` is the speed the robot arrived at `p0` with; it sets the energy
+    band and therefore the takeoff angle. Use `diagnose_path` rather than
+    calling this in a loop, or every hop after the first will be scored against
+    the start-of-chain energy.
+
+    The returned dict adds `v_s`, `v_g`, `e_inject` and `apex_drop` on feasible
+    hops, so callers can chain and can report the energy story.
     """
     z0 = float(m.get_elevation(*p0))
     z1 = float(m.get_elevation(*p1))
     X  = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
     Z  = z1 - z0
+    if v_g_in is None:
+        v_g_in = planner.v_g_initial
     # Can the robot's body actually rest at the landing cell? A hop can be a
     # perfectly good parabola and still be invalid because the robot would be
     # standing inside a wall when it got there — the baseline planner skips
     # this check, so it is exactly where baseline paths tend to go wrong.
     landing = m.world_to_grid(p1[0], p1[1])
     standable = bool(planner._standable[landing[0], landing[1]])
-    iv = planner_alpha_interval(planner, m, p0, p1, X, Z)
+    infeasible = {"feasible": False, "standable": standable,
+                  "X": X, "Z": Z, "alpha_s": None, "mc": -math.inf,
+                  "z0": z0, "z1": z1, "v_g_in": v_g_in,
+                  "v_s": None, "v_g": None, "e_inject": None,
+                  "apex_drop": None}
+
+    iv = planner_alpha_interval(planner, m, p0, p1, X, Z, v_g_in)
     if iv is None:
-        return {"feasible": False, "standable": standable,
-                "X": X, "Z": Z, "alpha_s": None,
-                "mc": -math.inf, "z0": z0, "z1": z1}
+        return infeasible
     profile = terrain_profile(
         (p0[0], p0[1], z0), (p1[0], p1[1], z1),
         m, planner.robot_radius, planner.leg_radius, planner.foot_radius, planner.leg_length,
@@ -253,24 +308,53 @@ def diagnose_edge(
         min_clearance_gate=planner.min_clearance_gate,
     )
     if profile is None:
-        return {"feasible": False, "standable": standable,
-                "X": X, "Z": Z, "alpha_s": None,
-                "mc": -math.inf, "z0": z0, "z1": z1}
+        return infeasible
     # Follows the planner's own angle rule, escalation included, so the
     # reported alpha is the one the planner would actually have flown.
     a, mc = alpha_for_clearance(
-        profile, iv[0], iv[1],
-        planner.min_clearance_gate, planner.alpha_margin_frac,
+        profile, iv[0], iv[1], planner.min_clearance_gate,
     )
+    v_s = takeoff_speed(X, Z, a, planner.g)
+    T = math.tan(a)
     return {"feasible": True, "standable": standable,
             "X": X, "Z": Z, "alpha_s": a, "mc": mc,
-            "z0": z0, "z1": z1}
+            "z0": z0, "z1": z1, "v_g_in": v_g_in,
+            "v_s": v_s,
+            "v_g": landing_speed(v_s, Z, planner.g),
+            "e_inject": injection_energy(
+                v_s, math.sqrt(planner.eta) * v_g_in, planner.mass,
+            ),
+            "apex_drop": (X * T - 2.0 * Z) ** 2 / (4.0 * (X * T - Z))}
 
 
 def diagnose_path(planner: HoppingAStarPlanner, m: Map2D5, path: list) -> list[dict]:
-    """`diagnose_edge` over every consecutive pair in `path`."""
-    return [diagnose_edge(planner, m, path[i], path[i + 1])
-            for i in range(len(path) - 1)]
+    """`diagnose_edge` over every consecutive pair in `path`, CHAINED and BINNED.
+
+    Chained, not mapped: the robot cannot shed energy, so each hop's takeoff
+    speed is floored by the previous hop's landing speed. Diagnosing the hops
+    independently would score every one of them against the start-of-chain
+    energy and report angles the robot could not actually have flown.
+
+    Binned for the same reason, one level down: the planner's search state
+    carries a QUANTISED landing speed, so that — not the exact `v_g` — is what
+    set the takeoff angle it chose. Chaining the exact value instead drifts by
+    up to `speed_bin/2` per hop, which is enough to move the angle and hence the
+    reported clearance across the gate. It shows up as this function accusing
+    the ballistic planner's own path of containing a hop the planner accepted.
+
+    Once a hop is infeasible the chain has no landing speed to continue from,
+    so the remaining hops fall back to the start energy. They are already
+    flagged infeasible-downstream by that point; `n_bad_hops` counts them.
+    """
+    diags = []
+    v_g = planner.v_g_initial
+    for i in range(len(path) - 1):
+        binned = planner._speed_bin(v_g) * planner.speed_bin
+        d = diagnose_edge(planner, m, path[i], path[i + 1], binned)
+        diags.append(d)
+        if d["v_g"] is not None:
+            v_g = d["v_g"]
+    return diags
 
 
 def n_bad_hops(diags: list[dict], gate: float = config.MIN_CLEARANCE) -> int:
@@ -330,12 +414,19 @@ def u_of_x(p0: tuple[float, float], p1: tuple[float, float], target_x: float) ->
 def enumerate_ring_candidates(
     planner: HoppingAStarPlanner,
     cell: tuple[int, int],
+    v_g_in: float | None = None,
 ) -> list[dict]:
     """All `n_angles` full-radius ring candidates from `cell`, with a verdict each.
 
     Scans only the full `hop_radius`, not the planner's inward ray-search, so the
     figure stays readable.  Out-of-bounds and physics-infeasible candidates are
     kept so they show up as rejections.
+
+    `v_g_in` is the speed the robot arrived at `cell` with, which sets the
+    energy band and so decides which candidates are reachable at all. It
+    defaults to the start-of-chain speed; pass the value from `path_hops` or
+    `diagnose_path` when illustrating a cell partway along a path, or the panel
+    will show a different robot's options than the one in the figure.
 
     Each entry carries a `gate` field naming *which* check rejected it —
     `"bounds"`, `"obstacle"`, `"stance"`, `"physics"`, `"clearance"`, or `""`
@@ -348,6 +439,8 @@ def enumerate_ring_candidates(
     px, py = m.grid_to_world(*cell)
     pz = float(m.grid[cell[0], cell[1]])
     obs = planner._obstacle_fill
+    if v_g_in is None:
+        v_g_in = planner.v_g_initial
 
     seen: set = {cell}
     out: list[dict] = []
@@ -393,10 +486,10 @@ def enumerate_ring_candidates(
             out.append(entry)
             continue
 
-        iv = planner_alpha_interval(planner, m, (px, py), (nx, ny), X, Z)
+        iv = planner_alpha_interval(planner, m, (px, py), (nx, ny), X, Z, v_g_in)
         if iv is None:
             entry["gate"] = "physics"
-            entry["reason"] = "infeasible (friction cone / V_max / geometry)"
+            entry["reason"] = "infeasible (energy band / min-apex / cone / geometry)"
             out.append(entry)
             continue
 
@@ -405,9 +498,7 @@ def enumerate_ring_candidates(
             planner.arc_max_step, obs, planner.n_lateral,
         )
         gate = planner.min_clearance_gate
-        a, mc = alpha_for_clearance(
-            profile, iv[0], iv[1], gate, planner.alpha_margin_frac,
-        )
+        a, mc = alpha_for_clearance(profile, iv[0], iv[1], gate)
         entry["alpha_s"] = a
         entry["mc"] = mc
         if mc < gate:
@@ -595,13 +686,13 @@ def save(fig, save_path: str, dpi: int = PRESENTATION_DPI) -> None:
 
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DEFAULT_OUT_DIR = os.path.join("results", "with_leg_capsule_margin")
+_DEFAULT_OUT_DIR = os.path.join("results", "energy_aware_planning")
 
 
 def out_dir() -> str:
     """Directory demo artefacts are written to, created if missing.
 
-    Defaults to `results/with_leg_capsule_margin/` so a plain
+    Defaults to `results/energy_aware_planning/` so a plain
     `python test/demo_*.py` lands in the current results set.
     Override with `$PLANNER_OUT_DIR`;
     relative overrides resolve against the repo root, not the working

@@ -10,7 +10,17 @@ cell stores an elevation z) for a hopping robot. The active planner
 step to an adjacent grid cell, using the physics from Campana & Laumond (2016),
 "Ballistic motion planning." See `docs/planner.md` for the full algorithm writeup and
 `CHANGELOG.md` for the history of how the planner evolved (RRT* → grid A* → hopping A*
-→ ballistic feasibility/clearance gating).
+→ ballistic feasibility/clearance gating → energy-carrying hop chain).
+
+**The robot HOPS, it does not jump.** Hops are not independent: the takeoff speed of
+each one is set by the landing speed of the last, through a three-phase cycle
+(ballistic descent with attitude control, an inverted-pendulum stance that returns
+`ETA_HOP` of the arriving kinetic energy, then powered climbing thrust that may inject
+up to `E_INJECT_MAX`). Thrust can only *add* energy, never shed it, so the incoming
+speed is a hard FLOOR on what the next hop can do — and since `(X, Z, alpha)` fixes
+`v_s` outright, that floor deletes every takeoff angle producing a lower parabola.
+This is why the A* state is `(cell, speed_bin)` and not `cell`, and why anything
+re-scoring a hop outside the planner has to know how the robot arrived.
 
 ## Setup
 
@@ -34,14 +44,16 @@ python main.py tall_stairs   # positional arg selects maps/<name>.py; run with a
 # Numeric correctness checks (prints PASS/FAIL per case, exits 1 on any failure)
 python test/test_clearance_rejection.py
 python test/test_friction_cone.py       # BEAM / friction-cone ground-truth validation
+python test/test_hop_energy_chain.py    # energy chain: closed forms, alpha bounds,
+                                        # and end-to-end chain closure on a real plan
 
 # Timing/scaling benchmark (ballistic vs. baseline planner on the same scenario)
 python test/benchmark_tall_stairs.py
 
 # Per-scenario timing table across the whole deck (writes markdown)
-python test/time_deck.py results/after_LS_recs/timings.md
+python test/time_deck.py results/energy_aware_planning/timings.md
 
-# Visual demos — each writes PNGs into results/after_LS_recs/ (side-view arcs,
+# Visual demos — each writes PNGs into results/energy_aware_planning/ (side-view arcs,
 # top-down paths, ring-candidate panels, etc.); set PLANNER_OUT_DIR to redirect.
 # Open the generated PNGs to inspect results.
 python test/demo_tall_stairs.py
@@ -69,7 +81,7 @@ hopping_astar_planner.py ← HoppingAStarPlanner: the active planner (ballistic 
 visualizer.py            ← Visualizer: matplotlib rendering (grid, arcs, path)
 main.py                  ← entry point: load_map(name) → plan() → visualize
 test/                     ← demo scripts (produce PNGs), a benchmark, a timing
-                            harness, and two assertion-based numeric tests (no pytest)
+                            harness, and three assertion-based numeric tests (no pytest)
 results/                  ← generated figures + timing tables, one dir per run
 ```
 
@@ -112,9 +124,25 @@ function — no registration step needed.
 
 ### HoppingAStarPlanner (`hopping_astar_planner.py`) — the core algorithm
 
-Standard A* (`heapq` open set, `g_cost`/`came_from` dicts, Euclidean-distance
-heuristic — admissible because elevation and proximity penalties only add cost), but
-neighbor generation and edge validation are non-trivial:
+A* over **`(cell, speed_bin)` states**, not cells (`heapq` open set,
+`g_cost`/`came_from` dicts, Euclidean-distance heuristic on the cell — still
+admissible because elevation and proximity penalties only add cost). Neighbor
+generation and edge validation are non-trivial:
+
+- **The state carries energy.** `speed_bin = round(v_g / SPEED_BIN)`, and the
+  canonical speed for a state is `speed_bin * SPEED_BIN`, not the exact speed that
+  produced it — that is what keeps the graph deterministic and finite. Neither more
+  nor less energy dominates (more raises the takeoff floor and shuts off shallow
+  hops; less lowers the ceiling), so **there is no valid dominance pruning** and
+  binning is the honest alternative. The start is seeded with a *virtual* landing
+  speed `sqrt(2*g*H_INITIAL/ETA_HOP)`, chosen so the uniform stance rule
+  `v_s = sqrt(eta)*v_g` yields a first takeoff speed of `sqrt(2*g*H_INITIAL)` — so
+  the first hop needs no special case. Costs ~4x the expansions in practice; the
+  `_profile_cache` (below) is what pays for it.
+- **`plan()` populates `self.path_hops`** with per-hop `alpha_s`, `v_s`, `v_g`,
+  `e_inject`, `apex_drop`, `X`, `Z`. **Read the takeoff angle from there, never
+  re-derive it from the endpoints** — with the energy chain the angle depends on the
+  entire path leading up to the hop.
 
 - **Neighbor generation** (`_generate_hop_neighbors`): for each of `n_angles` evenly
   spaced directions around the current cell, a ray-search scans radii from
@@ -132,39 +160,76 @@ neighbor generation and edge validation are non-trivial:
   2. **stance gate** (`Map2D5.standable_mask`, precomputed once): reject if the
      robot's body cannot rest at the landing cell without overlapping nearby
      terrain;
-  3. **feasibility gate** (`feasible_alpha_interval`) — Campana's BEAM: reject
-     unless some takeoff angle `alpha` satisfies all five of Eq. 4 validity, the
-     Coulomb friction cone at the takeoff contact, the friction cone at the
-     landing contact (mapped back through the arc), the takeoff leg-energy limit
-     `v_s <= V_max`, and the landing limit `v_g <= V_max`. This is the only gate
-     that depends on the hop's *heading*, because it is the only one that sees the
-     surface normals. See `docs/alpha_range_new.md`;
+  3. **feasibility gate** (`feasible_alpha_interval`) — reject unless some takeoff
+     angle `alpha` satisfies all eight of: the **energy floor** from the parent hop
+     (`v_s >= sqrt(eta)*v_g_in`, unshedable), the **injection ceiling**
+     (`v_s <= sqrt(v_s_min^2 + 2*E_INJECT_MAX/m)`), the **min-apex floor**
+     (`min_apex_tan`), plus Campana's five — Eq. 4 validity, the Coulomb friction
+     cone at the takeoff contact, the cone at the landing contact (mapped back
+     through the arc), `v_s <= V_max`, and `v_g <= V_g_max`. **The three energy
+     bounds are evaluated first**, before Eq. 4 and the cones, because they are the
+     ones that can wipe out most of the interval. This is the only gate that
+     depends on the hop's *heading* (only it sees the surface normals) and the only
+     one that depends on the hop's *history*. See `docs/alpha_range_new.md`;
   4. **clearance gate**: `terrain_profile` samples the corridor the body sweeps,
-     then `alpha_for_clearance` picks a takeoff angle and reports the resulting
-     clearance; reject if it is below `min_clearance_gate`;
+     then `alpha_for_clearance` picks the **least-injection** takeoff angle that
+     clears and reports the resulting clearance; reject if it is below
+     `min_clearance_gate`. This step also decides the flown angle, hence the
+     successor's energy, so it is not skippable;
   5. cost = XY distance + asymmetric elevation penalty (`alpha_uphill` /
-     `alpha_downhill`) + `hop_fixed_cost`. **Clearance does not enter the cost** —
-     it is purely a feasibility test.
+     `alpha_downhill`) + `hop_fixed_cost`. **Neither clearance nor injected energy
+     enters the cost** — clearance is purely a feasibility test, and injection is
+     minimised *within* an edge rather than traded against distance across edges,
+     which is what keeps the heuristic admissible.
+- **`_profile_cache`** memoises `terrain_profile` on the `(takeoff cell, landing
+  cell)` pair. Profiles depend only on the endpoints and body geometry, not on the
+  arc and so not on energy — but the energy axis means each cell is expanded once
+  per live speed bin, and every one of those re-samples identical terrain. Bounded
+  with FIFO eviction (A* sweeps outward, so old pairs are least likely to return).
+  Measured on `stairs`: 20k entries thrashes, 60k reaches uncapped speed at ~170 MB.
 - `disable_clearance=True` skips the stance and clearance gates but keeps the
   physics feasibility gate — used only for A/B baseline comparisons (e.g. in
   `test/benchmark_tall_stairs.py`), never for real planning. Note this is now a
-  *feasibility* A/B ("which candidates exist"), not a cost-shaping one.
+  *feasibility* A/B ("which candidates exist"), not a cost-shaping one. It still
+  picks a flown angle (the least-injection one, without a terrain profile to
+  consult), because the successor state's energy depends on it.
 - `mu=None` is the analogous knob for the friction cone: it drops BEAM constraints
   (1) and (2) while keeping Eq. 4 validity and both velocity limits. A/B baselines
   only (`test/demo_friction_cone.py`), never real planning.
+- **`v_s_min=None` disables the energy band** in `feasible_alpha_interval` and
+  recovers the pre-chain behaviour. That is what lets `test/test_friction_cone.py`
+  keep exercising BEAM in isolation with a bare `(X, Z, V_max, g)` call — it is not
+  a planning knob.
 
-### The robot model — three things that are easy to get wrong
+### The robot model — four things that are easy to get wrong
 
+- **Energy is bookkept as full CoM kinetic energy at touchdown (`m*v^2/2`), not as
+  apex height (`m*g*h`).** This is deliberate and load-bearing. The CoM sits at
+  `terrain + LEG_LENGTH` at touchdown *and* at takeoff — same foot, same leg — so
+  net ΔPE across stance is exactly zero and the whole balance is kinetic, with no
+  PE term to get wrong. `m*g*h_apex` counts only the *vertical* share and would
+  leave horizontal speed undamped, which is backwards: redirecting horizontal
+  momentum is the entire job of the inverted-pendulum stance. It is also the only
+  version that makes "delete the lower parabolas" well-posed — `v_g` plus `eta`
+  pins `v_s` to one number, and `v_s` with `(X, Z)` pins `alpha` through Eq. 4,
+  whereas apex energy only constrains `v_s*sin(alpha)`. The apex picture is not
+  lost: `h_drop = v_z_land^2 / (2g)` is a projection of the same state, which is
+  what `min_apex` gates on.
 - **The arc is the CoM, not the feet.** Hops start and end at
   `terrain_z + leg_length`. `Z = z_g - z_s` is unchanged (both ends shift
   equally), so `feasible_alpha_interval` is untouched; only the absolute arc
   height moves. Anything comparing an arc to terrain must add the leg offset.
-- **Clearance is monotone in `tan(alpha)`.** `dz/d tan a = u(X-u)/X >= 0` at every
-  `u`, so a steeper angle lifts the whole arc at once and the max-clearance angle
-  is *always* `alpha_max` — which is exactly where `v_s = V_max`. That is why
-  `alpha_for_clearance` does not simply maximise: it takes the max-margin midpoint
-  when that clears, and bisects for the shallowest sufficient angle otherwise.
-  Monotonicity is what makes the bisection valid.
+- **Clearance is monotone in `tan(alpha)`,** and so is apex height and everything
+  else about how high the arc sits. `dz/d tan a = u(X-u)/X >= 0` at every `u`, so a
+  steeper angle lifts the whole arc at once — which is what makes "higher parabola"
+  and "larger alpha" the same statement, lets every energy constraint reduce to a
+  bound on `tan(alpha)`, and makes the clearing set an upward-closed interval
+  `[alpha_c, alpha_max]`. Required *speed*, by contrast, is U-shaped in alpha with
+  its minimum at `min_energy_tan`. Together those give `alpha_for_clearance` an
+  exact answer rather than a search: `clamp(alpha*, alpha_c, alpha_max)`, where
+  `alpha_c` comes from a bisection that monotonicity validates. In practice this
+  collapses to `alpha_c` — `alpha*` sits below `alpha_min` whenever the energy
+  floor binds, since that floor starts on the steep branch above `alpha*`.
 - **Collision geometry is a capsule, not just a sphere, and it's checked
   differently at stance than in flight — and it has three different radii,
   not one.** The full collision volume is a capsule from foot to CoM with
@@ -221,11 +286,39 @@ Notable non-obvious parameters:
   hair. `config.py` asserts the flat-ground cone floor stays below the leg-energy
   ceiling at `HOP_RADIUS`; violating it empties the interval for *every* flat hop
   and `plan()` returns None everywhere with no other symptom.
-- `V_MAX` is **derived**, not tuned: `sqrt(2 * G_ACCEL * MAX_APEX_HEIGHT)`, i.e. the
-  speed needed to raise the CoM `MAX_APEX_HEIGHT` on a vertical in-place hop. The
-  longest feasible flat hop it affords is `V_MAX^2 / G_ACCEL`, and a flat hop of
-  distance X needs `sqrt(g*X)`, so `HOP_RADIUS` must stay well under that. Change
-  `MAX_APEX_HEIGHT` to change the robot, never `V_MAX` directly.
+- **`V_G_MAX` is the cap that matters; `V_MAX` and `MAX_APEX_HEIGHT` are derived from
+  it.** `V_G_MAX = sqrt(2*G_ACCEL*MAX_LANDING_APEX)` = 7.00 m/s is the fastest
+  touchdown the leg can absorb, sized for hopping off a 2.5 m platform. Because
+  `v_s_min = sqrt(ETA_HOP)*v_g` on the next hop, bounding `v_g` recursively bounds
+  every takeoff speed in the plan. Then
+  `V_MAX = sqrt(ETA_HOP*V_G_MAX^2 + 2*E_INJECT_MAX/ROBOT_MASS)` = 7.35 m/s and
+  `MAX_APEX_HEIGHT = V_MAX^2/(2g)` = 2.75 m.
+  **`V_MAX` is NOT a per-hop cap** — each hop is capped by its own parent
+  (`sqrt(v_s_min^2 + 2*E_INJECT_MAX/m)`, ~5.4 m/s in the flat steady state). `V_MAX`
+  is the arithmetic worst case, reached only right after a max-height drop; its jobs
+  are sizing `OBSTACLE_WALL_EXTRA` and acting as a never-binding backstop on
+  Campana's constraint (3). To change the robot, change `MAX_LANDING_APEX`,
+  `E_INJECT_MAX` or `ETA_HOP` — never `V_MAX` or `MAX_APEX_HEIGHT` directly.
+  The longest feasible flat hop is `V_MAX^2 / G_ACCEL` = 5.50 m, and a flat hop of
+  distance X needs `sqrt(g*X)`, so `HOP_RADIUS` must stay well under that.
+- `H_INITIAL` (1.0 m) is the first hop's apex, and the **first hop is the tightest in
+  any plan** — it hands the robot more energy than a `HOP_RADIUS` hop needs and the
+  robot cannot shed it, so the energy *floor* (not the ceiling) is what nearly
+  empties the interval. At shipped values that floor is 75.0° against an 82.8°
+  ceiling. `config.py` asserts the interval survives; violating it returns `None`
+  from `plan()` everywhere with no other symptom.
+- `MIN_APEX_HEIGHT` (0.3 m) is a **mechanism requirement, not a safety margin**:
+  below it the elastic leg does not compress enough for the controller to detect a
+  stance phase, so the cycle fails outright. It is what the chain converges to —
+  on flat 1 m hops the steady state sits exactly at a 0.30 m drop (50.2°).
+- `ETA_HOP` (0.7) is the fraction of kinetic energy surviving stance. Note
+  `sqrt(0.7)` = 0.837, so **speed** drops ~16% per hop while **energy** drops 30%;
+  reasoning about it in speed terms when the parameter is defined in energy terms is
+  an easy way to be wrong by a square root.
+- `SPEED_BIN` (0.25 m/s) quantises the search state's energy axis. Too coarse and
+  the propagated speed drifts from the arc actually flown; too fine and the state
+  space multiplies for no modelling gain. Rounding to nearest costs at most
+  ±0.125 m/s.
 - `LEG_LENGTH - ROBOT_RADIUS` must exceed `MIN_CLEARANCE`, or *every* edge is
   rejected and `plan()` silently returns `None` everywhere. `config.py` asserts
   it. This is specifically about the CoM sphere's own-column stance check
@@ -269,16 +362,25 @@ they need more specialized plots than the generic `Visualizer` provides.
   pattern: plain assertions, PASS/FAIL prints, `sys.exit(1)` on failure. New visual
   demos follow the `test/demo_*.py` pattern: build a scenario, run both the ballistic
   and baseline (`disable_clearance=True`) planners, save annotated PNGs via
-  `demo_common.out_path()` (`results/after_LS_recs/` by default, override with
+  `demo_common.out_path()` (`results/energy_aware_planning/` by default, override with
   `$PLANNER_OUT_DIR`).
 - **Diagnostics that re-score an edge outside the planner must go through
   `demo_common.planner_alpha_interval`,** never a bare `feasible_alpha_interval(X, Z,
-  V_max, g)`. The friction cone needs both surface normals and the heading, none of
-  which are recoverable from `X` and `Z`; the bare call silently assumes level ground,
-  so on sloped terrain the diagnostic disagrees with the planner it is explaining.
+  V_max, g)`. Two things are invisible in `X` and `Z` alone: the friction cone needs
+  both surface normals and the heading (the bare call silently assumes level ground,
+  so on sloped terrain the diagnostic disagrees with the planner it is explaining),
+  and the energy band needs the speed the robot *arrived* at.
+- **Diagnostics over a whole path must CHAIN, not map.** Use
+  `demo_common.diagnose_path`, which threads `v_g` forward hop by hop; calling
+  `diagnose_edge` in a loop scores every hop against the start-of-chain energy and
+  reports angles the robot could not have flown. Same for
+  `enumerate_ring_candidates` at a cell partway along a path — pass the `v_g_in` from
+  `path_hops` or it will show a different robot's options than the figure does.
 - `CHANGELOG.md` (Keep a Changelog format) is actively maintained — update it under
   `[Unreleased]` when making a notable change to the planner or its parameters.
 - Pure, unit-testable physics functions (`feasible_alpha_interval`, `predict_trajectory`,
-  `min_clearance`) are kept as free functions in `hopping_astar_planner.py`, separate
+  `min_clearance`, `min_apex_tan`, `min_energy_tan`, `takeoff_speed`, `landing_speed`,
+  `injection_energy`) are kept as free functions in `hopping_astar_planner.py`, separate
   from the `HoppingAStarPlanner` class, specifically so they can be imported and tested
-  in isolation (see `test/test_clearance_rejection.py`).
+  in isolation (see `test/test_clearance_rejection.py`,
+  `test/test_hop_energy_chain.py`).

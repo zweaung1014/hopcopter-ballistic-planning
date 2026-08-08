@@ -7,6 +7,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — hops now carry energy between them (hopping, not jumping)
+
+Every hop was validated in isolation: `feasible_alpha_interval(X, Z, V_max, g)` asked only
+"does *some* takeoff angle exist within the leg's budget?", so a landing cell was equally
+reachable however the robot got there. That is a **jumping** robot — land, stop, jump again.
+
+The real robot hops in a three-phase cycle (descent with attitude control, an
+inverted-pendulum stance, then powered climbing thrust), so takeoff speed is a function of
+landing speed, which is a function of the hop before it. Two things the old model could not
+express:
+
+1. **The robot already has a takeoff speed when it leaves the ground**, and propellers can
+   only *add* energy. Every parabola shallower than the one that speed produces is
+   unreachable, not merely suboptimal — the planner used to pick those freely.
+2. **The mechanism needs a minimum drop.** Falling less than `MIN_APEX_HEIGHT` does not
+   compress the elastic leg enough for the controller to detect a stance phase at all.
+
+- **The chain** — bookkeeping is full CoM kinetic energy at touchdown, `½mv²`. The CoM sits
+  at `terrain + LEG_LENGTH` at touchdown *and* takeoff, so stance involves no net change in
+  gravitational PE and the whole 30 % loss is kinetic, with no PE term to track. `m·g·h_apex`
+  was rejected as the alternative: it counts only the vertical share and would leave the
+  horizontal speed — exactly what the inverted pendulum redirects — undamped.
+
+  ```
+  flight (lossless):   v_g² = v_s² − 2gZ
+  stance (η loss):     v_s_min′ = √η · v_g                    η = ETA_HOP = 0.7
+  thrust (injection):  v_s′ ∈ [v_s_min′, √(v_s_min′² + 2·E_INJECT_MAX/m)]
+  ```
+
+- **Three new α bounds**, applied *before* Eq. 4 validity and the friction cones, in
+  `feasible_alpha_interval` — all behind keyword args defaulting to `None`, so bare
+  `(X, Z, V_max, g)` calls keep their old behaviour and `test/test_friction_cone.py` still
+  exercises BEAM in isolation:
+  - **(E1) energy floor.** `_speed_tan_interval` already returns where `v_s² ≤ W`; the floor
+    is its complement, and the implementation keeps the upper branch (the higher parabola).
+    Vacuous when `v_s_min` cannot reach the target at all, where the bound falls back to
+    (E2)'s lower root.
+  - **(E2) injection ceiling**, `v_s ≤ √(v_s_min² + 2·E_INJECT_MAX/m)`.
+  - **(E3) minimum drop**, new free function `min_apex_tan`. Measured apex → landing, not
+    takeoff → apex: it is the fall that compresses the leg, and on an uphill hop the robot
+    can rise 0.3 m and still land while barely descending. `h_drop = (XT−2Z)²/(4(XT−Z))` is
+    monotone in `T = tan α` on the valid domain, so it inverts in closed form to
+    `T ≥ 2(Z + h + √(h(h+Z)))/X` — no bisection. It is `max`'d against (E1), making it a
+    pure fallback that changes nothing unless the incoming speed's parabola is too low.
+
+- **A\* state is now `(cell, speed_bin)`.** A cell reached two ways is two situations, and
+  one may have no feasible continuation. Neither more nor less energy dominates — more
+  raises the floor and shuts off shallow hops, less lowers the ceiling — so there is no
+  valid dominance pruning and the speed axis is quantised (`SPEED_BIN` = 0.25 m/s) instead.
+  Measured on `stairs`: 827 → 3285 expansions (~4 live bins per cell), 5.1 s → 11.2 s.
+  Most of that was clawed back with a new bounded `_profile_cache`: terrain profiles depend
+  only on the cell pair, not on energy, so the bins of one cell were re-sampling identical
+  terrain (21.6 s before the cache; 20k entries thrashes at 15.0 s, 60k reaches the
+  uncapped 11.2 s at ~170 MB peak RSS).
+
+- **Takeoff angle is chosen to minimise injected energy**, not to maximise clearance margin
+  — energy spent now is energy the next hop lacks. `alpha_for_clearance` loses
+  `margin_frac` and returns `clamp(α*, α_c, α_max)`, where `α_c` is the shallowest clearing
+  angle (clearance is monotone in `tan α`) and `α*` = `min_energy_tan(X, Z)` =
+  `(Z + hypot(Z,X))/X` is the argmin of required speed (U-shaped in α). Exact, not a search.
+  **The accept/reject verdict is unchanged** by the policy switch — both reject only when
+  even `α_max` fails — so only reported angles and clearances moved.
+  `ALPHA_MARGIN_FRAC` is deleted.
+
+- **`V_MAX` is now derived from the chain, and `V_G_MAX` replaces it as the real cap.**
+  `V_G_MAX` = `√(2g·MAX_LANDING_APEX)` = 7.00 m/s is the fastest touchdown the leg can
+  absorb (sized at a 2.5 m fall — hopping off a platform); since `v_s_min = √η·v_g` on the
+  next hop, bounding `v_g` recursively bounds every takeoff speed. `V_MAX` =
+  `√(η·V_G_MAX² + 2·E_INJECT_MAX/m)` = 7.35 m/s is what remains: the global worst case,
+  reachable only immediately after a max-height drop, and a never-binding backstop on
+  constraint (3). Constraint (4) now reads `v_g ≤ V_G_MAX`.
+
+  Knock-on: `MAX_APEX_HEIGHT` becomes derived (1.20 → 2.75 m) and **`OBSTACLE_WALL_EXTRA`
+  had to rise 1.5 → 3.1 m** to keep obstacles un-flyable for a robot fresh off a platform.
+  Its existing assert catches this.
+
+- **New config**: `ROBOT_MASS`, `ETA_HOP`, `H_INITIAL`, `MIN_APEX_HEIGHT`,
+  `INJECT_MAX_HEIGHT`/`E_INJECT_MAX`, `MAX_LANDING_APEX`/`V_G_MAX`, `SPEED_BIN`. The start
+  cell is seeded with a *virtual* landing speed `√(2g·H_INITIAL/η)` = 5.29 m/s, chosen so
+  the uniform stance rule reproduces a first takeoff speed of `√(2g·H_INITIAL)` = 4.43 m/s
+  — so the first hop needs no special case anywhere in the search. Two new asserts guard
+  the silent-`None`-everywhere failure mode: that some angle survives the first hop (the
+  tightest in any plan, because `H_INITIAL` hands the robot a surplus it cannot shed), and
+  that the seed speed is one the leg could have absorbed.
+
+- **`HoppingAStarPlanner.path_hops`** records per-hop `alpha_s`, `v_s`, `v_g`, `e_inject`,
+  `apex_drop`, `X`, `Z` for the returned path. Callers needing the takeoff angle must read
+  it from there: with the chain, the angle depends on the whole path leading up to the hop
+  and cannot be recovered from the endpoints. `main.py` prints the table.
+
+- **Diagnostics chain, and bin.** `demo_common.diagnose_path` now threads `v_g` forward
+  hop by hop instead of mapping `diagnose_edge` over the pairs; `planner_alpha_interval`,
+  `diagnose_edge`, `enumerate_ring_candidates` and `demo_decision_sweep.path_cost` take a
+  `v_g_in`. Scoring hops independently would judge every one of them against the
+  start-of-chain energy. It also *quantises* `v_g` between hops, because the search state
+  carries a binned speed and that — not the exact value — is what chose the angle;
+  chaining the exact value drifts by up to `SPEED_BIN/2` per hop, enough to move the
+  reported clearance across the gate. That defect was visible as `diagnose_path` accusing
+  the ballistic planner's own path of containing a hop the planner had accepted
+  (`stairs_with_curb`, mc 0.088 vs the 0.10 gate).
+
+- **Map recalibration: `maps/tall_narrow_wall.py` 0.70 → 1.40 m.** Its 0.70 m ridge was
+  sized against a tuned `V_MAX` and a max-margin angle; under the energy chain a forced-
+  steep arc clears it from every takeoff, and both planners returned the identical clean
+  path. At 1.40 m the original contrast is back — baseline takes off at x=2.05 and clips,
+  ballistic backs off to 1.95 and clears. Measured: 1.1–1.4 m shifts the takeoff, 1.6 m
+  and up makes the planner detour around the y-end instead (which is
+  `demo_planner_reroute`'s scenario, not this one). `demo_clearance_sweep`'s pillar moved
+  0.9 → 1.6 m to stay in step with `test_clearance_rejection`, and now passes the energy
+  band rather than a bare interval.
+
+- **Test recalibration.** `test/test_clearance_rejection.py`'s pillar sweep needed
+  `PILLAR_H` 0.45 → 1.6 m and its wall case 1.10 → 1.90 m: a robot that cannot shed energy
+  is forced steep on short hops (39.8° of floor at `X = 2.1`, 78.2° at `X = 0.8`) and clears
+  a low pillar trivially. Both files' hard-coded reach boundaries are now derived from
+  `V_MAX²/g` so they cannot silently encode a tuned value again. New
+  `test/test_hop_energy_chain.py` covers the closed forms, the interval bounds, and
+  end-to-end chain closure on a real plan.
+
+- Demo output moved to `results/energy_aware_planning/`. The code default had already
+  drifted to `results/with_leg_capsule_margin` while the docs still said
+  `results/after_LS_recs`; all now agree.
+
 ### Added — friction cone at both contacts (Campana BEAM constraints 1–4)
 
 `feasible_alpha_interval` was pure and map-free: it saw only `X`, `Z`, `V_max` and
