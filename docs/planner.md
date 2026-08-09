@@ -67,7 +67,16 @@ Where:
 - $\alpha = \alpha_{\text{uphill}}$ if $\Delta z > 0$ (jumping up)
 - $\alpha = \alpha_{\text{downhill}}$ if $\Delta z < 0$ (landing down)
 
-The $\alpha$ values set the **exchange rate** between elevation and distance. For example, with `ALPHA_UPHILL = 5.0`, climbing 1m costs as much as traveling 5m horizontally. This means the planner prefers to go around an obstacle only if the detour is less than 5× the elevation gained by going over it.
+The $\alpha$ values set the **exchange rate** between elevation and distance. For example, with `alpha_uphill = 5.0`, climbing 1m costs as much as traveling 5m horizontally. This means the planner prefers to go around an obstacle only if the detour is less than 5× the elevation gained by going over it.
+
+> **These are now `astar_planner.py` constructor arguments only.** `ALPHA_UPHILL` and
+> `ALPHA_DOWNHILL` were removed from `config.py` when the active planner replaced this
+> elevation penalty with an energy cost,
+> `xy_dist + W_ENERGY · (e_inject + max(0, KE_in − KE_out))`. The penalty below could not
+> price the case it existed for: a hop that arcs **over** an obstacle and lands at the same
+> height has $\Delta z = 0$ and is charged nothing. Only paths that land *on* the obstacle
+> were ever priced. See `CLAUDE.md` § "The edge cost" and
+> `results/energy_based_edge_cost/`.
 
 ### Hard Jump Constraint
 
@@ -93,23 +102,29 @@ An admissible heuristic guarantees A* finds the optimal path.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `MAX_JUMP_HEIGHT` | 0.5 m | Maximum height difference between adjacent cells. Moves exceeding this are impassable. |
-| `ALPHA_UPHILL` | 5.0 | Cost multiplier for uphill moves. Higher values make the planner prefer flat paths over elevated ones. |
-| `ALPHA_DOWNHILL` | 2.0 | Cost multiplier for downhill moves (landings). Lower than uphill because landing is generally easier than jumping up. |
+| `MAX_JUMP_HEIGHT` | 0.5 m | Maximum height difference between adjacent cells. Moves exceeding this are impassable. Still in `config.py`. |
+| `alpha_uphill` | 1.0 | Cost multiplier for uphill moves. Higher values make the planner prefer flat paths over elevated ones. **Constructor arg only** — no longer in `config.py`. |
+| `alpha_downhill` | 0.5 | Cost multiplier for downhill moves (landings). Lower than uphill because landing is generally easier than jumping up. **Constructor arg only.** |
 
 ## Tuning Guide
 
+> For the **active** planner these knobs do not exist; the equivalent dial is
+> `config.W_ENERGY` (m per J). Raise it to prefer going around, lower it to prefer hopping
+> over. Unlike the $\alpha$ values it has a derived default — `1 / 1.197` J, the cost of
+> holding speed through one flat steady-state hop — so `0.84` means "weigh energy and
+> distance exactly as the physics says" rather than an arbitrary starting point.
+
 ### Making the robot prefer flat paths (go around)
-- Increase `ALPHA_UPHILL` and `ALPHA_DOWNHILL`
+- Increase `alpha_uphill` and `alpha_downhill`
 - The planner will accept longer 2D distances to avoid elevation changes
 
 ### Making the robot prefer short paths (hop over)
-- Decrease `ALPHA_UPHILL` and `ALPHA_DOWNHILL` (toward 0)
+- Decrease `alpha_uphill` and `alpha_downhill` (toward 0)
 - At 0, the planner ignores elevation entirely and finds the shortest 2D path
 
 ### Adjusting asymmetry
-- `ALPHA_UPHILL > ALPHA_DOWNHILL`: jumping up costs more than landing down (default — realistic for a hopping robot)
-- `ALPHA_UPHILL == ALPHA_DOWNHILL`: symmetric cost for up and down
+- `alpha_uphill > alpha_downhill`: jumping up costs more than landing down (default — realistic for a hopping robot)
+- `alpha_uphill == alpha_downhill`: symmetric cost for up and down
 
 ### Hard constraint
 - Lower `MAX_JUMP_HEIGHT` to make more terrain impassable (stricter robot limits)

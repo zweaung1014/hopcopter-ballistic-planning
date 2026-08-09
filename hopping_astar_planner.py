@@ -1030,10 +1030,14 @@ class HoppingAStarPlanner:
     the LEAST injected energy (`alpha_for_clearance`), because energy spent on
     this hop is energy the next hop does not have.
 
-    Clearance is a pure feasibility gate — it does not shape cost. Edge cost
-    is `xy distance + asymmetric elevation penalty + hop_fixed_cost`. The A*
-    heuristic remains Euclidean XY distance to the goal, and stays admissible
-    because every term only ever adds to the actual cost.
+    Clearance is a pure feasibility gate — it does not shape cost. Edge cost is
+    `xy distance + w_energy * (injected energy + momentum thrown away)`, which
+    replaced an elevation penalty that could not price the manoeuvre it was
+    written for (see `_edge_cost`). The A* heuristic remains Euclidean XY
+    distance to the goal, and stays admissible because both energy terms are
+    non-negative and so only ever add to the actual cost — though note the
+    heuristic cannot SEE them, which is what makes `w_energy` a search-speed
+    dial as well as a behaviour one.
 
     A "goal-snap" edge is added whenever the goal lies within `hop_radius`
     of the current cell, so the planner can land exactly on the goal
@@ -1048,8 +1052,9 @@ class HoppingAStarPlanner:
         hop_radius: float,
         n_angles: int = 16,
         max_jump_height: float = 0.5,
-        alpha_uphill: float = 1.0,
-        alpha_downhill: float = 0.5,
+        # Exchange rate between energy and distance in the edge cost, m per J.
+        # Derived rather than tuned — see `config.W_ENERGY` and `_edge_cost`.
+        w_energy: float = 0.84,
         # Ballistic / clearance parameters (defaults match config.py).
         g: float = 9.81,
         # Global worst-case takeoff speed — a backstop, not the per-hop cap.
@@ -1113,6 +1118,18 @@ class HoppingAStarPlanner:
         # for real planning. To isolate the friction cone instead, pass
         # `mu=None`.
         disable_clearance: bool = False,
+        # Demo/analysis flag: when False, `_edge_cost` charges injected energy but
+        # NOT the momentum a hop throws away. Third in the same family as
+        # `disable_clearance` and `mu=None` — A/B baselines only.
+        #
+        # Unlike those two, this one is not merely a weaker model, it is a
+        # KNOWN-BROKEN one, and worse than having no energy term at all. Short
+        # hops need no thrust (the robot already carries the speed from its last
+        # landing), so on injection alone they price as free and A* chops paths
+        # into stubs that arrive drained — `[1.0, 1.0, 1.0]` at 3.16 m/s becomes
+        # `[0.8, 1.0, 0.8, 0.4]` at 2.56 m/s. Do NOT reach for this as a way to
+        # claw back planning time. See `test/demo_cost_model_ab.py`.
+        charge_momentum: bool = True,
     ):
         self.map_env = map_env
         self.start_world = start
@@ -1122,8 +1139,8 @@ class HoppingAStarPlanner:
         # Retained for backward compatibility, but the ballistic feasibility
         # gate below fully supersedes the old `|dz| <= max_jump_height` check.
         self.max_jump_height = max_jump_height
-        self.alpha_uphill = alpha_uphill
-        self.alpha_downhill = alpha_downhill
+        self.w_energy = w_energy
+        self.charge_momentum = charge_momentum
 
         # Ballistic parameters.
         self.g = g
@@ -1430,9 +1447,11 @@ class HoppingAStarPlanner:
               keeps the body `min_clearance_gate` clear of the terrain, and
               reject if no feasible angle manages it;
           (e) return the edge cost. Clearance does NOT appear here — it is a
-              feasibility test, not a cost term. Neither does injected energy:
-              it is minimised *within* an edge, not traded off against distance
-              across edges, which is what keeps the heuristic admissible.
+              feasibility test, not a cost term. Injected energy DOES, together
+              with the momentum the hop throws away; see `_edge_cost`. Note the
+              two roles injection plays are distinct: step (d) minimises it
+              *within* an edge (which angle to fly), while (e) prices it
+              *across* edges (which hop to take).
         """
         self.n_edge_checks += 1
         neighbor_z = self.map_env.grid[neighbor[0], neighbor[1]]
@@ -1507,38 +1526,95 @@ class HoppingAStarPlanner:
         # (e) Edge cost. `hop_fixed_cost` breaks the tie that would otherwise
         # make N micro-hops exactly as cheap as one long hop.
         self.n_edges_accepted += 1
-        return self._edge_cost(current, neighbor, Z) + self.hop_fixed_cost, hop
+        return self._edge_cost(current, neighbor, hop) + self.hop_fixed_cost, hop
 
     def _edge_cost(
         self,
         current: tuple[int, int],
         neighbor: tuple[int, int],
-        dz: float,
+        hop: dict,
     ) -> float:
-        """Cost of hopping from `current` to `neighbor`.
+        """Cost of hopping from `current` to `neighbor`, given the arc flown.
 
-        Cost = actual Euclidean xy-distance between cell centers + elevation
-        penalty (asymmetric: uphill and downhill weighted differently).
+            cost = xy_dist + w_energy * (battery_used + momentum_thrown_away)
+
+        This replaced an elevation penalty (`alpha_uphill * dz`), which could not
+        do the job it was written for: arcing over a wall and landing at the same
+        height is `dz = 0`, so it charged nothing for exactly the manoeuvre it was
+        meant to price. It was also blind to how the robot ARRIVED, charging the
+        same whether the hop was paid for with spare momentum or with thrust.
+
+        **battery_used** is `hop["e_inject"]` — the propeller work this hop costs.
+        It rises on its own when the clearance gate lifts `alpha` to clear
+        terrain, which is what makes "over vs around" a physics question rather
+        than a weight-tuning one. It also prices climbing (a hop to `Z = +0.4`
+        needs 3.73 J against 1.20 J on the flat), which is why no separate
+        elevation term is needed.
+
+        **momentum_thrown_away** is `max(0, KE_in - KE_out)`, and without it the
+        model is broken rather than merely incomplete. Short hops need no thrust
+        — the robot already carries enough speed from the last landing — so on
+        battery alone they look FREE, and A* chops the path into stubs. They are
+        not free: every landing burns `1 - eta` of the kinetic energy, and the
+        robot simply arrives drained. Summing `e_inject` counts the battery but
+        not the bank account. This term bills the difference at exactly what
+        buying that energy back would cost. Measured on `flat` at steady state,
+        covering 1 m:
+
+            one 1.0 m hop:   battery 1.20 J + momentum 0.00 J  =  1.20 J
+            two 0.5 m hops:  battery 0.81 J + momentum 1.23 J  =  2.04 J
+
+        It is ALSO what regulates hop count, which is why there is no per-hop
+        energy constant here: holding speed steady costs
+        `0.5 * mass * v^2 * (1 - eta)` per hop, an expression with no hop length
+        in it, so N hops over the same ground cost N times as much. `min_apex`
+        already makes very short hops expensive; this makes merely-shortish ones
+        expensive too.
+
+        `KE_out` uses the BINNED landing speed, not the exact `hop["v_g"]`.
+        `hop["v_g_in"]` is already binned (see `_generate_hop_neighbors`) and the
+        successor state carries the binned speed, so mixing binned-in with
+        exact-out would leave up to ~0.32 J of quantisation noise per hop against
+        a ~1.2 J signal.
+
+        Both added terms are `>= 0` by construction (`injection_energy` clamps,
+        and the `max(0, ...)` here), so `_heuristic` stays admissible and edge
+        costs stay non-negative. The latter is not incidental: the uncapped form
+        `e_inject + KE_in - KE_out` reaches -1.36 J on a 0.4 m drop, and negative
+        edges break A*.
+
+        Known conservatism: a climb converts kinetic energy into height rather
+        than wasting it, but the momentum term charges for it anyway — about
+        0.60 J on top of 3.72 J of real injection for a 0.4 m step.
         """
         cx, cy = self.map_env.grid_to_world(current[0], current[1])
         nx, ny = self.map_env.grid_to_world(neighbor[0], neighbor[1])
         xy_dist = float(np.hypot(nx - cx, ny - cy))
 
-        if dz > 0:
-            elevation_penalty = self.alpha_uphill * dz
-        elif dz < 0:
-            elevation_penalty = self.alpha_downhill * abs(dz)
-        else:
-            elevation_penalty = 0.0
+        e_momentum = 0.0
+        if self.charge_momentum:  # False is an A/B baseline only — see __init__
+            v_g_out = self._speed_bin(hop["v_g"]) * self.speed_bin
+            ke_in = 0.5 * self.mass * hop["v_g_in"] ** 2
+            ke_out = 0.5 * self.mass * v_g_out ** 2
+            e_momentum = max(0.0, ke_in - ke_out)
 
-        return xy_dist + elevation_penalty
+        return xy_dist + self.w_energy * (hop["e_inject"] + e_momentum)
 
     def _heuristic(self, cell: tuple[int, int]) -> float:
         """Admissible heuristic: Euclidean distance in world coordinates to goal.
 
         Admissible because sum of hop xy-distances >= straight-line distance
-        (triangle inequality), and the elevation penalty and `hop_fixed_cost`
-        only add to the actual g-cost.
+        (triangle inequality), and every other term in `_edge_cost` — the
+        injected energy, the momentum charge, and `hop_fixed_cost` — is
+        non-negative, so it can only add to the actual g-cost.
+
+        Admissible is not the same as INFORMED, and the gap matters here. This
+        estimates distance only, so the whole energy term is cost the heuristic
+        cannot anticipate; the larger `w_energy` is, the more A* degrades toward
+        Dijkstra. Measured on `flat`, adding the energy term at `w_energy = 0.84`
+        took expansions from 186 to ~1800. The known fix is a per-hop energy
+        constant, which unlike the momentum charge can be lower-bounded from
+        `ceil(remaining_distance / hop_radius)` and added here.
         """
         x1, y1 = self.map_env.grid_to_world(cell[0], cell[1])
         x2, y2 = self.map_env.grid_to_world(self.goal_cell[0], self.goal_cell[1])

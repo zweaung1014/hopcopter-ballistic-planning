@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — edge cost is energy, not elevation
+
+`_edge_cost` priced a hop as `xy_dist + alpha_uphill·dz`. It was added to make the planner
+weigh "hop over the obstacle" against "go around it", and it could not do that job: a hop
+that arcs **over** a wall and lands on the flat beyond has `dz = 0`, so it was charged
+nothing — for exactly the manoeuvre it existed to price. It was also blind to how the robot
+arrived, charging the same whether the hop was paid for with spare momentum or with thrust.
+
+```
+cost = xy_dist + W_ENERGY · (e_inject + max(0, KE_in − KE_out))
+```
+
+- **`e_inject` was already there.** Computed on every edge, already rising when the
+  clearance gate lifts `alpha` over terrain, and thrown away. Hooking it into cost makes
+  over-vs-around a physics question. It also prices climbing on its own (`Z = +0.4` needs
+  3.73 J against 1.20 J flat), which is what makes the elevation term redundant rather than
+  merely miscalibrated.
+
+- **The momentum term is not optional.** Charging `e_inject` alone is *worse* than the old
+  cost: short hops need no thrust at all — the robot already carries the speed — so they
+  price as free and A* chops paths into stubs. On `flat` at steady state over 3.0 m, the
+  path went from `[1.0, 1.0, 1.0]` to `[0.8, 1.0, 0.8, 0.4]`, arriving at 2.56 m/s instead
+  of 3.16. It did not save energy, it spent momentum; `Σe_inject` counts the battery but
+  not the bank account. Covering 1 m: one 1.0 m hop is 1.20 J + 0.00 J, two 0.5 m hops are
+  0.81 J + 1.23 J.
+
+- **This is also what regulates hop count**, which is why no per-hop energy constant was
+  added. Holding speed steady costs `½mv²(1−η)` = 1.197 J per hop — an expression with no
+  hop *length* in it — so N hops over the same ground cost N times as much.
+
+- **`W_ENERGY = 0.84` m/J is derived, not tuned**: `1 / 1.197` makes one flat steady-state
+  hop's energy cost equal its distance cost. Raise it to bias toward detouring, lower it to
+  bias toward hopping over. It is also a runtime dial — see below.
+
+- **`KE_out` uses the binned landing speed**, matching `KE_in` (already binned) and the
+  speed the successor state actually stores. Mixing binned-in with exact-out leaves ~0.32 J
+  of quantisation noise per hop against a ~1.2 J signal.
+
+**Removed:** `ALPHA_UPHILL`, `ALPHA_DOWNHILL`, and the `alpha_uphill` / `alpha_downhill`
+constructor arguments. `astar_planner.py` (the retained 8-connected reference planner) keeps
+its own copies and is untouched. `HOP_FIXED_COST` stays at 0.05 but is likely now dead
+weight — the micro-hop chains it prevented stop being free once landings cost energy.
+
+**Cost: planning is 4–6× slower** (`flat` 9.3 → 44.6 s, `low_wall` 6.6 → 40.1 s; expansions
+~3.5–4.5×). Structural rather than a bug: `_heuristic` estimates distance only, so the whole
+energy term is cost it cannot anticipate and A* degrades toward Dijkstra. Scales with
+`W_ENERGY`. The known mitigation is a per-hop energy constant, which unlike the momentum
+charge can be lower-bounded from `ceil(dist / hop_radius)` and added to the heuristic; left
+undone as a search optimisation rather than a cost-model question.
+
+**Known conservatism:** a climb converts kinetic energy into height rather than wasting it,
+but the momentum term charges for it anyway — ~0.60 J on top of 3.72 J of real injection for
+a 0.4 m step.
+
+**Rejected alternatives**, recorded so they are not re-litigated: raw obstacle height
+(over-counts ~3×, because launching harder means landing harder and the next hop needs no
+injection — `[1.20, 2.86, 0.03, 1.20]` — a refund only a path sum can credit); `m·g·h` at the
+apex (charges for height the robot got free, counts only the vertical share); stance
+dissipation instead of injection (makes climbing *cheaper* than flat, 1.02 J vs 1.20 J);
+uncapped potential shaping `e_inject + KE_in − KE_out` (reaches −1.36 J on a 0.4 m drop, and
+negative edges break A*); a larger `hop_fixed_cost` (needs ~1.0, fitted per scenario); a
+separate per-hop energy constant (tested at 0.2 J — changed neither path nor expansion count).
+
+- **New:** `test/test_edge_cost_energy.py`, 11 assertions, mostly regressions against the
+  above.
+- **New:** `charge_momentum` (default `True`), a third A/B knob alongside
+  `disable_clearance` and `mu=None`. `False` charges thrust but not the momentum term.
+  Unlike the other two it is not a weaker model but a **known-broken** one — worse than
+  having no energy term at all — and is documented as such so nobody reaches for it to
+  claw back planning time.
+- **New:** `test/demo_cost_model_ab.py` — three cost models (distance only / thrust only /
+  thrust + momentum) across three scenarios, producing `cost_model_ab.png` (top-down
+  paths) and `cost_model_ledger.png` (per-hop thrust-vs-momentum bars). Measured, every
+  scenario seeded at the flat steady state:
+
+  ```
+  scenario   model  hops  travel  thrust  moment  total E  exit v
+  flat       A         3   3.00    3.10    0.00     3.10    3.16
+  flat       B         4   3.00    2.45    2.35     4.80    2.56
+  flat       C         3   3.00    3.10    0.00     3.10    3.16
+  low_wall   A         4   3.00    3.90    3.23     7.13    2.72
+  low_wall   B         4   3.00    3.06    2.50     5.56    2.63
+  low_wall   C         4   3.16    3.55    1.30     4.85    2.92
+  bypass     A         4   4.00    6.79    3.68    10.47    3.76
+  bypass     B         5   4.00    6.45    4.83    11.27    2.93
+  bypass     C         6   5.44    5.44    0.62     6.06    2.89
+  ```
+
+  B burns less thrust than C on `flat` and `low_wall` while arriving slower every time —
+  it looks cheaper only because the meter is not running on momentum. On `bypass` the
+  models split on routing: A and B cross a 0.70 m wall, C walks 1.44 m further round the
+  end and spends **6.06 J against B's 11.27 J**.
+- **Seeding matters and is not cosmetic.** All three scenarios start at the flat steady
+  state (`h_initial ≈ 0.356 m`). At the shipped `H_INITIAL = 1.0` the robot opens with
+  5.29 m/s it cannot shed, injects nothing for three hops while stance losses burn the
+  surplus off, and ~8 J of forced momentum loss swamps the ledger — every model paying it
+  identically. A development A/B run showed no difference between models for exactly this
+  reason.
+- **Rewritten:** `test/demo_decision_sweep.py` — narrative was built entirely on
+  `ALPHA_UPHILL · h`. Now reports the travel/thrust/momentum split. Its `HEIGHTS` were
+  re-picked from `[0.15, 0.80, 1.20, 1.40]` to `[0.30, 0.60, 0.90, 1.20]`: the over/around
+  flip moved from h ∈ [1.20, 1.40] to h ∈ [0.90, 1.20] at `demo_common.HOP_RADIUS = 1.5`,
+  because arcing over is now paid for at all. Its `build_wall` also moved from a raw
+  `world_to_grid` slice to `paint_region`, so the physical wall no longer rescales with
+  `CELL_RESOLUTION` — which would have moved the flip point the demo exists to locate.
+- **Results:** `results/energy_based_edge_cost/`.
+
 ### Changed — hops now carry energy between them (hopping, not jumping)
 
 Every hop was validated in isolation: `feasible_alpha_interval(X, Z, V_max, g)` asked only

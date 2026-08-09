@@ -147,7 +147,7 @@ def param_caption(planner: HoppingAStarPlanner | None = None) -> str:
             f"(apex {config.MAX_APEX_HEIGHT} m) · leg={config.LEG_LENGTH} m · "
             f"robot_radius={config.ROBOT_RADIUS} m · "
             f"min_clearance={config.MIN_CLEARANCE} m · res={config.CELL_RESOLUTION} m · "
-            f"α_uphill={config.ALPHA_UPHILL} · α_downhill={config.ALPHA_DOWNHILL}"
+            f"W_energy={config.W_ENERGY} m/J"
         )
     return (
         f"hop_radius={planner.hop_radius} m · leg={planner.leg_length} m · "
@@ -157,7 +157,8 @@ def param_caption(planner: HoppingAStarPlanner | None = None) -> str:
         f"energy chain: η={planner.eta} · m={planner.mass} kg · "
         f"E_inject_max={planner.e_inject_max:.2f} J · "
         f"min_apex={planner.min_apex} m · V_g_max={planner.V_g_max:.2f} m/s · "
-        f"V_max={planner.V_max:.2f} m/s · speed_bin={planner.speed_bin} m/s"
+        f"V_max={planner.V_max:.2f} m/s · speed_bin={planner.speed_bin} m/s\n"
+        f"cost: xy_dist + {planner.w_energy} m/J × (E_inject + momentum lost)"
     )
 
 
@@ -178,7 +179,7 @@ def make_planner(
     """Build a planner with every `config.*` field threaded in by name.
 
     `overrides` accepts any remaining `HoppingAStarPlanner` keyword (e.g.
-    `alpha_uphill=...`) so a demo can vary one parameter without restating
+    `w_energy=...`) so a demo can vary one parameter without restating
     the rest.
     """
     kwargs = dict(
@@ -188,8 +189,7 @@ def make_planner(
         hop_radius=hop_radius,
         n_angles=n_angles,
         max_jump_height=config.MAX_JUMP_HEIGHT,
-        alpha_uphill=config.ALPHA_UPHILL,
-        alpha_downhill=config.ALPHA_DOWNHILL,
+        w_energy=config.W_ENERGY,
         g=config.G_ACCEL,
         V_max=V_max,
         mu=config.MU,

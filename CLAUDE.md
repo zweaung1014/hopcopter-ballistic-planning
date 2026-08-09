@@ -46,6 +46,8 @@ python test/test_clearance_rejection.py
 python test/test_friction_cone.py       # BEAM / friction-cone ground-truth validation
 python test/test_hop_energy_chain.py    # energy chain: closed forms, alpha bounds,
                                         # and end-to-end chain closure on a real plan
+python test/test_edge_cost_energy.py    # energy-based edge cost: the momentum term,
+                                        # non-negativity, and the over-a-wall case
 
 # Timing/scaling benchmark (ballistic vs. baseline planner on the same scenario)
 python test/benchmark_tall_stairs.py
@@ -63,6 +65,8 @@ python test/demo_barely_jumpable.py
 python test/demo_narrow_wall_showcase.py
 python test/demo_planner_reroute.py
 python test/demo_prof_showcase.py
+python test/demo_cost_model_ab.py    # 3 cost models x 3 scenarios: what each
+                                     # energy term buys (~2 min)
 ```
 
 `test/*.py` scripts insert the repo root onto `sys.path` themselves
@@ -176,11 +180,11 @@ generation and edge validation are non-trivial:
      clears and reports the resulting clearance; reject if it is below
      `min_clearance_gate`. This step also decides the flown angle, hence the
      successor's energy, so it is not skippable;
-  5. cost = XY distance + asymmetric elevation penalty (`alpha_uphill` /
-     `alpha_downhill`) + `hop_fixed_cost`. **Neither clearance nor injected energy
-     enters the cost** — clearance is purely a feasibility test, and injection is
-     minimised *within* an edge rather than traded against distance across edges,
-     which is what keeps the heuristic admissible.
+  5. cost = XY distance + `w_energy * (e_inject + max(0, KE_in - KE_out))` +
+     `hop_fixed_cost`. Clearance still does **not** enter the cost (it is purely a
+     feasibility test), but injected energy now does — see "The edge cost" below.
+     Note injection plays two distinct roles: step 4 minimises it *within* an edge
+     (which angle to fly), step 5 prices it *across* edges (which hop to take).
 - **`_profile_cache`** memoises `terrain_profile` on the `(takeoff cell, landing
   cell)` pair. Profiles depend only on the endpoints and body geometry, not on the
   arc and so not on energy — but the energy axis means each cell is expanded once
@@ -196,10 +200,63 @@ generation and edge validation are non-trivial:
 - `mu=None` is the analogous knob for the friction cone: it drops BEAM constraints
   (1) and (2) while keeping Eq. 4 validity and both velocity limits. A/B baselines
   only (`test/demo_friction_cone.py`), never real planning.
+- `charge_momentum=False` is the third of these knobs: `_edge_cost` then charges
+  injected energy but not the momentum a hop throws away. **Unlike the other two
+  it is not a weaker model but a known-broken one**, and worse than dropping the
+  energy term entirely (`w_energy=0`) — short hops need no thrust, so on injection
+  alone they price as free and A* chops paths into stubs that arrive drained. It
+  exists so `test/demo_cost_model_ab.py` can show that; do not reach for it to
+  claw back planning time.
 - **`v_s_min=None` disables the energy band** in `feasible_alpha_interval` and
   recovers the pre-chain behaviour. That is what lets `test/test_friction_cone.py`
   keep exercising BEAM in isolation with a bare `(X, Z, V_max, g)` call — it is not
   a planning knob.
+
+### The edge cost — why it is energy and not elevation
+
+`cost = xy_dist + w_energy * (e_inject + max(0, KE_in - KE_out))`. Both energy
+terms are `>= 0` by construction, so the Euclidean-XY heuristic stays admissible.
+
+- **`e_inject` was already computed on every edge and thrown away.** It rises on
+  its own when the clearance gate lifts `alpha` over terrain, and it prices
+  climbing without help (`Z = +0.4` costs 3.73 J against 1.20 J flat). That is
+  why there is no elevation term any more: `alpha_uphill * dz` was not
+  miscalibrated, it was *blind* — arcing over a wall and landing on the flat
+  beyond is `dz = 0`, so it charged nothing for exactly the manoeuvre it existed
+  to price.
+- **The momentum term is load-bearing, not a refinement.** Charging `e_inject`
+  alone is worse than the old cost: short hops need no thrust (the robot already
+  carries the speed from its last landing), so they price as FREE and A* chops
+  paths into stubs — `[1.0, 1.0, 1.0]` became `[0.8, 1.0, 0.8, 0.4]`, arriving at
+  2.56 m/s instead of 3.16. It did not save energy, it spent momentum. Summing
+  `e_inject` counts the battery but not the bank account.
+- **It is also what regulates hop count**, which is why there is no per-hop
+  energy constant. Holding speed steady costs `0.5*m*v^2*(1-eta)` = 1.197 J per
+  hop — an expression with **no hop length in it** — so N hops over the same
+  ground cost N times as much. `HOP_FIXED_COST` survives at 0.05 but is probably
+  now dead weight.
+- **`KE_out` uses the BINNED landing speed**, matching `KE_in` and the speed the
+  successor state stores. Mixing binned-in with exact-out leaves ~0.32 J of
+  quantisation noise per hop against a ~1.2 J signal.
+- **The `max(0, ...)` cap is required, not defensive.** The uncapped form
+  `e_inject + KE_in - KE_out` is exact potential shaping and telescopes neatly,
+  but reaches **-1.36 J** on a 0.4 m drop. Negative edge costs break A*.
+- **Do not switch to charging stance dissipation** instead of injection. It looks
+  attractive (monotone in hop count, no cap needed) but makes climbing *cheaper*
+  than flat ground — 1.02 J for a 0.4 m climb against 1.20 J flat, because a
+  climb lands slower — so the robot seeks out hills.
+- **Do not re-add a raw obstacle-height penalty.** It over-counts ~3x: a 0.5 m
+  wall costs 1.67 J on the crossing hop but only 0.50 J once chained, because
+  launching harder means landing harder and the next hop needs no injection
+  (`[1.20, 2.86, 0.03, 1.20]`). Only a path sum can credit that refund.
+- **`W_ENERGY` is a runtime dial as well as a behaviour one.** `_heuristic`
+  estimates distance only, so the whole energy term is cost it cannot anticipate
+  and A* degrades toward Dijkstra as `w_energy` rises. Turning it on cost 4-6x on
+  the two maps measured. The known fix is a per-hop energy constant, which unlike
+  the momentum charge can be lower-bounded from `ceil(dist / hop_radius)`.
+
+See `results/energy_based_edge_cost/` for the measurements behind all of the
+above.
 
 ### The robot model — four things that are easy to get wrong
 
@@ -341,9 +398,18 @@ Notable non-obvious parameters:
   land on x-values the straight ladder skips. It ships equal to `CELL_RESOLUTION`
   for that reason. If you coarsen it for speed, check the paths for zig-zags
   before trusting the figures.
-- `HOP_FIXED_COST` exists because `min_hop_radius` defaults to 0. Without it, N
+- `HOP_FIXED_COST` existed because `min_hop_radius` defaults to 0. Without it, N
   short hops along a straight line cost exactly as much as one long hop, so A* is
   indifferent and tie-breaks on heap order, producing jittery micro-hop chains.
+  **Largely superseded by the energy cost** — the momentum term makes every
+  landing cost `0.5*m*v^2*(1-eta)` regardless of hop length, so more hops is
+  already more expensive. Kept at 0.05 for tie-breaking hygiene; not verified as
+  removable across the deck.
+- `W_ENERGY` (0.84 m/J) is the energy/distance exchange rate in the edge cost.
+  Derived, not tuned: `1 / 1.197` J, so one flat steady-state hop's energy cost
+  equals its distance cost. Raise it to bias toward detouring around obstacles,
+  lower it to bias toward hopping over. **It also governs planning time** — see
+  "The edge cost" above.
 
 Obstacles must be **at least two cells thick** across any arc that should be
 blocked. A one-cell obstacle sampled along its own boundary is averaged 50/50 with

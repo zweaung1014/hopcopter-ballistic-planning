@@ -75,7 +75,7 @@ def _make_planner(m: Map2D5, start, goal, **overrides) -> HoppingAStarPlanner:
         map_env=m, start=start, goal=goal,
         hop_radius=config.HOP_RADIUS, n_angles=config.HOP_N_ANGLES,
         max_jump_height=config.MAX_JUMP_HEIGHT,
-        alpha_uphill=config.ALPHA_UPHILL, alpha_downhill=config.ALPHA_DOWNHILL,
+        w_energy=config.W_ENERGY,
         g=G, V_max=config.V_MAX, mass=MASS, eta=ETA, e_inject_max=E_INJ,
         min_apex=H_MIN, h_initial=config.H_INITIAL, V_g_max=config.V_G_MAX,
         speed_bin=config.SPEED_BIN, mu=config.MU,

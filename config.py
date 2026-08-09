@@ -22,8 +22,6 @@ GOAL_TOLERANCE = 0.1  # meters
 
 # Height-aware planning parameters
 MAX_JUMP_HEIGHT = 0.5  # meters; edges with dz > this are impassable
-ALPHA_UPHILL = 5.0  # cost weight for uphill elevation changes
-ALPHA_DOWNHILL = 0.0  # cost weight for downhill elevation changes (landing)
 
 # Hopping-robot A* parameters
 HOP_RADIUS = 1.0  # meters; the robot hops to points on a circle of this radius
@@ -51,6 +49,35 @@ HOP_FIXED_COST = 0.05  # per-hop constant added to every edge. Without it, N sho
                        # long hop (triangle equality), so A* is indifferent and
                        # tie-breaks on heap order, producing jittery micro-hop
                        # chains. Admissible: it only ever adds cost.
+                       #
+                       # Largely superseded by W_ENERGY below: once landings cost
+                       # energy, micro-hop chains stop being free on their own.
+                       # Kept at 0.05 for tie-breaking hygiene, not load-bearing.
+
+W_ENERGY = 0.84  # m per J; the exchange rate between energy and distance in the
+                 # edge cost. See `HoppingAStarPlanner._edge_cost`:
+                 #
+                 #     cost = xy_dist + W_ENERGY * (e_inject + momentum_lost)
+                 #
+                 # DERIVED, not tuned. Holding speed steady through one hop costs
+                 # `0.5 * ROBOT_MASS * v^2 * (1 - ETA_HOP)`, which at the flat
+                 # steady state (v = 3.158 m/s on 1 m hops) is 1.197 J. Setting
+                 # W_ENERGY = 1 / 1.197 = 0.84 makes that hop's energy cost equal
+                 # its distance cost, so the default means "weigh energy and
+                 # distance exactly as the physics says". Raise it to bias the
+                 # planner toward detouring around obstacles, lower it to bias
+                 # toward hopping over them.
+                 #
+                 # Note the derivation has no hop LENGTH in it — holding speed
+                 # costs the same 1.197 J whether the hop is 0.2 m or 1.0 m. That
+                 # is what makes the energy term penalise hop COUNT without any
+                 # separate per-hop constant, and it is why HOP_FIXED_COST above
+                 # is no longer doing real work.
+                 #
+                 # W_ENERGY is also a RUNTIME dial: `_heuristic` estimates
+                 # distance only, so every Joule it adds is cost the heuristic
+                 # cannot see, and A* loses focus as it rises. Measured on the
+                 # flat map, 0 -> 0.84 took expansions from 186 to ~1800.
 
 # Robot geometry
 # -----------------------------------------------------------------------------
@@ -154,7 +181,7 @@ MIN_APEX_HEIGHT = 0.3  # m; minimum APEX-TO-LANDING drop. Below this the elastic
 INJECT_MAX_HEIGHT = 1.0  # m; the injection budget expressed as a height.
 E_INJECT_MAX = ROBOT_MASS * G_ACCEL * INJECT_MAX_HEIGHT  # 7.848 J per hop
 
-MAX_LANDING_APEX = 2.5  # m; the tallest fall the leg can absorb — sized for
+MAX_LANDING_APEX = 2.0  # m; the tallest fall the leg can absorb — sized for
                         # hopping off a platform, not for ordinary hops.
 V_G_MAX = math.sqrt(2.0 * G_ACCEL * MAX_LANDING_APEX)  # 7.004 m/s
         # THE cap that actually bounds the chain, and the one that gates real

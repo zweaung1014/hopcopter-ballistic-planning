@@ -37,7 +37,15 @@ tracks — sits `LEG_LENGTH` above the contact foot. A hop is accepted only if:
    corridor the body sweeps.
 
 Clearance is a pure feasibility gate — it does not shape cost. Edge cost is
-`xy distance + elevation penalty + HOP_FIXED_COST`.
+`xy distance + W_ENERGY × (injected energy + momentum thrown away) + HOP_FIXED_COST`.
+
+The energy term replaced an elevation penalty, which could not price the case it was
+written for: a hop that arcs *over* an obstacle and lands at the same height has
+`dz = 0` and was charged nothing. Injected energy rises on its own when the clearance
+gate lifts the takeoff angle over terrain, so "hop over vs go around" is decided by
+physics. The momentum term (`max(0, KE_in − KE_out)`) stops the planner chopping paths
+into short hops, which need no thrust at all and would otherwise price as free. See
+`results/energy_based_edge_cost/`.
 
 ## Configuration
 
@@ -55,7 +63,8 @@ Everything tunable lives in `config.py` and is threaded explicitly through const
 | `MIN_CLEARANCE` | 0.15 m | Hard clearance gate |
 | `HOP_RADIUS` | 1.0 m | Ring-sampling radius for candidate landings |
 | `HOP_SCAN_STEP` | 0.1 m | Inward ray-search step; the dominant speed/quality knob |
-| `HOP_FIXED_COST` | 0.05 | Per-hop constant; stops micro-hop chains |
+| `HOP_FIXED_COST` | 0.05 | Per-hop constant; largely superseded by `W_ENERGY` |
+| `W_ENERGY` | 0.84 m/J | Energy/distance exchange rate in the edge cost. Derived, not tuned |
 | `ALPHA_MARGIN_FRAC` | 0.5 | Default takeoff angle within the feasible interval |
 | `OBSTACLE_WALL_EXTRA` | 1.5 m | Height obstacle cells read as during clearance checks |
 

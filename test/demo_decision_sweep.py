@@ -9,10 +9,29 @@ height, so the change in behaviour can only come from the cost model.
     START (0.5, 2.4) → GOAL (4.5, 2.4)
 
 The wall is plain elevation, not an OBSTACLE sentinel, so landing on its crest is
-allowed and costs `alpha_uphill * h` (with `alpha_downhill = 0.0` the descent is
-free).  Going around instead costs extra travel.  The planner crosses while the
-climb is cheaper and detours once it is not — the flip lands between h=1.2 m and
-h=1.4 m with the suite's shared parameters.  Nothing here is tuned per panel.
+allowed.  Crossing costs ENERGY — the clearance gate lifts the takeoff angle, a
+steeper arc needs a faster launch, and the propellers pay for the difference.
+Going around costs extra travel instead.  The planner crosses while the energy is
+cheaper than the detour and detours once it is not; the flip lands between
+h = 0.90 m and h = 1.20 m at the suite's shared parameters.  Nothing here is tuned
+per panel.
+
+What makes this demo worth keeping is that neither side of that comparison is a
+tuned weight.  The edge cost is
+
+    xy_dist + W_ENERGY * (e_inject + momentum thrown away)
+
+and `W_ENERGY` is derived rather than chosen: it is set so one flat steady-state
+hop's energy cost equals its distance cost (see `config.W_ENERGY`).  The flip
+point is therefore a prediction of the robot's physics, not a knob setting.
+
+This replaced an elevation penalty, `alpha_uphill * dz`, under which the flip sat
+between h = 1.20 m and h = 1.40 m.  That penalty could not see this scenario
+properly: a hop that arcs OVER the wall and lands on the flat on the far side has
+`dz = 0` and was charged nothing at all, so only paths that landed on the crest
+were ever priced.  The flip moved down because arcing over is now paid for too —
+and every panel below now crosses by arcing clear rather than by landing on the
+crest, which is the behaviour the old penalty was blind to.
 
 Figures produced
 ----------------
@@ -49,19 +68,35 @@ GOAL  = (4.5, 2.4)
 WALL_XMIN, WALL_XMAX = 2.3, 2.7
 WALL_YMIN, WALL_YMAX = 0.8, 4.2
 
-# Chosen to bracket the flip: three crossings then a detour.
-HEIGHTS = [0.15, 0.80, 1.20, 1.40]
+# Chosen to bracket the flip: three crossings then a detour. Re-picked when the
+# cost model moved from `alpha_uphill * dz` to energy — under the old penalty
+# these were [0.15, 0.80, 1.20, 1.40].
+#
+# Note these are calibrated against `demo_common.HOP_RADIUS` (1.5 m), the deck
+# default `make_planner` uses, NOT `config.HOP_RADIUS` (1.0 m). The flip moves a
+# long way with reach: at 1.0 m it sits between 0.45 and 0.60 m instead, because
+# a shorter run-up buys less height for the same energy.
+HEIGHTS = [0.30, 0.60, 0.90, 1.20]
 
 
 def build_wall(h: float) -> Map2D5:
+    """The ridge, painted in world metres.
+
+    `paint_region` rather than a `world_to_grid` slice with an inclusive `+1`:
+    that form overshoots by up to one cell and silently rescales the physical
+    wall when `CELL_RESOLUTION` changes — which would move the flip point this
+    demo exists to locate.
+    """
     m = Map2D5(
         size_x=config.MAP_SIZE_X,
         size_y=config.MAP_SIZE_Y,
         resolution=config.CELL_RESOLUTION,
     )
-    r0, c0 = m.world_to_grid(WALL_XMIN, WALL_YMIN)
-    r1, c1 = m.world_to_grid(WALL_XMAX, WALL_YMAX)
-    m.grid[r0:r1 + 1, c0:c1 + 1] = h
+    m.paint_region(
+        h,
+        x_min=WALL_XMIN, x_max=WALL_XMAX,
+        y_min=WALL_YMIN, y_max=WALL_YMAX,
+    )
     return m
 
 
@@ -80,24 +115,36 @@ def classify(m: Map2D5, path: list, h: float) -> tuple[str, str]:
     return "OVER", ("lands on the crest" if on_crest else "arcs clear over")
 
 
-def path_cost(planner, m: Map2D5, path: list) -> float:
-    """Sum the planner's own edge costs along `path` (includes every penalty).
+def path_cost(planner, m: Map2D5, path: list) -> dict:
+    """Sum the planner's own edge costs along `path`, split into its three terms.
+
+    Returns `{"cost", "dist", "inject", "momentum"}` — the total, and the parts
+    it decomposes into. The split is what makes the figure legible: it shows
+    whether a crossing was paid for with propeller work or with speed.
 
     Chained, not mapped: `_validate_and_cost` needs the speed the robot arrived
     with, and it returns the speed it leaves with. Feeding each hop the
     start-of-chain energy instead would price hops the robot could not fly.
     """
-    total = 0.0
+    out = {"cost": 0.0, "dist": 0.0, "inject": 0.0, "momentum": 0.0}
     v_g = planner.v_g_initial
     for i in range(len(path) - 1):
         a = m.world_to_grid(*path[i])
         b = m.world_to_grid(*path[i + 1])
         edge = planner._validate_and_cost(a, m.grid[a[0], a[1]], b, v_g)
-        if edge is not None:
-            cost, hop = edge
-            total += cost
-            v_g = hop["v_g"]
-    return total
+        if edge is None:
+            continue
+        cost, hop = edge
+        v_out = planner._speed_bin(hop["v_g"]) * planner.speed_bin
+        out["cost"] += cost
+        out["dist"] += hop["X"]
+        out["inject"] += hop["e_inject"]
+        out["momentum"] += max(
+            0.0,
+            0.5 * planner.mass * (hop["v_g_in"] ** 2 - v_out ** 2),
+        )
+        v_g = hop["v_g"]
+    return out
 
 
 def crossing_hop(path: list) -> int | None:
@@ -130,8 +177,9 @@ def main() -> int:
         diags = diagnose_path(planner, m, path)
         results.append((h, m, planner, path, strat, detail, cost, diags))
         print(f"h={h:.2f}  {strat:<7} ({detail})  "
-              f"{len(path)-1} hops  cost={cost:.2f}  "
-              f"climb penalty={config.ALPHA_UPHILL * h:.2f}")
+              f"{len(path)-1} hops  cost={cost['cost']:.2f}  "
+              f"= {cost['dist']:.2f} m travel + {config.W_ENERGY} × "
+              f"({cost['inject']:.2f} J thrust + {cost['momentum']:.2f} J momentum)")
 
     strategies = [r[4] for r in results]
     if "OVER" not in strategies or "AROUND" not in strategies:
@@ -162,9 +210,15 @@ def main() -> int:
         ax.plot(*GOAL, "r*", markersize=15, zorder=10)
 
         badge = "#00695c" if strat == "OVER" else "#4527a0"
+        # Kept to four short lines rather than one long one: at 4.6 in per
+        # column, a single-line cost breakdown overruns the axes and collides
+        # with its neighbours.
         ax.set_title(
-            f"h = {h:.2f} m\n{strat}  —  {detail}\n"
-            f"cost = {cost:.2f}   (climb penalty α·h = {config.ALPHA_UPHILL * h:.2f})", color=badge, fontweight="bold", wrap=True
+            f"h = {h:.2f} m  —  {strat}\n{detail}\n"
+            f"cost {cost['cost']:.2f} = {cost['dist']:.2f} m travel\n"
+            f"+ {config.W_ENERGY}×({cost['inject']:.2f} J thrust "
+            f"+ {cost['momentum']:.2f} J momentum)",
+            color=badge, fontweight="bold", fontsize=9,
         )
 
         # ---- bottom row: the crossing hop, or why there wasn't one ----
@@ -183,19 +237,24 @@ def main() -> int:
             axb.set_ylim(-0.1, max(HEIGHTS) + 0.5)
             axb.axhline(h, color="#e65100", linewidth=1.4, linestyle="--",
                         zorder=5, label=f"wall top z={h:.2f}")
-            axb.legend(loc="upper right")
+            # `draw_arc_side_view` labels four series with long names; at the
+            # default font the legend is wider than a 4.6 in column and spills
+            # over the panel to its left.
+            axb.legend(loc="upper right", fontsize=6, framealpha=0.9)
             axb.set_xlabel(
                 f"crossing hop {hi}: ({p0[0]:.1f},{p0[1]:.1f}) → "
                 f"({p1[0]:.1f},{p1[1]:.1f})",
             )
         else:
             axb.set_facecolor("#ede7f6")
+            straight = math.hypot(GOAL[0] - START[0], GOAL[1] - START[1])
             axb.text(
                 0.5, 0.5,
-                "No crossing hop\n\nthe planner detoured past\nthe end of the wall\n\n"
-                f"climbing would cost α·h = {config.ALPHA_UPHILL * h:.2f}\n"
-                "on top of the travel distance",
-                ha="center", va="center",
+                "No crossing hop\n\n"
+                "the planner detoured past the wall end\n\n"
+                f"clearing {h:.2f} m needs a steeper takeoff\n"
+                f"than the extra {cost['dist'] - straight:.1f} m of travel costs",
+                ha="center", va="center", fontsize=9,
                 color="#4527a0", transform=axb.transAxes,
             )
             axb.set_xticks([]); axb.set_yticks([])
@@ -207,9 +266,11 @@ def main() -> int:
     fig.suptitle(
         "One planner, one geometry — only the wall height changes\n"
         f"Wall x∈[{WALL_XMIN}, {WALL_XMAX}] m, y∈[{WALL_YMIN}, {WALL_YMAX}] m "
-        "(bypassable at both ends) · plain elevation, so the crest is landable", wrap=True
+        "(bypassable at both ends) · plain elevation, so the crest is landable\n"
+        f"cost = travel + {config.W_ENERGY} m/J × (thrust + momentum thrown away)"
+        " — no tuned height weight", wrap=True,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.tight_layout(rect=(0, 0, 1, 0.88))  # 3-line suptitle + 4-line subtitles
     save(fig, out_path("decision_sweep.png"))
     plt.close(fig)
 
