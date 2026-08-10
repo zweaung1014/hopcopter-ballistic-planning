@@ -33,10 +33,9 @@ time (self-check group 4 asserts them there, and downgrades to informational
 prints on any other map, where the expected answer is not hand-derivable):
 
 1. **The hop split is 1.00 / 0.90 / 0.60 m, not 1.0 / 1.0 / 0.5.** Edge cost is
-   XY distance + `hop_fixed_cost`, and the total XY distance is 2.5 m for *any*
+   XY distance, and the total XY distance is 2.5 m for *any*
    3-hop split — so every equal-count split ties exactly and A* tie-breaks on
-   heap order. `HOP_FIXED_COST` separates hop COUNTS, never splits of the same
-   count.
+   heap order.
 
 2. **Only the energy floor (E1) ever binds here.** Injection is 0.00 J on all
    three hops and the drops (0.92 / 0.64 / 0.45 m) stay clear of `min_apex`

@@ -74,7 +74,7 @@ def make_planner(m: Map2D5, **overrides) -> HoppingAStarPlanner:
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
-        hop_fixed_cost=config.HOP_FIXED_COST, hop_scan_step=config.HOP_SCAN_STEP,
+        hop_scan_step=config.HOP_SCAN_STEP,
     )
     kwargs.update(overrides)
     return HoppingAStarPlanner(**kwargs)
@@ -116,8 +116,8 @@ def case_speed_maintained() -> None:
     expect = hop["X"] + config.W_ENERGY * hop["e_inject"]
     check(
         "cost reduces to xy_dist + w*e_inject when speed holds",
-        abs((cost - p.hop_fixed_cost) - expect) < 1e-9,
-        f"{cost - p.hop_fixed_cost:.4f} vs {expect:.4f}",
+        abs(cost - expect) < 1e-9,
+        f"{cost:.4f} vs {expect:.4f}",
     )
 
 

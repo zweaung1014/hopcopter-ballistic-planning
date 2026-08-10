@@ -11,7 +11,7 @@ cost = xy_dist + W_ENERGY * (e_inject + max(0, KE_in - KE_out))
 one hop costs `0.5 * m * v^2 * (1 - eta)` = 1.197 J at the flat steady state, so
 `1 / 1.197` makes that hop's energy cost equal its distance cost.
 
-`ALPHA_UPHILL` and `ALPHA_DOWNHILL` are deleted. `HOP_FIXED_COST` stays at 0.05.
+`ALPHA_UPHILL` and `ALPHA_DOWNHILL` are deleted.
 
 ## Why the old penalty could not work
 
@@ -174,7 +174,7 @@ what B spent without being billed is the entire point.
   at 2.56 m/s. It did not save energy; it spent 2.35 J of momentum off the books.
 - **`low_wall`** — C is cheapest overall (4.85 J vs 5.56 and 7.13) *and* arrives
   fastest (2.92 m/s). Note A's trailing `0.1` m hop: with nothing but distance in
-  the cost, `HOP_FIXED_COST = 0.05` is not enough to suppress a micro-hop stub.
+  the cost, the momentum term is absent and micro-hop stubs are not penalised.
 - **`bypass`** — the models split on routing, not just hop pattern. A and B cross a
   0.70 m wall; C walks 1.44 m further around the end and spends **6.06 J against
   B's 11.27 J**. In the ledger this is one 5–7 J spike (A, B) versus six ordinary
@@ -223,10 +223,6 @@ rather than wasting it, but the momentum term charges for it anyway — about
 0.60 J on top of 3.72 J of real injection for a 0.4 m step, ~15%. Conservative,
 not wrong.
 
-**`HOP_FIXED_COST` is probably now dead weight** and was left at 0.05 rather than
-removed. The micro-hop chains it was invented to prevent stop being free once
-landings cost energy. Not yet verified across the deck.
-
 ## Rejected alternatives
 
 Recorded so they are not re-litigated:
@@ -240,7 +236,5 @@ Recorded so they are not re-litigated:
 - **Stance dissipation instead of injection.** Makes climbing *cheaper* than flat
   ground (1.02 J vs 1.20 J for a 0.4 m climb) because climbing lands slower.
 - **Uncapped potential shaping.** Negative edge costs; see the test above.
-- **A larger `hop_fixed_cost` as the counterweight.** Needs ~1.0 to work, and is
-  fitted per scenario.
 - **A separate per-hop energy constant.** Tested at 0.2 J: changed neither the
   path nor the expansion count once the momentum term was present.

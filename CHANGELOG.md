@@ -74,8 +74,7 @@ cost = xy_dist + W_ENERGY · (e_inject + max(0, KE_in − KE_out))
 
 **Removed:** `ALPHA_UPHILL`, `ALPHA_DOWNHILL`, and the `alpha_uphill` / `alpha_downhill`
 constructor arguments. `astar_planner.py` (the retained 8-connected reference planner) keeps
-its own copies and is untouched. `HOP_FIXED_COST` stays at 0.05 but is likely now dead
-weight — the micro-hop chains it prevented stop being free once landings cost energy.
+its own copies and is untouched.
 
 **Cost: planning is 4–6× slower** (`flat` 9.3 → 44.6 s, `low_wall` 6.6 → 40.1 s; expansions
 ~3.5–4.5×). Structural rather than a bug: `_heuristic` estimates distance only, so the whole
@@ -94,8 +93,8 @@ injection — `[1.20, 2.86, 0.03, 1.20]` — a refund only a path sum can credit
 apex (charges for height the robot got free, counts only the vertical share); stance
 dissipation instead of injection (makes climbing *cheaper* than flat, 1.02 J vs 1.20 J);
 uncapped potential shaping `e_inject + KE_in − KE_out` (reaches −1.36 J on a 0.4 m drop, and
-negative edges break A*); a larger `hop_fixed_cost` (needs ~1.0, fitted per scenario); a
-separate per-hop energy constant (tested at 0.2 J — changed neither path nor expansion count).
+negative edges break A*);
+a separate per-hop energy constant (tested at 0.2 J — changed neither path nor expansion count).
 
 - **New:** `test/test_edge_cost_energy.py`, 11 assertions, mostly regressions against the
   above.
@@ -529,20 +528,14 @@ density. Clearance became a hard feasibility gate rather than a cost penalty.
   limit, `alpha_for_clearance()` takes the max-margin midpoint when it already
   clears, gives up only if `alpha_max` cannot, and otherwise bisects for the
   shallowest angle that does. Typical hops cost one clearance evaluation.
-- **`min_hop_radius` default 0** (was `hop_radius / 2`), with two changes that
-  make it affordable and well-behaved:
-  - `HOP_FIXED_COST = 0.05` per hop. Without it, N short hops along a straight
-    line cost *exactly* as much as one long hop, leaving A* indifferent and
-    tie-breaking on heap order — the observed result was paths containing runs
-    of consecutive 0.1 m micro-hops. The old radius floor existed to prevent
-    exactly this; a fixed cost does it without imposing a floor.
-  - `HOP_SCAN_STEP` makes the inward ray-search step an explicit parameter
-    rather than reading `map.resolution`. It is the dominant cost knob — the
-    branching factor is proportional to `1/step` — but coarsening it also
-    quantizes how far a hop can travel, which shows up as lateral doglegs where
-    the straight-ahead ladder cannot reach a wanted x. Shipped at 0.1 m
-    (= `CELL_RESOLUTION`), i.e. the pre-change behaviour, after 0.3 m was found
-    to put a visible 0.30 m y-detour into the `slope_crest` path.
+- **`min_hop_radius` default 0** (was `hop_radius / 2`). `HOP_SCAN_STEP` makes
+  the inward ray-search step an explicit parameter rather than reading
+  `map.resolution`. It is the dominant cost knob — the branching factor is
+  proportional to `1/step` — but coarsening it also quantizes how far a hop can
+  travel, which shows up as lateral doglegs where the straight-ahead ladder cannot
+  reach a wanted x. Shipped at 0.1 m (= `CELL_RESOLUTION`), i.e. the pre-change
+  behaviour, after 0.3 m was found to put a visible 0.30 m y-detour into the
+  `slope_crest` path.
 - **Performance**: a naive implementation of the above measured 13.7 s per
   `plan()` (vs 284 ms before). Two-phase evaluation now separates the
   alpha-independent terrain sampling (`terrain_profile`) from the cheap

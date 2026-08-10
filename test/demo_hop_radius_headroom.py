@@ -224,11 +224,10 @@ def sweep_hop_radius(map_builder, start, goal, label: str) -> list[dict]:
 # Test 3 -- why ~2 m: split-cost decomposition
 # --------------------------------------------------------------------------- #
 #
-# `_edge_cost` = xy_dist + w_energy*(e_inject + momentum_lost) + hop_fixed_cost.
+# `_edge_cost` = xy_dist + w_energy*(e_inject + momentum_lost).
 # Hold the hop COUNT fixed at 2 (what A* already found optimal at
 # HOP_RADIUS=4.0) and sweep only the intermediate landing point of a
-# start -> mid -> goal path. `xy_dist` sums to the same total for every split
-# and `hop_fixed_cost` sums to the same 2 * HOP_FIXED_COST for every split --
+# start -> mid -> goal path. `xy_dist` sums to the same total for every split --
 # both TIE identically across the whole sweep. So whichever split minimises
 # TOTAL cost is, by construction, whichever split minimises TOTAL ENERGY
 # (e_inject + momentum_lost) -- and that number comes directly out of
@@ -364,7 +363,7 @@ def print_split_cost_report(
     print(f"\n--- Test 3: split-cost decomposition -- {label} ---")
     ok = [r for r in rows if r["feasible"]]
     best = min(ok, key=lambda r: r["total_cost"])
-    print(f"xy_dist and hop_fixed_cost tie across every split here (fixed "
+    print(f"xy_dist ties across every split here (fixed "
           f"2-hop count, fixed total distance) -- so this minimum IS the "
           f"minimum of e_inject + momentum_lost alone.")
     print(f"Sweep minimum:  X1={best['X1']:.2f} m  (X2={best['X2']:.2f} m)  "
@@ -517,7 +516,7 @@ def plot_split_cost(
         ax.legend(fontsize=ANNOT_FS - 1)
     fig.suptitle(
         "Test 3: total cost vs. where the split lands\n"
-        "xy_dist and hop_fixed_cost tie here, so this curve IS the energy cost",
+        "xy_dist ties here, so this curve IS the energy cost",
         fontsize=LABEL_FS - 1,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.84))

@@ -180,8 +180,7 @@ generation and edge validation are non-trivial:
      clears and reports the resulting clearance; reject if it is below
      `min_clearance_gate`. This step also decides the flown angle, hence the
      successor's energy, so it is not skippable;
-  5. cost = XY distance + `w_energy * (e_inject + max(0, KE_in - KE_out))` +
-     `hop_fixed_cost`. Clearance still does **not** enter the cost (it is purely a
+  5. cost = XY distance + `w_energy * (e_inject + max(0, KE_in - KE_out))`. Clearance still does **not** enter the cost (it is purely a
      feasibility test), but injected energy now does — see "The edge cost" below.
      Note injection plays two distinct roles: step 4 minimises it *within* an edge
      (which angle to fly), step 5 prices it *across* edges (which hop to take).
@@ -233,8 +232,7 @@ terms are `>= 0` by construction, so the Euclidean-XY heuristic stays admissible
 - **It is also what regulates hop count**, which is why there is no per-hop
   energy constant. Holding speed steady costs `0.5*m*v^2*(1-eta)` = 1.197 J per
   hop — an expression with **no hop length in it** — so N hops over the same
-  ground cost N times as much. `HOP_FIXED_COST` survives at 0.05 but is probably
-  now dead weight.
+  ground cost N times as much.
 - **`KE_out` uses the BINNED landing speed**, matching `KE_in` and the speed the
   successor state stores. Mixing binned-in with exact-out leaves ~0.32 J of
   quantisation noise per hop against a ~1.2 J signal.
@@ -398,13 +396,6 @@ Notable non-obvious parameters:
   land on x-values the straight ladder skips. It ships equal to `CELL_RESOLUTION`
   for that reason. If you coarsen it for speed, check the paths for zig-zags
   before trusting the figures.
-- `HOP_FIXED_COST` existed because `min_hop_radius` defaults to 0. Without it, N
-  short hops along a straight line cost exactly as much as one long hop, so A* is
-  indifferent and tie-breaks on heap order, producing jittery micro-hop chains.
-  **Largely superseded by the energy cost** — the momentum term makes every
-  landing cost `0.5*m*v^2*(1-eta)` regardless of hop length, so more hops is
-  already more expensive. Kept at 0.05 for tie-breaking hygiene; not verified as
-  removable across the deck.
 - `W_ENERGY` (0.84 m/J) is the energy/distance exchange rate in the edge cost.
   Derived, not tuned: `1 / 1.197` J, so one flat steady-state hop's energy cost
   equals its distance cost. Raise it to bias toward detouring around obstacles,

@@ -1100,16 +1100,12 @@ class HoppingAStarPlanner:
         # inside `leg_radius + min_clearance_gate`). See
         # `Map2D5.standable_mask` for the max-grade derivation.
         leg_clearance_start_frac: float = 1.0 / 3.0,
-        # Per-hop constant. Without it, N short hops along a straight line cost
-        # exactly as much as one long hop, leaving A* indifferent between them
-        # and tie-breaking on heap order.
-        hop_fixed_cost: float = 0.05,
         # Inward ray-search step, in world metres. Deliberately independent of
         # `map_env.resolution`: tying it to the grid means refining the map also
         # multiplies the branching factor, which dominates the cost of planning.
         hop_scan_step: float = 0.3,
         # Floor on the inward ray-search. 0 lets the planner consider arbitrarily
-        # short hops; `hop_fixed_cost` is what keeps it from abusing them.
+        # short hops; the energy cost makes more hops more expensive.
         min_hop_radius: float = 0.0,
         # Demo/analysis flag: when True, skip the clearance gate entirely. The
         # BEAM feasibility gate and the standability check still run (they guard
@@ -1154,7 +1150,6 @@ class HoppingAStarPlanner:
         self.arc_max_step = arc_max_step
         self.n_lateral = n_lateral
         self.leg_clearance_start_frac = leg_clearance_start_frac
-        self.hop_fixed_cost = hop_fixed_cost
         self.hop_scan_step = hop_scan_step
         self.disable_clearance = disable_clearance
 
@@ -1523,10 +1518,8 @@ class HoppingAStarPlanner:
             "Z": Z,
         }
 
-        # (e) Edge cost. `hop_fixed_cost` breaks the tie that would otherwise
-        # make N micro-hops exactly as cheap as one long hop.
         self.n_edges_accepted += 1
-        return self._edge_cost(current, neighbor, hop) + self.hop_fixed_cost, hop
+        return self._edge_cost(current, neighbor, hop), hop
 
     def _edge_cost(
         self,
@@ -1597,6 +1590,7 @@ class HoppingAStarPlanner:
             ke_in = 0.5 * self.mass * hop["v_g_in"] ** 2
             ke_out = 0.5 * self.mass * v_g_out ** 2
             e_momentum = max(0.0, ke_in - ke_out)
+            # e_momentum = ke_in * 0.3 # just trying a new way of keeping track
 
         return xy_dist + self.w_energy * (hop["e_inject"] + e_momentum)
 
@@ -1605,8 +1599,8 @@ class HoppingAStarPlanner:
 
         Admissible because sum of hop xy-distances >= straight-line distance
         (triangle inequality), and every other term in `_edge_cost` — the
-        injected energy, the momentum charge, and `hop_fixed_cost` — is
-        non-negative, so it can only add to the actual g-cost.
+        injected energy and the momentum charge — is non-negative, so it can
+        only add to the actual g-cost.
 
         Admissible is not the same as INFORMED, and the gap matters here. This
         estimates distance only, so the whole energy term is cost the heuristic

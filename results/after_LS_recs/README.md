@@ -12,7 +12,7 @@ Same 21 figures, same scenarios, same start/goal pairs.
 | Robot | point mass, radius subtracted vertically | **sphere, `r = 0.2 m`, checked laterally too** |
 | Leg | none — arcs started on the ground | **`LEG_LENGTH = 0.4 m`; arcs track the CoM** |
 | Clearance | soft penalty below 0.15 m | **hard reject below `MIN_CLEARANCE = 0.15 m`** |
-| Min hop radius | `hop_radius / 2` | **0**, with `HOP_FIXED_COST = 0.05` to break cost ties |
+| Min hop radius | `hop_radius / 2` | **0** |
 
 ## Read this before comparing the figures
 
