@@ -24,7 +24,18 @@ GOAL_TOLERANCE = 0.1  # meters
 MAX_JUMP_HEIGHT = 0.5  # meters; edges with dz > this are impassable
 
 # Hopping-robot A* parameters
-HOP_RADIUS = 1.0  # meters; the robot hops to points on a circle of this radius
+HOP_RADIUS = 4.0  # meters; the robot hops to points on a circle of this radius.
+                  # Was 1.0. `test/demo_hop_radius_headroom.py` showed that at
+                  # 1.0 essentially every hop saturated the ring (X_taken ==
+                  # hop_radius) while the physics gates (feasibility + energy
+                  # chain + clearance) tolerated 2-4x more -- the ring, not the
+                  # robot's physics, was choosing hop length. 4.0 is the safe
+                  # ceiling: the asserts below pass at 4.0 (first-hop floor
+                  # 39.81 deg vs ceiling 45.00 deg) and fail at 4.2 (the
+                  # first-hop energy floor, seeded by H_INITIAL, can no longer
+                  # reach that far at any angle) -- well short of the naive
+                  # flat-hop reach V_MAX^2/g = 5.50 m, which assumes a hop
+                  # already at full injection, never true for the first hop.
 HOP_N_ANGLES = 16  # number of evenly spaced candidate hop directions per expansion
 HOP_SCAN_STEP = 0.1  # m; spacing of the radius ladder the inward ray-search walks
                      # when generating candidate landing cells. Along any one

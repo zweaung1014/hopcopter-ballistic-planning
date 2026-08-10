@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — `HOP_RADIUS` raised 1.0 m -> 4.0 m (the ring, not the physics, was limiting hop length)
+
+`test/demo_hop_radius_headroom.py` (new) tests, per hop, whether a landing
+farther than `HOP_RADIUS` along the same heading would still pass
+`_validate_and_cost` unmodified, and separately replans the same start/goal
+across a radius sweep. At `HOP_RADIUS = 1.0`, every hop on `flat` and most on
+`stairs` saturated the ring exactly (`X_taken == hop_radius`) while the
+physics gates tolerated 2-4x more — confirmed by hand against
+`feasible_alpha_interval` for the first hop (feasible out to ~3.8-4.0 m,
+against a 1.0 m ring). The ring, not the robot's energy/friction/clearance
+limits, was choosing hop length.
+
+- Raised to 4.0 m, the safe ceiling under `config.py`'s own asserts (4.0
+  passes, 4.2 fails on the first-hop energy floor — see the assert block
+  below `V_MAX`). Re-running the same diagnostic at 4.0 m flips the verdict
+  to physics-bound: per-hop headroom past the ring goes to ~0 (stopped by an
+  actual physics/clearance/map-edge gate, not the ring), and the radius sweep
+  plateaus — 2.0 m, 3.0 m and 4.0 m all produce the identical path on both
+  scenarios tested (`flat`: 2 hops @ 2.0 m; `stairs`: 2 hops @ 2.0 m), where
+  1.0 m gave 4-5 short hops.
+- **Cost**: `_generate_hop_neighbors`'s ray-search scans `hop_radius /
+  hop_scan_step` radii per direction, so this ~4x's the candidates per
+  expansion (10 -> 40 radii at `HOP_SCAN_STEP = 0.1`) on top of the existing
+  energy-axis multiplier. Not re-tuned here; if planning time on larger maps
+  becomes a problem, `min_hop_radius` (skip the inner rungs of the ladder) or
+  `hop_scan_step` are the levers, not reverting `HOP_RADIUS`.
+
 ### Changed — edge cost is energy, not elevation
 
 `_edge_cost` priced a hop as `xy_dist + alpha_uphill·dz`. It was added to make the planner
