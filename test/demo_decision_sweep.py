@@ -52,7 +52,7 @@ import matplotlib.patches as mpatches
 
 import config
 from demo_common import (
-    HOP_RADIUS, TITLE_FS, LABEL_FS, ANNOT_FS,
+    TITLE_FS, LABEL_FS, ANNOT_FS,
     C_BALL, C_COLLIDE, C_ANNOT,
     make_planner, diagnose_path,
     draw_topdown_compact, segment_crosses_region,

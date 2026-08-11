@@ -31,7 +31,7 @@ import numpy as np
 
 import config
 from demo_common import (
-    HOP_RADIUS, N_ANGLES, V_MAX,
+    N_ANGLES, V_MAX,
     PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
     make_planner, diagnose_edge, n_bad_hops, param_caption, save, out_path
 )

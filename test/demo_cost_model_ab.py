@@ -70,11 +70,6 @@ MODELS = [
      dict(w_energy=config.W_ENERGY)),
 ]
 
-#: Every scenario runs at config.HOP_RADIUS (1.0 m), not demo_common's deck
-#: default of 1.5 m. Nine planning runs is enough work already, and the 1.5 m
-#: reach roughly doubles each one.
-HOP_RADIUS = config.HOP_RADIUS
-
 #: `h_initial` that seeds the chain at the flat steady state (3.158 m/s), by
 #: inverting `v_g_initial = sqrt(2 g h / eta)`. Applied to EVERY scenario.
 #
@@ -167,8 +162,7 @@ def run(scenario, model) -> dict:
     _, _, _, kw = model
 
     m = build()
-    p = make_planner(m, False, start, goal, hop_radius=HOP_RADIUS,
-                     h_initial=H_STEADY, **kw)
+    p = make_planner(m, False, start, goal, h_initial=H_STEADY, **kw)
     t0 = time.time()
     path = p.plan()
     dt = time.time() - t0
@@ -311,7 +305,7 @@ def figure_ledger(results) -> None:
 
 def main() -> int:
     print(param_caption())
-    print(f"hop_radius={HOP_RADIUS} m · every scenario seeded at "
+    print(f"hop_radius=dynamic (per-state) · every scenario seeded at "
           f"h_initial={H_STEADY:.3f} m (the flat steady state, 3.158 m/s)\n")
 
     results = {}

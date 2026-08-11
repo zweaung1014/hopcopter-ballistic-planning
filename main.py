@@ -5,7 +5,7 @@ import math
 import sys
 
 import config
-from hopping_astar_planner import HoppingAStarPlanner
+from hopping_astar_planner import HoppingAStarPlanner, max_hop_radius
 from visualizer import Visualizer
 
 DEFAULT_MAP = "stairs"
@@ -34,7 +34,6 @@ def main():
         map_env=env_map,
         start=config.START,
         goal=config.GOAL,
-        hop_radius=config.HOP_RADIUS,
         n_angles=config.HOP_N_ANGLES,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
@@ -80,7 +79,15 @@ def main():
     vis = Visualizer(env_map)
     vis.draw_map()
     if path:
-        vis.draw_hop_circles(path, config.HOP_RADIUS)
+        # hop_radii[i] is the ring available when departing waypoint i: the
+        # first hop's radius comes from the seeded start speed, every later
+        # one from the previous hop's recorded radius (path has one more
+        # point than path_hops).
+        hop_radii = [max_hop_radius(
+            planner.v_g_initial, config.ETA_HOP, config.E_INJECT_MAX,
+            config.ROBOT_MASS, config.G_ACCEL, config.V_MAX,
+        )] + [h["hop_radius"] for h in planner.path_hops]
+        vis.draw_hop_circles(path, hop_radii)
         vis.draw_path(path)
     vis.draw_start_goal(config.START, config.GOAL)
     vis.draw_robot_pose(config.START, config.ROBOT_RADIUS, config.MIN_CLEARANCE)

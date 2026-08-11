@@ -53,7 +53,7 @@ import matplotlib.patches as mpatches
 
 import config
 from demo_common import (
-    HOP_RADIUS, N_ANGLES, V_MAX,
+    N_ANGLES, V_MAX,
     PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
     make_planner, diagnose_edge, n_bad_hops,
     enumerate_ring_candidates, find_interesting_cells, gate_counts,
@@ -192,9 +192,11 @@ def draw_topdown(
         )
         px, py = m.grid_to_world(*chosen_cell)
 
-        # hop circle
+        # hop circle -- all candidates share the radius they were generated
+        # with (`enumerate_ring_candidates` computes it once per call, from
+        # this state's v_g_in)
         ax.add_patch(mpatches.Circle(
-            (px, py), radius=HOP_RADIUS, fill=False,
+            (px, py), radius=cands[0]["r"], fill=False,
             edgecolor="deepskyblue", linewidth=1.3, linestyle="--",
             alpha=0.9, zorder=5,
         ))

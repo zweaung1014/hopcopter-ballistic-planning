@@ -63,7 +63,7 @@ def make_planner(m: Map2D5, **overrides) -> HoppingAStarPlanner:
     """
     kwargs = dict(
         map_env=m, start=(0.5, 2.5), goal=(4.5, 2.5),
-        hop_radius=config.HOP_RADIUS, n_angles=config.HOP_N_ANGLES,
+        n_angles=config.HOP_N_ANGLES,
         w_energy=config.W_ENERGY, g=G, V_max=config.V_MAX, mass=MASS, eta=ETA,
         e_inject_max=config.E_INJECT_MAX, min_apex=config.MIN_APEX_HEIGHT,
         h_initial=H_STEADY, V_g_max=config.V_G_MAX, speed_bin=config.SPEED_BIN,
@@ -260,9 +260,16 @@ def case_plan_keeps_long_hops() -> None:
     path = p.plan()
     assert path is not None, "flat 3 m plan should succeed"
     lengths = [h["X"] for h in p.path_hops]
+    # `hop_radius` is now the max radius available to THAT hop (dynamic, not a
+    # single global constant) -- comparing each hop's span against its own
+    # radius is the correct per-hop analogue of the old "not a chopped chain"
+    # check. NOTE: the `len(lengths) == 3` expectation predates this change and
+    # may itself be stale now that hop reach varies with speed; see
+    # CLAUDE.md-adjacent plan notes on dynamic hop_radius for re-validation.
     check(
-        "flat 3 m plan uses 3 full-radius hops, not a chopped chain",
-        len(lengths) == 3 and all(x > 0.9 * config.HOP_RADIUS for x in lengths),
+        "flat 3 m plan uses full-radius hops, not a chopped chain",
+        len(lengths) == 3
+        and all(h["X"] > 0.9 * h["hop_radius"] for h in p.path_hops),
         f"{len(lengths)} hops: {[round(x, 2) for x in lengths]}",
     )
     check(

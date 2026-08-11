@@ -24,23 +24,23 @@ GOAL_TOLERANCE = 0.1  # meters
 MAX_JUMP_HEIGHT = 0.5  # meters; edges with dz > this are impassable
 
 # Hopping-robot A* parameters
-HOP_RADIUS = 4.0  # meters; the robot hops to points on a circle of this radius.
-                  # Was 1.0. `test/demo_hop_radius_headroom.py` showed that at
-                  # 1.0 essentially every hop saturated the ring (X_taken ==
-                  # hop_radius) while the physics gates (feasibility + energy
-                  # chain + clearance) tolerated 2-4x more -- the ring, not the
-                  # robot's physics, was choosing hop length. 4.0 is the safe
-                  # ceiling: the asserts below pass at 4.0 (first-hop floor
-                  # 39.81 deg vs ceiling 45.00 deg) and fail at 4.2 (the
-                  # first-hop energy floor, seeded by H_INITIAL, can no longer
-                  # reach that far at any angle) -- well short of the naive
-                  # flat-hop reach V_MAX^2/g = 5.50 m, which assumes a hop
-                  # already at full injection, never true for the first hop.
+# HOP_RADIUS is not a config constant any more: the robot hops to points on a
+# circle whose radius is derived per-state from the energy it is carrying
+# (the flat-ground 45-degree ballistic range at the current takeoff-speed
+# ceiling — see `hopping_astar_planner.max_hop_radius`), not a single tuned
+# number. `test/demo_hop_radius_headroom.py` is what originally showed a
+# fixed radius was the wrong model: at a fixed 1.0 m, essentially every hop
+# saturated the ring (X_taken == hop_radius) while the physics gates
+# (feasibility + energy chain + clearance) tolerated 2-4x more -- the ring,
+# not the robot's physics, was choosing hop length. Sizing it from the actual
+# energy state fixes that at the source instead of hand-picking a bigger
+# constant.
 HOP_N_ANGLES = 16  # number of evenly spaced candidate hop directions per expansion
 HOP_SCAN_STEP = 0.1  # m; spacing of the radius ladder the inward ray-search walks
                      # when generating candidate landing cells. Along any one
-                     # direction, candidates sit at HOP_RADIUS, HOP_RADIUS - step,
-                     # ... so this is what quantizes how far a hop can go.
+                     # direction, candidates sit at the state's max radius, that
+                     # radius minus step, ... so this is what quantizes how far a
+                     # hop can go.
                      #
                      # It is a separate parameter from CELL_RESOLUTION (rather than
                      # just reading the grid) so it can be tuned for speed: the
@@ -55,15 +55,6 @@ HOP_SCAN_STEP = 0.1  # m; spacing of the radius ladder the inward ray-search wal
                      # the map itself. Measured on slope_crest: 0.3 -> a 5-hop path
                      # with a 0.3 m y-detour in 2.6 s; 0.1 -> a straight 4-hop path
                      # in 7.2 s.
-HOP_FIXED_COST = 0.05  # per-hop constant added to every edge. Without it, N short
-                       # hops along a straight line cost exactly the same as one
-                       # long hop (triangle equality), so A* is indifferent and
-                       # tie-breaks on heap order, producing jittery micro-hop
-                       # chains. Admissible: it only ever adds cost.
-                       #
-                       # Largely superseded by W_ENERGY below: once landings cost
-                       # energy, micro-hop chains stop being free on their own.
-                       # Kept at 0.05 for tie-breaking hygiene, not load-bearing.
 
 W_ENERGY = 0.84  # m per J; the exchange rate between energy and distance in the
                  # edge cost. See `HoppingAStarPlanner._edge_cost`:
@@ -82,8 +73,7 @@ W_ENERGY = 0.84  # m per J; the exchange rate between energy and distance in the
                  # Note the derivation has no hop LENGTH in it — holding speed
                  # costs the same 1.197 J whether the hop is 0.2 m or 1.0 m. That
                  # is what makes the energy term penalise hop COUNT without any
-                 # separate per-hop constant, and it is why HOP_FIXED_COST above
-                 # is no longer doing real work.
+                 # separate per-hop constant.
                  #
                  # W_ENERGY is also a RUNTIME dial: `_heuristic` estimates
                  # distance only, so every Joule it adds is cost the heuristic
@@ -211,8 +201,10 @@ V_MAX = math.sqrt(ETA_HOP * V_G_MAX**2 + 2.0 * E_INJECT_MAX / ROBOT_MASS)
         # never-binding backstop on Campana's takeoff-speed constraint.
         #
         # The longest flat hop it affords is V_MAX^2 / g = 5.50 m, and a flat hop
-        # of distance X needs v_s >= sqrt(g*X), so HOP_RADIUS must stay under
-        # that. (It was 2.40 m when V_MAX was a tuned 4.852 m/s.)
+        # of distance X needs v_s >= sqrt(g*X) -- this is what caps
+        # `hopping_astar_planner.max_hop_radius`'s per-state ring radius, since
+        # its v_s_max is itself capped at V_MAX. (It was 2.40 m when V_MAX was
+        # a tuned 4.852 m/s.)
 
 MAX_APEX_HEIGHT = V_MAX**2 / (2.0 * G_ACCEL)  # 2.750 m
         # Derived, not tuned: the CoM rise above the takeoff CoM on a vertical
@@ -260,7 +252,7 @@ MU = 1.2  # Coulomb friction coefficient, uniform over the environment (as in
           # just below `standable_mask`'s geometric ceiling (~1.21), so friction
           # is now the binding standability limit — by a hair.
 
-MIN_CLEARANCE = 0.10  # m; HARD gate — an arc whose body-to-terrain clearance ever
+MIN_CLEARANCE = 0.15  # m; HARD gate — an arc whose body-to-terrain clearance ever
                       # drops below this is rejected outright. Clearance does NOT
                       # enter the edge cost; it is purely a feasibility test.
 ARC_SAMPLE_MAX_STEP = 0.05  # m; upper bound on sampling step along the arc's XY line
@@ -314,65 +306,83 @@ assert ROBOT_RADIUS >= LEG_CYLINDER_RADIUS and ROBOT_RADIUS >= FOOT_TIP_RADIUS, 
     "ROBOT_RADIUS (CoM sphere) must be the largest of the three capsule radii."
 )
 
+# Reference "first hop" ballistic reach, used only to sanity-check that the
+# shipped ENERGY/FRICTION/APEX parameters leave a non-empty takeoff-angle
+# interval at start-up. Hop radius itself is no longer a free config
+# parameter: the planner derives it per-state from the incoming speed, as the
+# flat-ground 45-degree range `v_s_max^2 / g` (see
+# `hopping_astar_planner.max_hop_radius`). This mirrors that formula (inlined
+# rather than imported -- config must not import the planner) evaluated at
+# the seeded first-hop speed, which is deterministic and known here.
+_V_S_MIN_FIRST_HOP = math.sqrt(2.0 * G_ACCEL * H_INITIAL)  # = sqrt(ETA_HOP) * v_g_initial
+_V_S_MAX_FIRST_HOP = math.sqrt(min(
+    _V_S_MIN_FIRST_HOP**2 + 2.0 * E_INJECT_MAX / ROBOT_MASS, V_MAX**2,
+))
+_HOP_RADIUS_FIRST_HOP = _V_S_MAX_FIRST_HOP**2 / G_ACCEL
+
 # Same silent-failure hazard as the MIN_CLEARANCE assert above, one gate later.
 # The friction cone raises the takeoff-angle floor to `pi/2 - atan(MU)` on flat
-# ground; if that ever rises above the leg-energy ceiling at HOP_RADIUS, the
-# feasible interval is empty for *every* flat hop and plan() returns None
-# everywhere with no obvious symptom. At shipped values the floor is 39.79 deg
-# against a ceiling of 77.66 deg.
+# ground; if that ever rises above the leg-energy ceiling at the first hop's
+# own radius, the feasible interval is empty for *every* flat hop and plan()
+# returns None everywhere with no obvious symptom. At shipped values the
+# floor is 39.79 deg against a ceiling of exactly 45.00 deg -- the ceiling is
+# ALWAYS exactly 45 deg now, by construction: _HOP_RADIUS_FIRST_HOP is defined
+# as exactly the distance that needs the full injection budget at 45 deg, so
+# every hop's own ring edge sits at this same tight margin.
 assert MU > 0.0, "MU must be positive."
-_FLAT_DISC = V_MAX**4 - G_ACCEL**2 * HOP_RADIUS**2
-assert _FLAT_DISC >= 0.0, (
-    f"HOP_RADIUS = {HOP_RADIUS} m exceeds the flat-hop reach of V_MAX "
-    f"({V_MAX**2 / G_ACCEL:.2f} m) — no flat hop is feasible at any angle."
-)
+_FLAT_DISC = V_MAX**4 - G_ACCEL**2 * _HOP_RADIUS_FIRST_HOP**2
+# Structurally >= 0 now (no assert needed): _HOP_RADIUS_FIRST_HOP is capped so
+# V_MAX can always reach it (the `min(..., V_MAX**2)` above), so this can no
+# longer go negative. Kept as a value only because the friction-floor check
+# below reuses its square root.
 assert math.pi / 2 - math.atan(MU) < math.atan(
-    (V_MAX**2 + math.sqrt(_FLAT_DISC)) / (G_ACCEL * HOP_RADIUS)
+    (V_MAX**2 + math.sqrt(_FLAT_DISC)) / (G_ACCEL * _HOP_RADIUS_FIRST_HOP)
 ), (
     f"MU = {MU} is too low — the friction cone's flat-ground floor "
     f"({math.degrees(math.pi / 2 - math.atan(MU)):.2f} deg) sits above the "
-    f"leg-energy ceiling at HOP_RADIUS, so no flat hop is feasible."
+    f"leg-energy ceiling at the first hop's radius, so no flat hop is feasible."
 )
 
 # The same silent-failure hazard once more, now for the energy chain — and this
-# is the one most likely to trip, because FOUR parameters have to agree.
-# The very first hop is the tightest in the whole plan: H_INITIAL hands the robot
-# more energy than a HOP_RADIUS hop needs, and it cannot shed any of it, so the
-# energy FLOOR (not the ceiling) is what nearly empties the interval. If it does
-# empty, plan() returns None everywhere with no other symptom.
+# is the one most likely to trip, because several parameters have to agree.
+# The seeded first hop is the one deterministic case checkable at import time
+# (every later hop's own ring edge sits at the same tight margin by
+# construction, but those depend on where the search actually goes).
 #
-# All four lower bounds on tan(alpha), evaluated for a flat HOP_RADIUS hop:
-_W_LO = 2.0 * G_ACCEL * H_INITIAL                     # v_s^2 leaving the start
-_W_HI = min(_W_LO + 2.0 * E_INJECT_MAX / ROBOT_MASS, V_MAX**2)
+# All three lower bounds on tan(alpha), evaluated for a flat first-hop-radius hop:
+_W_LO = _V_S_MIN_FIRST_HOP**2   # v_s^2 leaving the start, no injection
+_W_HI = _V_S_MAX_FIRST_HOP**2
 
 
 def _tan_hi(W: float) -> float | None:
-    """Upper `tan(alpha)` root of `v_s^2 <= W` for a flat HOP_RADIUS hop.
+    """Upper `tan(alpha)` root of `v_s^2 <= W` for a flat first-hop-radius hop.
 
     Mirrors `hopping_astar_planner._speed_tan_interval` at `Z = 0`; inlined
     because `config` must not import the planner.
     """
-    D = W * W - G_ACCEL**2 * HOP_RADIUS**2
+    D = W * W - G_ACCEL**2 * _HOP_RADIUS_FIRST_HOP**2
     if D < 0.0:
         return None
-    return (W + math.sqrt(D)) / (G_ACCEL * HOP_RADIUS)
+    return (W + math.sqrt(D)) / (G_ACCEL * _HOP_RADIUS_FIRST_HOP)
 
 
 _T_CEIL = _tan_hi(_W_HI)
 assert _T_CEIL is not None, (
-    f"the start's full-thrust budget cannot reach HOP_RADIUS = {HOP_RADIUS} m at "
-    f"any angle — raise H_INITIAL or E_INJECT_MAX, or lower HOP_RADIUS."
+    "the start's full-thrust budget cannot reach its own first-hop radius at "
+    "any angle -- this should be structurally impossible; raise H_INITIAL or "
+    "E_INJECT_MAX if it trips."
 )
 _T_FLOOR = max(
-    _tan_hi(_W_LO) or 0.0,                        # energy floor (the binding one)
-    4.0 * MIN_APEX_HEIGHT / HOP_RADIUS,           # min-apex floor, flat-ground form
-    1.0 / MU,                                     # friction cone floor, tan(atan(1/MU))
+    _tan_hi(_W_LO) or 0.0,                          # energy floor (rarely binding at the ring edge)
+    4.0 * MIN_APEX_HEIGHT / _HOP_RADIUS_FIRST_HOP,  # min-apex floor, flat-ground form
+    1.0 / MU,                                       # friction cone floor, tan(atan(1/MU))
 )
 assert _T_FLOOR < _T_CEIL, (
     f"no takeoff angle survives the first hop: floor "
     f"{math.degrees(math.atan(_T_FLOOR)):.2f} deg >= ceiling "
-    f"{math.degrees(math.atan(_T_CEIL)):.2f} deg for a flat HOP_RADIUS hop. The "
-    f"start carries v_s = {math.sqrt(_W_LO):.2f} m/s and cannot shed it."
+    f"{math.degrees(math.atan(_T_CEIL)):.2f} deg for a flat hop at the first "
+    f"hop's own radius. The start carries v_s = {math.sqrt(_W_LO):.2f} m/s and "
+    f"cannot shed it."
 )
 
 # The chain is seeded with a virtual landing speed (see H_INITIAL); it has to be

@@ -73,7 +73,7 @@ def _flat_map(size_x: float = 5.0, size_y: float = 5.0) -> Map2D5:
 def _make_planner(m: Map2D5, start, goal, **overrides) -> HoppingAStarPlanner:
     kwargs = dict(
         map_env=m, start=start, goal=goal,
-        hop_radius=config.HOP_RADIUS, n_angles=config.HOP_N_ANGLES,
+        n_angles=config.HOP_N_ANGLES,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
         g=G, V_max=config.V_MAX, mass=MASS, eta=ETA, e_inject_max=E_INJ,

@@ -29,13 +29,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 import config
-from demo_common import HOP_RADIUS, V_MAX, make_planner, planner_alpha_interval
+from demo_common import V_MAX, make_planner, planner_alpha_interval
 from hopping_astar_planner import (
     alpha_for_clearance,
     feasible_alpha_interval,
+    max_hop_radius,
     terrain_profile,
 )
 from map2d5 import Map2D5
+
+# Reference hop radius for this standalone geometry search. `HOP_RADIUS` is no
+# longer a single global constant (the planner derives it per-state from the
+# incoming speed -- see `hopping_astar_planner.max_hop_radius`); this mirrors
+# `config.py`'s own first-hop reference (seeded start speed, full injection,
+# 45 deg flat range) as a stand-in so the filtering below still runs. NOT
+# re-validated against the dynamic ring -- see the dynamic-hop_radius plan's
+# deferred items for calibrate_geometry.py.
+_V_G_INITIAL_REF = math.sqrt(2.0 * config.G_ACCEL * config.H_INITIAL / config.ETA_HOP)
+HOP_RADIUS = max_hop_radius(
+    _V_G_INITIAL_REF, config.ETA_HOP, config.E_INJECT_MAX, config.ROBOT_MASS,
+    config.G_ACCEL, config.V_MAX,
+)
 
 
 RES = config.CELL_RESOLUTION

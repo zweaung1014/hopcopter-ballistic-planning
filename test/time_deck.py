@@ -105,7 +105,7 @@ def render(rows) -> str:
     hdr = (
         f"# Deck planning times\n\n"
         f"`CELL_RESOLUTION={config.CELL_RESOLUTION}` · "
-        f"`HOP_RADIUS={demo_common.HOP_RADIUS}` · "
+        f"`hop_radius=dynamic (per-state)` · "
         f"`V_MAX={demo_common.V_MAX:.3f}` · "
         f"`ROBOT_RADIUS={config.ROBOT_RADIUS}`\n\n"
         f"`v_s/V_max` is the fraction of the leg's energy budget a hop consumes.\n\n"

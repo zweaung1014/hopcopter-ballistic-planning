@@ -6,13 +6,13 @@ for where they land).  The planner construction, per-edge diagnosis and
 ring-candidate enumeration were previously copy-pasted byte-identically across
 five demos; they live here instead.
 
-The scenario constants below are the *deck-wide* physics parameters.  `HOP_RADIUS`
-deliberately overrides `config.HOP_RADIUS` (1.0) because the deck's scenarios are
-laid out for a 1.5 m hop, and the whole suite must quote one set of numbers or the
-"one planner, many behaviours" story falls apart.  Everything else — crucially
-`V_MAX` — comes from `config.py`, since the robot's capability is now derived
-from `MAX_APEX_HEIGHT` rather than tuned per demo.  `param_caption()` renders
-them for the console.
+The scenario constants below are the *deck-wide* physics parameters. There is
+no deck-wide `HOP_RADIUS` any more: the ring the planner scans is derived
+per-state from the robot's own energy (`hopping_astar_planner.max_hop_radius`),
+not a tuned constant, so `make_planner` no longer takes a `hop_radius`
+argument at all. `V_MAX` still comes from `config.py`, since the robot's
+capability is derived from `MAX_APEX_HEIGHT` rather than tuned per demo.
+`param_caption()` renders the rest for the console.
 
 Text size for every figure in the deck is set once here — see the styling block
 below before adding any `fontsize=` argument to a demo.
@@ -34,6 +34,7 @@ from hopping_astar_planner import (
     feasible_alpha_interval,
     injection_energy,
     landing_speed,
+    max_hop_radius,
     min_clearance,
     takeoff_speed,
     terrain_profile,
@@ -45,7 +46,6 @@ from visualizer import Visualizer
 # ---------------------------------------------------------------------------
 # Deck-wide scenario constants
 # ---------------------------------------------------------------------------
-HOP_RADIUS = 1.5
 N_ANGLES   = 16
 V_MAX      = config.V_MAX   # derived from MAX_APEX_HEIGHT; 4.85 m/s
 
@@ -135,22 +135,22 @@ def param_caption(planner: HoppingAStarPlanner | None = None) -> str:
     projected slide. The values are also recorded in the results README.
 
     **Pass the planner** whenever the demo overrode a parameter. Without it this
-    reports this module's deck defaults (`HOP_RADIUS` = 1.5 m), which is a
-    caption that quietly lies about the figure beneath it — a demo running at
-    `config.HOP_RADIUS` = 1.0 would still be labelled 1.5. Given a planner, the
-    values are read off the object that actually produced the result, and the
-    energy chain is reported too.
+    reports this module's deck defaults. Given a planner, the values are read
+    off the object that actually produced the result, and the energy chain is
+    reported too. `hop_radius` is state-dependent now (`max_hop_radius`), not a
+    single planner-level scalar, so it is omitted here — see the per-hop table
+    or `enumerate_ring_candidates` for the radius at a specific state.
     """
     if planner is None:
         return (
-            f"hop_radius={HOP_RADIUS} m · V_max={V_MAX:.2f} m/s "
+            f"V_max={V_MAX:.2f} m/s "
             f"(apex {config.MAX_APEX_HEIGHT} m) · leg={config.LEG_LENGTH} m · "
             f"robot_radius={config.ROBOT_RADIUS} m · "
             f"min_clearance={config.MIN_CLEARANCE} m · res={config.CELL_RESOLUTION} m · "
             f"W_energy={config.W_ENERGY} m/J"
         )
     return (
-        f"hop_radius={planner.hop_radius} m · leg={planner.leg_length} m · "
+        f"leg={planner.leg_length} m · "
         f"robot_radius={planner.robot_radius} m · "
         f"min_clearance={planner.min_clearance_gate} m · "
         f"res={planner.map_env.resolution} m · μ={planner.mu}\n"
@@ -171,7 +171,6 @@ def make_planner(
     disable_clearance: bool,
     start: tuple[float, float],
     goal: tuple[float, float],
-    hop_radius: float = HOP_RADIUS,
     n_angles: int = N_ANGLES,
     V_max: float = V_MAX,
     **overrides,
@@ -186,7 +185,6 @@ def make_planner(
         map_env=m,
         start=start,
         goal=goal,
-        hop_radius=hop_radius,
         n_angles=n_angles,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
@@ -417,15 +415,16 @@ def enumerate_ring_candidates(
 ) -> list[dict]:
     """All `n_angles` full-radius ring candidates from `cell`, with a verdict each.
 
-    Scans only the full `hop_radius`, not the planner's inward ray-search, so the
-    figure stays readable.  Out-of-bounds and physics-infeasible candidates are
-    kept so they show up as rejections.
+    Scans only the full ring radius, not the planner's inward ray-search, so
+    the figure stays readable.  Out-of-bounds and physics-infeasible
+    candidates are kept so they show up as rejections.
 
     `v_g_in` is the speed the robot arrived at `cell` with, which sets the
-    energy band and so decides which candidates are reachable at all. It
-    defaults to the start-of-chain speed; pass the value from `path_hops` or
-    `diagnose_path` when illustrating a cell partway along a path, or the panel
-    will show a different robot's options than the one in the figure.
+    energy band and so decides which candidates are reachable at all — and,
+    via `max_hop_radius`, the ring radius itself. It defaults to the
+    start-of-chain speed; pass the value from `path_hops` or `diagnose_path`
+    when illustrating a cell partway along a path, or the panel will show a
+    different robot's options than the one in the figure.
 
     Each entry carries a `gate` field naming *which* check rejected it —
     `"bounds"`, `"obstacle"`, `"stance"`, `"physics"`, `"clearance"`, or `""`
@@ -440,16 +439,20 @@ def enumerate_ring_candidates(
     obs = planner._obstacle_fill
     if v_g_in is None:
         v_g_in = planner.v_g_initial
+    r = max_hop_radius(
+        v_g_in, planner.eta, planner.e_inject_max, planner.mass, planner.g,
+        planner.V_max,
+    )
 
     seen: set = {cell}
     out: list[dict] = []
     for dx, dy in planner._hop_dirs:
-        tx = px + planner.hop_radius * dx
-        ty = py + planner.hop_radius * dy
+        tx = px + r * dx
+        ty = py + r * dy
         if not m.is_within_bounds(tx, ty):
             out.append({
                 "cell": None, "c_s": (px, py, pz), "c_g": None,
-                "X": None, "Z": None, "r": planner.hop_radius,
+                "X": None, "Z": None, "r": r,
                 "alpha_s": None, "mc": None,
                 "accepted": False, "gate": "bounds", "reason": "out of bounds",
             })
@@ -469,7 +472,7 @@ def enumerate_ring_candidates(
 
         entry: dict = {
             "cell": nb, "c_s": c_s, "c_g": c_g,
-            "X": X, "Z": Z, "r": planner.hop_radius,
+            "X": X, "Z": Z, "r": r,
             "alpha_s": None, "mc": None,
             "accepted": False, "gate": "", "reason": "",
         }

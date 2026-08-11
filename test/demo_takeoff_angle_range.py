@@ -74,6 +74,7 @@ from hopping_astar_planner import (
     feasible_alpha_interval,
     injection_energy,
     landing_speed,
+    max_hop_radius,
     takeoff_speed,
 )
 from maps import flat, low_wall
@@ -270,7 +271,11 @@ def fig_topdown(m, path, planner) -> str:
     # the elevation into all 2500 cells, which on an all-zero map is 2500 copies
     # of "0.00" and no colourbar worth having.
     draw_topdown_compact(m, ax)
-    vis.draw_hop_circles(path, planner.hop_radius)
+    hop_radii = [max_hop_radius(
+        planner.v_g_initial, planner.eta, planner.e_inject_max,
+        planner.mass, planner.g, planner.V_max,
+    )] + [h["hop_radius"] for h in planner.path_hops]
+    vis.draw_hop_circles(path, hop_radii)
     vis.draw_path(path)
     vis.draw_start_goal(START, GOAL)
 
@@ -465,7 +470,7 @@ def main() -> int:
     # Swap these two lines (and `SCENARIO` above) to go back to flat ground.
     # m = flat.build()
     m = low_wall.build()
-    planner = make_planner(m, False, START, GOAL, hop_radius=config.HOP_RADIUS)
+    planner = make_planner(m, False, START, GOAL)
     path = planner.plan()
     if path is None:
         print(f"FAIL: no path across {_SCENARIO_LABEL[SCENARIO]}.")

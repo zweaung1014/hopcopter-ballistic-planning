@@ -251,14 +251,19 @@ class Visualizer:
         # Draw waypoint markers
         self.ax.plot(xs, ys, "o", color="red", markersize=5, zorder=5)
 
-    def draw_hop_circles(self, path: list[tuple[float, float]], hop_radius: float):
-        """Draw the reachable ring at each waypoint to visualise hop coverage."""
+    def draw_hop_circles(self, path: list[tuple[float, float]], hop_radii: list[float]):
+        """Draw the reachable ring at each waypoint to visualise hop coverage.
+
+        `hop_radii[i]` is the ring available when departing waypoint `i` — it
+        varies along the path since the ring is derived from the robot's
+        speed at that state, not a fixed constant.
+        """
         if not path:
             return
-        for i, (x, y) in enumerate(path):
+        for i, ((x, y), r) in enumerate(zip(path, hop_radii)):
             circle = mpatches.Circle(
                 (x, y),
-                radius=hop_radius,
+                radius=r,
                 fill=False,
                 edgecolor="deepskyblue",
                 linewidth=0.8,

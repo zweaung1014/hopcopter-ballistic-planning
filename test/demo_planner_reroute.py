@@ -43,6 +43,7 @@ from hopping_astar_planner import (
     HoppingAStarPlanner,
     alpha_for_clearance,
     feasible_alpha_interval,
+    max_hop_radius,
     terrain_profile,
 )
 from map2d5 import Map2D5
@@ -63,10 +64,6 @@ PILLAR_YMIN, PILLAR_YMAX = 1.0, 3.0
 
 START = (1.0, 2.0)
 GOAL = (5.0, 2.0)
-# The longest feasible flat hop at the derived V_MAX is V_MAX^2 / g = 2.40 m,
-# and a flat hop of span X needs v_s >= sqrt(g*X). 1.8 m leaves ~13% margin,
-# enough that grid snapping cannot push an edge past the limit.
-HOP_RADIUS = 1.8
 N_ANGLES = 16
 V_MAX = config.V_MAX
 
@@ -93,7 +90,6 @@ def make_planner(m: Map2D5) -> HoppingAStarPlanner:
         map_env=m,
         start=START,
         goal=GOAL,
-        hop_radius=HOP_RADIUS,
         n_angles=N_ANGLES,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
@@ -132,12 +128,16 @@ def enumerate_ring_candidates(planner: HoppingAStarPlanner, parent_cell):
     px, py = m.grid_to_world(*parent_cell)
     pz = float(m.grid[parent_cell[0], parent_cell[1]])
     obs_fill = planner._obstacle_fill
+    r = max_hop_radius(
+        planner.v_g_initial, planner.eta, planner.e_inject_max, planner.mass,
+        planner.g, planner.V_max,
+    )
 
     seen: set = {parent_cell}
     out: list = []
     for dx, dy in planner._hop_dirs:
-        tx = px + planner.hop_radius * dx
-        ty = py + planner.hop_radius * dy
+        tx = px + r * dx
+        ty = py + r * dy
         if not m.is_within_bounds(tx, ty):
             continue
         cell = m.world_to_grid(tx, ty)
@@ -232,8 +232,12 @@ def draw_topdown(fig, ax, planner, path, chosen_cell, candidates):
 
     # Highlight the takeoff cell whose ring we're visualising.
     px, py = m.grid_to_world(*chosen_cell)
+    ring_r = max_hop_radius(
+        planner.v_g_initial, planner.eta, planner.e_inject_max, planner.mass,
+        planner.g, planner.V_max,
+    )
     ax.add_patch(mpatches.Circle(
-        (px, py), radius=HOP_RADIUS, fill=False,
+        (px, py), radius=ring_r, fill=False,
         edgecolor="deepskyblue", linewidth=1.2, linestyle="--",
         alpha=0.9, zorder=5, label="hop ring",
     ))

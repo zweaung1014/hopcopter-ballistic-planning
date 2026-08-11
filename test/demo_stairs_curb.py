@@ -38,7 +38,7 @@ import matplotlib.patches as mpatches
 import config
 from demo_common import (
     SLIDE_FIGSIZE, TOPDOWN_FIGSIZE, arcs_figsize,
-    HOP_RADIUS, PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
+    PRESENTATION_DPI, TITLE_FS, LABEL_FS, ANNOT_FS,
     C_BASE, C_BALL, C_COLLIDE, C_ACCEPT, C_REJECT, C_CHOSEN,
     make_planner, diagnose_path, n_bad_hops,
     draw_topdown_base, draw_ab_paths, add_collision_legend,
