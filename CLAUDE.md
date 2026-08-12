@@ -160,30 +160,38 @@ generation and edge validation are non-trivial:
   added whenever the goal is within `hop_radius`, so reaching it doesn't depend on
   angular alignment with the ring sampling.
 - **Edge validation** (`_validate_and_cost`), cheapest test first:
-  1. reject if the landing cell is an obstacle;
-  2. **stance gate** (`Map2D5.standable_mask`, precomputed once): reject if the
+  1. **stance gate** (`Map2D5.standable_mask`, precomputed once): reject if the
      robot's body cannot rest at the landing cell without overlapping nearby
-     terrain;
-  3. **feasibility gate** (`feasible_alpha_interval`) — reject unless some takeoff
-     angle `alpha` satisfies all eight of: the **energy floor** from the parent hop
+     terrain. This also rejects OBSTACLE cells outright — `standable_mask` ANDs
+     in `grid != OBSTACLE` unconditionally — so there is no separate obstacle
+     check;
+  2. **feasibility gate** (`feasible_alpha_interval`) — reject unless some takeoff
+     angle `alpha` satisfies all six of: the **energy floor** from the parent hop
      (`v_s >= sqrt(eta)*v_g_in`, unshedable), the **injection ceiling**
-     (`v_s <= sqrt(v_s_min^2 + 2*E_INJECT_MAX/m)`), the **min-apex floor**
-     (`min_apex_tan`), plus Campana's five — Eq. 4 validity, the Coulomb friction
-     cone at the takeoff contact, the cone at the landing contact (mapped back
-     through the arc), `v_s <= V_max`, and `v_g <= V_g_max`. **The three energy
-     bounds are evaluated first**, before Eq. 4 and the cones, because they are the
-     ones that can wipe out most of the interval. This is the only gate that
-     depends on the hop's *heading* (only it sees the surface normals) and the only
-     one that depends on the hop's *history*. See `docs/alpha_range_new.md`;
-  4. **clearance gate**: `terrain_profile` samples the corridor the body sweeps,
+     (`v_s <= sqrt(v_s_min^2 + 2*E_INJECT_MAX/m)`, capped at `V_max`), the
+     **min-apex floor** (`min_apex_tan`), the Coulomb friction cone at the
+     takeoff contact, the cone at the landing contact (mapped back through the
+     arc), and `v_g <= V_g_max`. **The three energy bounds are evaluated
+     first**, before the cones, because they are the ones that can wipe out
+     most of the interval. Campana's Eq. 4 validity and his takeoff-speed bound
+     `v_s <= V_max` are *not* checked separately: they are algebraically
+     implied once the energy band is supplied — `_speed_tan_interval`'s roots
+     satisfy Eq. 4's `X*tan(alpha) - Z > 0` on their own, and the injection
+     ceiling's own `min(..., V_max^2)` already subsumes `v_s <= V_max`. (Because
+     of this, `v_s_min`/`e_inject_max`/`mass` are required arguments to
+     `feasible_alpha_interval` now — there is no bare-BEAM fallback mode.) This
+     is the only gate that depends on the hop's *heading* (only it sees the
+     surface normals) and the only one that depends on the hop's *history*. See
+     `docs/alpha_range_new.md`;
+  3. **clearance gate**: `terrain_profile` samples the corridor the body sweeps,
      then `alpha_for_clearance` picks the **least-injection** takeoff angle that
      clears and reports the resulting clearance; reject if it is below
      `min_clearance_gate`. This step also decides the flown angle, hence the
      successor's energy, so it is not skippable;
-  5. cost = XY distance + `w_energy * (e_inject + max(0, KE_in - KE_out))`. Clearance still does **not** enter the cost (it is purely a
+  4. cost = XY distance + `w_energy * (e_inject + max(0, KE_in - KE_out))`. Clearance still does **not** enter the cost (it is purely a
      feasibility test), but injected energy now does — see "The edge cost" below.
-     Note injection plays two distinct roles: step 4 minimises it *within* an edge
-     (which angle to fly), step 5 prices it *across* edges (which hop to take).
+     Note injection plays two distinct roles: step 3 minimises it *within* an edge
+     (which angle to fly), step 4 prices it *across* edges (which hop to take).
 - **`_profile_cache`** memoises `terrain_profile` on the `(takeoff cell, landing
   cell)` pair. Profiles depend only on the endpoints and body geometry, not on the
   arc and so not on energy — but the energy axis means each cell is expanded once
@@ -197,8 +205,8 @@ generation and edge validation are non-trivial:
   picks a flown angle (the least-injection one, without a terrain profile to
   consult), because the successor state's energy depends on it.
 - `mu=None` is the analogous knob for the friction cone: it drops BEAM constraints
-  (1) and (2) while keeping Eq. 4 validity and both velocity limits. A/B baselines
-  only (`test/demo_friction_cone.py`), never real planning.
+  (1) and (2) while keeping the energy band and the landing-speed limit. A/B
+  baselines only (`test/demo_friction_cone.py`), never real planning.
 - `charge_momentum=False` is the third of these knobs: `_edge_cost` then charges
   injected energy but not the momentum a hop throws away. **Unlike the other two
   it is not a weaker model but a known-broken one**, and worse than dropping the
@@ -206,10 +214,14 @@ generation and edge validation are non-trivial:
   alone they price as free and A* chops paths into stubs that arrive drained. It
   exists so `test/demo_cost_model_ab.py` can show that; do not reach for it to
   claw back planning time.
-- **`v_s_min=None` disables the energy band** in `feasible_alpha_interval` and
-  recovers the pre-chain behaviour. That is what lets `test/test_friction_cone.py`
-  keep exercising BEAM in isolation with a bare `(X, Z, V_max, g)` call — it is not
-  a planning knob.
+- **`v_s_min`/`e_inject_max`/`mass` are required arguments** to
+  `feasible_alpha_interval`, not optional. There is no bare-BEAM fallback mode:
+  Eq. 4 validity and the takeoff-speed bound are algebraically implied by the
+  energy band (see "Edge validation" above), so a caller with no energy state
+  to supply cannot use this function. `test/test_friction_cone.py` and parts of
+  `test/test_clearance_rejection.py` previously exercised BEAM in isolation
+  with a bare `(X, Z, V_max, g)` call; that mode no longer exists and those
+  tests are expected to fail until rewritten.
 
 ### The edge cost — why it is energy and not elevation
 

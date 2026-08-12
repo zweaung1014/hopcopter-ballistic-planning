@@ -336,11 +336,9 @@ def max_hop_radius(
 #: hard-coding the list, so a new constraint shows up in the diagnostics
 #: automatically instead of being silently omitted.
 _TRACE_STEPS: tuple[tuple[str, str], ...] = (
-    ("eq4",               "Eq. 4 validity (aim above the chord)"),
     ("E1_energy_floor",   "(E1) energy floor — unshedable arrival speed"),
     ("E2_inject_ceiling", "(E2) injection ceiling — one thrust cycle"),
     ("E3_min_apex",       "(E3) minimum apex-to-landing drop"),
-    ("c3_takeoff_speed",  "(3) takeoff speed <= V_max"),
     ("c4_landing_speed",  "(4) landing speed <= V_g_max"),
     ("c1_takeoff_cone",   "(1) takeoff friction cone"),
     ("c2_landing_cone",   "(2) landing friction cone (mapped through the arc)"),
@@ -391,9 +389,9 @@ def feasible_alpha_interval(
     n_s: tuple[float, float, float] | None = None,
     n_g: tuple[float, float, float] | None = None,
     theta: float = 0.0,
-    v_s_min: float | None = None,
-    e_inject_max: float | None = None,
-    mass: float | None = None,
+    v_s_min: float,
+    e_inject_max: float,
+    mass: float,
     min_apex: float | None = None,
     V_g_max: float | None = None,
     trace: list | None = None,
@@ -407,8 +405,8 @@ def feasible_alpha_interval(
     same statement and every constraint below is literally a bound on how high
     the arc may be.
 
-    The energy constraints are applied FIRST, before Eq. 4 validity and before
-    the cones, because they are the ones that can wipe out most of the interval:
+    The energy constraints are applied FIRST, because they are the ones that can
+    wipe out most of the interval:
 
     (E1)  Energy floor. The robot arrives with a takeoff speed it cannot shed —
           propellers only ADD energy — so every parabola *below* the one
@@ -419,18 +417,28 @@ def feasible_alpha_interval(
           at any angle the floor is vacuous and the lower bound falls back to
           (E2)'s own lower root.
 
-    (E2)  Injection ceiling, `v_s <= sqrt(v_s_min^2 + 2 e_inject_max / mass)`:
-          the most one stance-plus-thrust cycle can produce.
+    (E2)  Injection ceiling, `v_s <= sqrt(v_s_min^2 + 2 e_inject_max / mass)`,
+          capped at `V_max`: the most one stance-plus-thrust cycle can produce,
+          never more than the global worst case over every possible parent hop.
+          The `min()` against `V_max` in its own computation makes it at least
+          as tight as Campana's takeoff-speed constraint `v_s <= V_max`
+          everywhere, which is why that constraint isn't applied separately
+          below.
 
     (E3)  Minimum drop, `min_apex` — see `min_apex_tan`. A pure fallback: it is
           `max`ed against (E1), so it changes nothing unless the incoming speed
           produces a parabola that is *too low* to compress the leg.
 
-    Then Campana's own five:
+    (E1) and (E2) also make Campana's Eq. 4 validity (`X*tan(alpha) - Z > 0`,
+    i.e. "aim above the chord to the target") redundant rather than merely
+    dominated: `_speed_tan_interval` derives its `tan(alpha)` roots from
+    `g X^2 (1+T^2) = 2 W (X T - Z)`, and the left side is always positive, so
+    ANY real root already forces `X T - Z > 0` on its own. That domain is a
+    half-line in `T` (`T > Z/X`), so once both of E1/E2's endpoints satisfy it,
+    everything between them does too — there is nothing left for a separate
+    `atan2(Z, X)` bracket to cut.
 
-    (i)   Eq. 4 validity: `X*tan(alpha) - Z > 0`, i.e.
-          `alpha in (atan2(Z, X), pi/2)`. Physically, a projectile falls below
-          its launch ray, so you must aim above the chord to the target.
+    Then Campana's remaining two:
 
     (1)   Takeoff non-sliding: the takeoff direction *is* `alpha_s`, so the
           friction wedge at the start contact applies directly —
@@ -438,34 +446,31 @@ def feasible_alpha_interval(
 
     (2)   Landing non-sliding: see `_landing_cone_alpha_s`.
 
-    (3)   Takeoff speed, `v_s <= V_max`. With the energy band supplied this is
-          a backstop only — (E2) is strictly tighter, since `V_max` is the
-          global worst case over every possible parent hop.
-
     (4)   Landing speed, `v_g <= V_g_max` — the leg must absorb the arrival as
           well as produce the departure. Since `v_g^2 = v_s^2 - 2 g Z`, this is
           slack on uphill hops and tight on downhill ones. This is the cap that
           does real work: it is what stops the robot dropping off something
           taller than it can land from.
 
-    (3), (4), (E1) and (E2) all share `_speed_tan_interval`; (1) and (2) share
+    (4), (E1) and (E2) all share `_speed_tan_interval`; (1) and (2) share
     `inplane_friction_cone`.
 
     Parameters
     ----------
     mu : friction coefficient. `None` disables constraints (1) and (2) entirely
-        — for A/B baselines that isolate what the friction cone contributes,
-        mirroring `HoppingAStarPlanner.disable_clearance`. Do NOT use `None`
-        for real planning; the remaining constraints still apply.
+        — for A/B baselines that isolate what the friction cone contributes.
+        Do NOT use `None` for real planning; the remaining constraints still
+        apply.
     n_s, n_g : outward unit surface normals at the takeoff and landing contacts,
         from `Map2D5.surface_normals()`. Default to level ground.
     theta : hop heading, `atan2(dy, dx)`. Only the normals' components in the
         hop plane matter, and `theta` is what defines that plane; it is
         irrelevant when both normals are vertical.
-    v_s_min, e_inject_max, mass : the energy band (E1)+(E2). All three are
-        required together; passing `v_s_min=None` skips the band entirely and
-        recovers the pre-energy-chain behaviour, which is what lets the BEAM
-        ground-truth tests keep calling this with just `(X, Z, V_max, g)`.
+    v_s_min, e_inject_max, mass : the energy band (E1)+(E2), required together.
+        There is no bare-BEAM fallback mode: Campana's Eq. 4 and takeoff-speed
+        constraints are folded into this band rather than kept as a separate
+        code path (see the (E1)/(E2) notes above), so a caller with no energy
+        state to supply cannot use this function.
     min_apex : (E3). `None` skips it.
     V_g_max : landing-speed cap for (4). Defaults to `V_max`, the pre-split
         behaviour where one speed capped both ends.
@@ -473,7 +478,9 @@ def feasible_alpha_interval(
         of its own bound and what it cut, as it is applied. See
         `_TRACE_STEPS` and `test/demo_takeoff_angle_range.py`. `None` (the
         default, and what the planner always passes) makes this inert: the
-        arithmetic executed is identical either way.
+        arithmetic executed is identical either way, except for one extra
+        `atan2` that seeds the trace's cut-accounting baseline and is
+        otherwise skipped entirely.
 
         This instrumentation is deliberately REMOVABLE. Every added block is
         bracketed by `# --- trace ---` markers and either appends to `trace`
@@ -495,48 +502,43 @@ def feasible_alpha_interval(
     if V_g_max is None:
         V_g_max = V_max
 
-    # (i) Geometric interval from Campana Eq. 4 validity. This branch of atan2
-    # naturally handles Z < 0 (downhill): the bound simply moves below 0.
-    alpha_lo = math.atan2(Z, X)
-    alpha_hi = 0.5 * math.pi
     # --- trace ---
+    # Seed the trace's cut-accounting baseline with the geometric domain
+    # (Campana Eq. 4 validity) so E1's cut_lo below reports correctly. Purely
+    # bookkeeping for the diagnostic: E1/E2's own roots satisfy this domain on
+    # their own (see docstring), so it is never applied to alpha_lo/alpha_hi,
+    # and the atan2 call is skipped outright when trace is None (the planner's
+    # hot path).
     if trace is not None:
-        _trace_add(trace, "eq4", alpha_lo, alpha_hi, alpha_lo, alpha_hi)
+        _trace_add(trace, "eq4_domain", math.atan2(Z, X), 0.5 * math.pi,
+                   math.atan2(Z, X), 0.5 * math.pi)
     # --- end trace ---
 
     # (E1) energy floor and (E2) injection ceiling.
-    if v_s_min is not None:
-        if e_inject_max is None or mass is None:
-            raise ValueError("v_s_min requires both e_inject_max and mass")
-        W_lo = v_s_min * v_s_min
-        # The ceiling is what one cycle can produce, never more than the global
-        # worst case; min() keeps (3) from ever being the looser of the two.
-        W_hi = min(W_lo + 2.0 * e_inject_max / mass, V_max * V_max)
+    W_lo = v_s_min * v_s_min
+    # The ceiling is what one cycle can produce, never more than the global
+    # worst case; min() also subsumes Campana's takeoff-speed bound (3).
+    W_hi = min(W_lo + 2.0 * e_inject_max / mass, V_max * V_max)
 
-        iv_hi = _speed_tan_interval(X, Z, W_hi, g)
-        if iv_hi is None:
-            # --- trace ---
-            if trace is not None:
-                _trace_add(trace, "E2_inject_ceiling", None, None,
-                           alpha_lo, alpha_hi, fatal=True)
-            # --- end trace ---
-            return None  # unreachable even at full thrust
-        iv_lo = _speed_tan_interval(X, Z, W_lo, g)
-        # Upper branch of the floor when v_s_min can reach the target; when it
-        # cannot, every angle already needs injection and the binding lower
-        # bound is the ceiling interval's own lower root.
-        e1_lo = math.atan(iv_lo[1] if iv_lo else iv_hi[0])
-        e2_hi = math.atan(iv_hi[1])
-        alpha_lo = max(alpha_lo, e1_lo)
+    iv_hi = _speed_tan_interval(X, Z, W_hi, g)
+    if iv_hi is None:
         # --- trace ---
         if trace is not None:
-            _trace_add(trace, "E1_energy_floor", e1_lo, None, alpha_lo, alpha_hi)
+            _trace_add(trace, "E2_inject_ceiling", None, None,
+                       math.atan2(Z, X), 0.5 * math.pi, fatal=True)
         # --- end trace ---
-        alpha_hi = min(alpha_hi, e2_hi)
-        # --- trace ---
-        if trace is not None:
-            _trace_add(trace, "E2_inject_ceiling", None, e2_hi, alpha_lo, alpha_hi)
-        # --- end trace ---
+        return None  # unreachable even at full thrust
+    iv_lo = _speed_tan_interval(X, Z, W_lo, g)
+    # Upper branch of the floor when v_s_min can reach the target; when it
+    # cannot, every angle already needs injection and the binding lower
+    # bound is the ceiling interval's own lower root.
+    alpha_lo = math.atan(iv_lo[1] if iv_lo else iv_hi[0])
+    alpha_hi = math.atan(iv_hi[1])
+    # --- trace ---
+    if trace is not None:
+        _trace_add(trace, "E1_energy_floor", alpha_lo, None, alpha_lo, alpha_hi)
+        _trace_add(trace, "E2_inject_ceiling", None, alpha_hi, alpha_lo, alpha_hi)
+    # --- end trace ---
 
     # (E3) Minimum apex-to-landing drop. A `max` against the energy floor, so it
     # only bites when the incoming speed's parabola is itself too low.
@@ -550,23 +552,23 @@ def feasible_alpha_interval(
             _trace_add(trace, "E3_min_apex", e3_lo, None, alpha_lo, alpha_hi)
         # --- end trace ---
 
-    # (3) Takeoff speed, and (4) landing speed.
-    for name, W in (("c3_takeoff_speed", V_max * V_max),
-                    ("c4_landing_speed", V_g_max * V_g_max + 2.0 * g * Z)):
-        tan_iv = _speed_tan_interval(X, Z, W, g)
-        if tan_iv is None:
-            # --- trace ---
-            if trace is not None:
-                _trace_add(trace, name, None, None, alpha_lo, alpha_hi, fatal=True)
-            # --- end trace ---
-            return None
-        own_lo, own_hi = math.atan(tan_iv[0]), math.atan(tan_iv[1])
-        alpha_lo = max(alpha_lo, own_lo)
-        alpha_hi = min(alpha_hi, own_hi)
+    # (4) Landing speed, v_g <= V_g_max. (Campana's takeoff-speed constraint
+    # (3) is subsumed by (E2) above, so it is not checked separately here.)
+    tan_iv = _speed_tan_interval(X, Z, V_g_max * V_g_max + 2.0 * g * Z, g)
+    if tan_iv is None:
         # --- trace ---
         if trace is not None:
-            _trace_add(trace, name, own_lo, own_hi, alpha_lo, alpha_hi)
+            _trace_add(trace, "c4_landing_speed", None, None,
+                       alpha_lo, alpha_hi, fatal=True)
         # --- end trace ---
+        return None
+    own_lo, own_hi = math.atan(tan_iv[0]), math.atan(tan_iv[1])
+    alpha_lo = max(alpha_lo, own_lo)
+    alpha_hi = min(alpha_hi, own_hi)
+    # --- trace ---
+    if trace is not None:
+        _trace_add(trace, "c4_landing_speed", own_lo, own_hi, alpha_lo, alpha_hi)
+    # --- end trace ---
 
     if mu is not None:
         # (1) Takeoff non-sliding — the wedge applies to alpha_s directly.
@@ -1035,9 +1037,11 @@ class HoppingAStarPlanner:
         at most that plus one cycle's `e_inject_max`;
       * drops at least `min_apex` from its own apex, or the elastic leg never
         compresses enough for the controller to register a stance phase;
-      * satisfies Campana's BEAM — Eq. 4 validity, the Coulomb friction cone
-        at both the takeoff and landing contacts, and `v_g <= V_g_max` (the
-        fastest touchdown the leg can absorb);
+      * satisfies the Coulomb friction cone at both the takeoff and landing
+        contacts, and `v_g <= V_g_max` (the fastest touchdown the leg can
+        absorb) — Campana's Eq. 4 validity and takeoff-speed bound are implied
+        by the energy band above rather than checked separately (see
+        `feasible_alpha_interval`);
       * keeps the robot's body at least `min_clearance_gate` clear of the
         terrain across the whole corridor it sweeps.
 
@@ -1463,31 +1467,28 @@ class HoppingAStarPlanner:
         into the successor state's speed bin.
 
         Sequence, cheapest test first:
-          (a) reject if the landing cell itself is an obstacle;
-          (b) STANCE GATE: reject if the robot's body cannot sit at the landing
-              cell without overlapping nearby terrain (precomputed mask);
-          (c) FEASIBILITY GATE: reject if no `alpha_s` satisfies the energy band
-              from `v_g_in`, the `min_apex` stance-detection floor, Campana
-              Eq. 4 validity, the friction cones at both contacts, and the
-              landing-speed limit;
-          (d) CLEARANCE GATE: pick the least-injection takeoff angle whose arc
+          (a) STANCE GATE: reject if the robot's body cannot sit at the landing
+              cell without overlapping nearby terrain (precomputed mask); this
+              also rejects OBSTACLE cells outright, since `standable_mask`
+              never marks one standable;
+          (b) FEASIBILITY GATE: reject if no `alpha_s` satisfies the energy band
+              from `v_g_in`, the `min_apex` stance-detection floor, the
+              friction cones at both contacts, and the landing-speed limit;
+          (c) CLEARANCE GATE: pick the least-injection takeoff angle whose arc
               keeps the body `min_clearance_gate` clear of the terrain, and
               reject if no feasible angle manages it;
-          (e) return the edge cost. Clearance does NOT appear here — it is a
+          (d) return the edge cost. Clearance does NOT appear here — it is a
               feasibility test, not a cost term. Injected energy DOES, together
               with the momentum the hop throws away; see `_edge_cost`. Note the
-              two roles injection plays are distinct: step (d) minimises it
-              *within* an edge (which angle to fly), while (e) prices it
+              two roles injection plays are distinct: step (c) minimises it
+              *within* an edge (which angle to fly), while (d) prices it
               *across* edges (which hop to take).
         """
         self.n_edge_checks += 1
         neighbor_z = self.map_env.grid[neighbor[0], neighbor[1]]
 
-        # (a) Landing must not be on an obstacle.
-        if neighbor_z == Map2D5.OBSTACLE:
-            return None
-
-        # (b) The robot must be able to stand where it lands.
+        # (a) The robot must be able to stand where it lands. Also rejects
+        # OBSTACLE cells: standable_mask ANDs in `grid != OBSTACLE` itself.
         if not self.disable_clearance and not self._standable[neighbor[0], neighbor[1]]:
             return None
 

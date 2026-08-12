@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — trimmed redundant checks from `_validate_and_cost` / `feasible_alpha_interval`
+
+Two checks in the hottest path of the planner were provably redundant given how
+the planner actually calls them, and were removed to cut per-edge cost:
+
+- **The landing-obstacle check** in `_validate_and_cost` (`if neighbor_z ==
+  Map2D5.OBSTACLE: return None`) duplicated the stance gate right after it:
+  `Map2D5.standable_mask` already ANDs in `grid != OBSTACLE` unconditionally, so
+  every OBSTACLE cell was already rejected by the stance check. Removed outright.
+  Note this also removes the obstacle guard from the `disable_clearance=True`
+  path (which skips the stance gate) — that A/B-baseline knob is no longer
+  relied upon, so it is no longer obstacle-safe on a map with real OBSTACLE
+  cells.
+- **`feasible_alpha_interval`'s Eq. 4 validity check and its takeoff-speed bound
+  (`v_s <= V_max`)** are algebraically implied once the energy band (E1
+  energy floor / E2 injection ceiling) is supplied: `_speed_tan_interval`'s
+  `tan(alpha)` roots always satisfy `X*tan(alpha) - Z > 0` (Eq. 4's condition)
+  on their own, since the equation they solve has a strictly positive left
+  side; and E2's own ceiling already takes `min(..., V_max^2)`, which is at
+  least as tight as the takeoff-speed bound everywhere. Both checks are
+  deleted rather than special-cased away, which makes `v_s_min`,
+  `e_inject_max`, and `mass` **required** arguments now — there is no more
+  bare-BEAM fallback mode (`feasible_alpha_interval(X, Z, V_max, g)` with no
+  energy state). `test/test_friction_cone.py` and part of
+  `test/test_clearance_rejection.py` exercised that bare mode directly and are
+  expected to fail until rewritten for the new algorithm.
+
 ### Changed — `HOP_RADIUS` raised 1.0 m -> 4.0 m (the ring, not the physics, was limiting hop length)
 
 `test/demo_hop_radius_headroom.py` (new) tests, per hop, whether a landing
