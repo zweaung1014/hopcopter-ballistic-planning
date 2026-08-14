@@ -48,6 +48,11 @@ python test/test_hop_energy_chain.py    # energy chain: closed forms, alpha boun
                                         # and end-to-end chain closure on a real plan
 python test/test_edge_cost_energy.py    # energy-based edge cost: the momentum term,
                                         # non-negativity, and the over-a-wall case
+python test/test_inflated_field.py      # the planner's inflated-field clearance check
+                                        # vs. the reference capsule check it replaced:
+                                        # asserts it is never MORE PERMISSIVE, plus
+                                        # the lookup-pad guarantee and the
+                                        # standable_mask equivalence
 
 # Timing/scaling benchmark (ballistic vs. baseline planner on the same scenario)
 python test/benchmark_tall_stairs.py
@@ -103,7 +108,22 @@ memoised), `get_elevation_bilinear` (scalar wrapper over it), `set_obstacle_regi
 `LEG_CYLINDER_RADIUS` — at shipped values `LEG_CYLINDER_RADIUS` is thinner than
 `CELL_RESOLUTION`, so in practice the CoM sphere, not the leg-cylinder-sides
 channel, governs the max standable grade, ~1.25 at shipped values),
-`surface_normals` (per-cell outward unit normals for the friction cone; memoised).
+`surface_normals` (per-cell outward unit normals for the friction cone; memoised),
+`inflated_field` (terrain inflated by a sphere or column of a given radius, in
+absolute heights — the planner's flight-clearance primitive; memoised).
+
+**`inflated_field` is what makes the robot a POINT.** It answers, per cell, "how
+high must a body of this radius be when passing over here" — so the whole capsule
+test becomes one scalar comparison, and the body's width lives in the map rather
+than in a lateral sampling pattern. Two properties are load-bearing and both are
+regression-tested in `test/test_inflated_field.py`: the `lookup_pad`
+(`resolution*sqrt(2)/2`, without which a nearest-cell lookup can read a cell
+whose value does not bound the query point), and `taper=False` for the CoM field
+(the reference check treats terrain above the CoM as a full-height column, so a
+sphere there over-rejects). `standable_mask` is provably this same object
+evaluated at standing height — `inflated_field(com_radius+gate) <= grid +
+leg_length` — and the two are kept separate only because `standable_mask` runs
+once per planner and costs nothing.
 
 **`surface_normals` uses min-|slope| one-sided differences, not a central
 difference,** and that is a correctness requirement, not a refinement. A central
@@ -141,8 +161,9 @@ generation and edge validation are non-trivial:
   binning is the honest alternative. The start is seeded with a *virtual* landing
   speed `sqrt(2*g*H_INITIAL/ETA_HOP)`, chosen so the uniform stance rule
   `v_s = sqrt(eta)*v_g` yields a first takeoff speed of `sqrt(2*g*H_INITIAL)` — so
-  the first hop needs no special case. Costs ~4x the expansions in practice; the
-  `_profile_cache` (below) is what pays for it.
+  the first hop needs no special case. Costs ~4x the expansions in practice,
+  which is affordable because the clearance check is a read off a precomputed
+  field rather than a per-hop terrain sample (below).
 - **`plan()` populates `self.path_hops`** with per-hop `alpha_s`, `v_s`, `v_g`,
   `e_inject`, `apex_drop`, `X`, `Z`. **Read the takeoff angle from there, never
   re-derive it from the endpoints** — with the energy chain the angle depends on the
@@ -183,21 +204,27 @@ generation and edge validation are non-trivial:
      is the only gate that depends on the hop's *heading* (only it sees the
      surface normals) and the only one that depends on the hop's *history*. See
      `docs/alpha_range_new.md`;
-  3. **clearance gate**: `terrain_profile` samples the corridor the body sweeps,
-     then `alpha_for_clearance` picks the **least-injection** takeoff angle that
-     clears and reports the resulting clearance; reject if it is below
-     `min_clearance_gate`. This step also decides the flown angle, hence the
-     successor's energy, so it is not skippable;
+  3. **clearance gate**: `clearance_floor_alpha` reads the **precomputed
+     inflated height fields** along the hop's centreline and solves for
+     `alpha_c`, the shallowest angle that clears, in closed form; reject if it
+     exceeds `alpha_max`. The flown angle is then the least-injection one at or
+     above it, so this step still decides the successor's energy and is not
+     skippable;
   4. cost = XY distance + `w_energy * (e_inject + max(0, KE_in - KE_out))`. Clearance still does **not** enter the cost (it is purely a
      feasibility test), but injected energy now does — see "The edge cost" below.
      Note injection plays two distinct roles: step 3 minimises it *within* an edge
      (which angle to fly), step 4 prices it *across* edges (which hop to take).
-- **`_profile_cache`** memoises `terrain_profile` on the `(takeoff cell, landing
-  cell)` pair. Profiles depend only on the endpoints and body geometry, not on the
-  arc and so not on energy — but the energy axis means each cell is expanded once
-  per live speed bin, and every one of those re-samples identical terrain. Bounded
-  with FIFO eviction (A* sweeps outward, so old pairs are least likely to return).
-  Measured on `stairs`: 20k entries thrashes, 60k reaches uncapped speed at ~170 MB.
+- **The clearance check is precomputed per CELL, not derived per HOP,** and that
+  distinction is the whole design. `terrain_profile` was keyed on a `(takeoff,
+  landing)` **pair** — ~7M of them — so it could never be precomputed; a 60k FIFO
+  cache compensated at a 17-34% hit rate, and the search still made **155M grid
+  reads over a 2,500-cell map, ~62,000 per cell of terrain that never changes**.
+  `Map2D5.inflated_field` is keyed on a **cell** instead, so all 2,500 answers
+  are computed once in 0.26 ms. Two fields are built (`_inflated_foot`,
+  `_inflated_com`), because the capsule's regions differ in radius *and* shape:
+  the foot tip is a sphere (tapered) while terrain above the CoM is treated as a
+  full-height column (untapered). **Do not add a taper to the CoM field** — it
+  silently over-rejects. The cache is gone; nothing per-hop is derived any more.
 - `disable_clearance=True` skips the stance and clearance gates but keeps the
   physics feasibility gate — used only for A/B baseline comparisons (e.g. in
   `test/benchmark_tall_stairs.py`), never for real planning. Note this is now a
@@ -292,11 +319,19 @@ above.
   and "larger alpha" the same statement, lets every energy constraint reduce to a
   bound on `tan(alpha)`, and makes the clearing set an upward-closed interval
   `[alpha_c, alpha_max]`. Required *speed*, by contrast, is U-shaped in alpha with
-  its minimum at `min_energy_tan`. Together those give `alpha_for_clearance` an
-  exact answer rather than a search: `clamp(alpha*, alpha_c, alpha_max)`, where
-  `alpha_c` comes from a bisection that monotonicity validates. In practice this
-  collapses to `alpha_c` — `alpha*` sits below `alpha_min` whenever the energy
-  floor binds, since that floor starts on the steep branch above `alpha*`.
+  its minimum at `min_energy_tan`. Together those give an exact answer rather
+  than a search: `clamp(alpha*, alpha_c, alpha_max)`. In practice this collapses
+  to `alpha_c` — `alpha*` sits below `alpha_min` whenever the energy floor binds,
+  since that floor starts on the steep branch above `alpha*`.
+
+  Linearity is the stronger statement, and it is what `clearance_floor_alpha`
+  uses: `arc_z` is not merely monotone in `T = tan(alpha)`, it is **affine** in
+  it, so `alpha_c` inverts outright —
+  `T_req(u) = (H(u) - t_s - Z*u^2/X^2) * X / (u*(X-u))`, maximised over `u`. The
+  reference `alpha_for_clearance` still bisects (monotonicity is all a bisection
+  needs); the planner does not. **The `u*(X-u)` denominator is a pole at each
+  end,** which is why `ARC_SAMPLE_MAX_STEP` cannot be coarsened even though the
+  inflated fields are smooth — see its note in `config.py`.
 - **Collision geometry is a capsule, not just a sphere, and it's checked
   differently at stance than in flight — and it has three different radii,
   not one.** The full collision volume is a capsule from foot to CoM with
@@ -390,7 +425,12 @@ Notable non-obvious parameters:
   rejected and `plan()` silently returns `None` everywhere. `config.py` asserts
   it. This is specifically about the CoM sphere's own-column stance check
   (`ROBOT_RADIUS`, not `LEG_CYLINDER_RADIUS` or `FOOT_TIP_RADIUS`).
-- `OBSTACLE_WALL_EXTRA` is added on top of the map's max real elevation to get the
+- `OBSTACLE_WALL_EXTRA` **no longer gates the planner** — `inflated_field` gives
+  OBSTACLE cells `+inf`, which is strictly stronger and needs no calibration
+  against `MAX_APEX_HEIGHT`. It still governs the reference implementation
+  (`terrain_profile`) and every `test/demo_*.py` that reads
+  `planner._obstacle_fill`, so the assert below is still live. It is added on top
+  of the map's max real elevation to get the
   height used for obstacle cells in the clearance check — obstacles aren't just
   "tall," they're "taller than anything else on the map," so bilinear interpolation
   near an obstacle edge doesn't accidentally produce a below-wall reading. It must
@@ -414,9 +454,13 @@ Notable non-obvious parameters:
   lower it to bias toward hopping over. **It also governs planning time** — see
   "The edge cost" above.
 
-Obstacles must be **at least two cells thick** across any arc that should be
-blocked. A one-cell obstacle sampled along its own boundary is averaged 50/50 with
-its neighbour by the bilinear lookup, halving its effective height.
+Obstacles **no longer have to be two cells thick.** That rule existed because the
+old flight check read terrain bilinearly, which averaged a one-cell obstacle
+50/50 with its neighbour and halved its effective height. The planner now reads
+`Map2D5.inflated_field`, which is a `max` and so never under-reports. The rule
+still applies to anything going through `sample_bilinear` directly — including
+`terrain_profile` / `clearance_for_alpha`, retained as the reference
+implementation.
 
 ### Visualizer (`visualizer.py`)
 

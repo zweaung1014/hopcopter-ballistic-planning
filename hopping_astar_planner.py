@@ -64,7 +64,6 @@ a hop either has an arc that stays clear of the terrain or it does not exist.
 
 import heapq
 import math
-from collections import OrderedDict
 from typing import NamedTuple
 
 import numpy as np
@@ -80,11 +79,6 @@ from map2d5 import Map2D5
 # and away from the singularities `X*tan(alpha) = Z` (xdot -> inf) and
 # `cos(alpha) = 0` (v_s -> inf).
 _ALPHA_EPS = 1e-6
-
-
-#: Cache-miss sentinel. `None` is a legitimate cached value (a degenerate hop),
-#: so it cannot double as "absent".
-_MISS = object()
 
 
 #: Normal of perfectly level ground — the default when no terrain normal is
@@ -1022,6 +1016,130 @@ def alpha_for_clearance(
     return alpha_s, clearance_for_alpha(profile, alpha_s)
 
 
+def clearance_floor_alpha(
+    c_s: tuple[float, float, float],
+    c_g: tuple[float, float, float],
+    height_map: Map2D5,
+    inflated_foot: np.ndarray,
+    inflated_com: np.ndarray,
+    leg_length: float,
+    max_step: float,
+) -> float | None:
+    """Shallowest takeoff angle whose arc clears the terrain — in closed form.
+
+    The configuration-space replacement for `terrain_profile` +
+    `alpha_for_clearance`. Returns `alpha_c` in radians, `-inf` when nothing
+    along the hop constrains the arc at all, or `None` when the centreline
+    leaves the map. The caller still clamps into `[alpha_min, alpha_max]` and
+    rejects when `alpha_c` exceeds `alpha_max` — this function knows nothing
+    about the energy chain or the friction cones.
+
+    Two facts make this exact rather than a search.
+
+    **The robot is a point.** `Map2D5.inflated_field` has already baked the
+    body's radii into the terrain, so the whole capsule test collapses to one
+    scalar comparison per sample, against
+
+        H(u) = max( inflated_foot(u),  inflated_com(u) - leg_length )
+
+    `inflated_foot` carries the Pythagoras taper (the foot tip is a sphere);
+    `inflated_com` does not, because `clearance_for_alpha`'s above-the-CoM
+    branch treats such terrain as a full-height column. The leg-cylinder band
+    needs no field of its own: `foot_radius + gate` exceeds `leg_radius + gate`
+    at any sane geometry, so the foot field already forces terrain below the
+    foot everywhere the leg check could fire. Only the CENTRELINE is sampled —
+    the body's width is in the field, not in the sampling pattern, which is
+    what removes the old `n_lateral` rake and its 15 cm gaps.
+
+    **Arc height is linear in `tan(alpha)`.** From `_arc_z`, with the leg offset
+    cancelled out so `foot_h(0) = t_s`,
+
+        foot_h(u) = t_s + Z*u^2/X^2 + T * u*(X - u)/X       (T = tan alpha)
+
+    so `foot_h(u) >= H(u)` inverts to a bound on `T` directly:
+
+        T_req(u) = ( H(u) - t_s - Z*u^2/X^2 ) * X / ( u*(X - u) )
+
+    and `alpha_c = atan(max_u T_req(u))`. One vectorized pass replaces the
+    1.5-2.3 `clearance_for_alpha` calls and 8-step bisection this supersedes,
+    and it yields the exact crossover rather than a bracket around it.
+
+    **The endpoint exemption**, which the old code expressed as an
+    alpha-dependent mask, becomes alpha-FREE here: a sample whose terrain is at
+    or below `max(t_s, t_g)` can never reject the hop. Either the old mask
+    covered it, or the foot had already risen a full `foot_radius + gate` above
+    it, which puts it in the bottom-cap branch with clearance to spare. So only
+    terrain strictly above BOTH endpoints constrains anything — tested as
+    `inflated_com(u) > max(t_s, t_g)`, which holds exactly when some terrain
+    within the CoM reach of `u` is above that height. Consequence worth
+    knowing: a hop up onto a step, or down off one, is unconstrained by
+    clearance no matter how big the step, because nothing en route is above both
+    ends. Only genuine walls bite.
+
+    `u = 0` and `u = X` are excluded (zero denominator). They are stance
+    configurations, and `Map2D5.standable_mask` gates them — the same division of
+    labour `clearance_for_alpha` documents. **Do not try to check them here with
+    the fields instead.** An inflated field is a DISC, so at `u = 0` it also sees
+    terrain *behind* the takeoff, which the reference's corridor never samples;
+    on a graded map that is fatal rather than merely conservative. On
+    `maps/slope_crest.py`'s 0.35 ramp the ground 0.24 m uphill sits 0.084 m above
+    the foot, so an endpoint test rejected every hop off every ramp cell and
+    `plan()` returned `None` straight from the start state.
+
+    **The sampling step is not a free knob.** `T_req` has a POLE at each end (the
+    `u*(X-u)` denominator), so it is far more sensitive to sample spacing near
+    the endpoints than the fields themselves are — the fields are smooth at the
+    scale of their own dilation radius, which is misleading here. Measured across
+    the deck, marching at `resolution` lets 333 hops through that
+    `clearance_for_alpha` rejects, `resolution/2` lets 20 through, and
+    `resolution/3` — the density `terrain_profile` itself uses — lets none. Hence
+    the clamp below. The win over the old check is dropping the lateral rake and
+    the bisection, not a coarser march.
+    """
+    x_s, y_s, t_s = c_s
+    x_g, y_g, t_g = c_g
+
+    dx = x_g - x_s
+    dy = y_g - y_s
+    X = math.hypot(dx, dy)
+    if X < 1e-9:
+        return None
+
+    # Matches `terrain_profile`'s density, and that is NOT a free knob: see the
+    # docstring's note on the pole at u -> 0, X.
+    step = min(max_step, height_map.resolution / 3.0)
+    n = max(3, int(math.ceil(X / step)) + 1)
+    u = np.linspace(0.0, X, n)
+
+    cx = x_s + u * (dx / X)
+    cy = y_s + u * (dy / X)
+    if np.any((cx < 0.0) | (cx >= height_map.size_x)
+              | (cy < 0.0) | (cy >= height_map.size_y)):
+        return None
+
+    res = height_map.resolution
+    ci = (cx / res).astype(np.int64)
+    ri = (cy / res).astype(np.int64)
+    np.clip(ci, 0, height_map.cols - 1, out=ci)
+    np.clip(ri, 0, height_map.rows - 1, out=ri)
+
+    f_com = inflated_com[ri, ci]
+    H = np.maximum(inflated_foot[ri, ci], f_com - leg_length)
+
+    # Only terrain above BOTH endpoints can reject the hop — see the docstring.
+    active = f_com > max(t_s, t_g)
+    active[0] = False       # stance configurations; standable_mask gates these
+    active[-1] = False
+    if not active.any():
+        return -math.inf
+
+    ua = u[active]
+    Z = t_g - t_s
+    numer = H[active] - t_s - Z * (ua * ua) / (X * X)
+    denom = ua * (X - ua) / X
+    return float(math.atan(float(np.max(numer / denom))))
+
+
 class HoppingAStarPlanner:
     """A* planner for a hopping robot on a 2.5D grid map.
 
@@ -1104,12 +1222,6 @@ class HoppingAStarPlanner:
         # and the propagated energy drifts from the arc actually flown; too fine
         # and the state space multiplies for no modelling gain.
         speed_bin: float = 0.25,
-        # Cap on the terrain-profile cache (see `_profile_cache`). Purely a
-        # memory/speed trade; correctness does not depend on it. Measured on
-        # `stairs`: 20k thrashes (15.0 s), 60k reaches the uncapped speed
-        # (11.2 s) at ~170 MB peak RSS, 120k costs 70 MB more for nothing.
-        # The right value scales with map area, so raise it for larger maps.
-        profile_cache_size: int = 60000,
         # Coulomb friction coefficient (Campana's BEAM constraints 1 and 2).
         # `None` drops the two friction-cone constraints — an A/B baseline knob
         # only, like `disable_clearance`; the Eq. 4 and leg-energy gates stay.
@@ -1196,9 +1308,16 @@ class HoppingAStarPlanner:
         # first hop then needs no special case anywhere in the search.
         self.v_g_initial = math.sqrt(2.0 * g * h_initial / eta)
 
-        # Height used in place of OBSTACLE sentinels when the arc-clearance
-        # check bilinearly samples the terrain. Setting it well above the
-        # tallest real cell makes OBSTACLE cells act as un-flyable walls.
+        # Height used in place of OBSTACLE sentinels when terrain is sampled
+        # BILINEARLY. Setting it well above the tallest real cell makes OBSTACLE
+        # cells act as un-flyable walls.
+        #
+        # No longer read by the planner itself: `Map2D5.inflated_field` gives
+        # OBSTACLE cells `+inf` outright, which is strictly stronger and needs no
+        # calibration against `MAX_APEX_HEIGHT`. It is kept because the reference
+        # implementation (`terrain_profile`) needs it, and because most of
+        # `test/demo_*.py` reads `planner._obstacle_fill` to reproduce what the
+        # planner sees.
         non_obs = map_env.grid[map_env.grid != Map2D5.OBSTACLE]
         map_max_z = float(non_obs.max()) if non_obs.size > 0 else 0.0
         self._obstacle_fill = map_max_z + obstacle_wall_extra
@@ -1214,6 +1333,25 @@ class HoppingAStarPlanner:
         # Per-cell outward surface normals, for the friction cone at both
         # contact points. Like `_standable`, computed once and read per edge.
         self._normals = map_env.surface_normals()
+
+        # Terrain inflated by the body, so the flight-clearance check can treat
+        # the robot as a POINT (see `Map2D5.inflated_field` and
+        # `clearance_floor_alpha`). Two fields, because the capsule's regions
+        # have different radii AND different shapes: the foot tip is a sphere
+        # (tapered), while terrain above the CoM is treated as a full-height
+        # column by the reference check, so its field must NOT taper.
+        #
+        # This is what replaced per-hop terrain sampling. A profile was keyed on
+        # a cell PAIR (~7M of them, hence a 60k FIFO cache running at a 17-34%
+        # hit rate and re-reading each map cell ~62,000 times per plan); these
+        # are keyed on a cell, so all 2500 answers are computed here, once, in
+        # well under a millisecond.
+        self._inflated_foot = map_env.inflated_field(
+            foot_radius + min_clearance_gate, taper=True,
+        )
+        self._inflated_com = map_env.inflated_field(
+            robot_radius + min_clearance_gate, taper=False,
+        )
 
         # Convert start/goal to grid coordinates
         self.start_cell = map_env.world_to_grid(start[0], start[1])
@@ -1234,56 +1372,9 @@ class HoppingAStarPlanner:
         # Per-hop record of the path plan() last returned; see `_reconstruct_path`.
         self.path_hops: list[dict] = []
 
-        # Terrain profiles, keyed by (takeoff cell, landing cell).
-        #
-        # A profile depends only on the two endpoints and the fixed body
-        # geometry — NOT on the arc, and so not on energy. But the energy axis
-        # of the search state means the same cell is expanded once per live
-        # speed bin (~4 in practice), and each of those expansions re-samples
-        # the identical terrain for the identical neighbours. Sampling terrain
-        # is the expensive half of validating an edge, so caching it recovers
-        # most of what the energy dimension costs.
-        #
-        # Bounded, because the unbounded version is ~1.5 KB per entry over
-        # ~100k distinct cell pairs on a 50x50 map. FIFO eviction rather than
-        # LRU: A* sweeps outward, so old pairs are the ones least likely to
-        # come back, and this avoids a move_to_end on every hit.
-        self._profile_cache: OrderedDict[tuple, ArcProfile | None] = OrderedDict()
-        self._profile_cache_max = profile_cache_size
-
     def _speed_bin(self, v_g: float) -> int:
         """Quantise a landing speed onto the state's speed axis."""
         return int(round(v_g / self.speed_bin))
-
-    def _terrain_profile_cached(
-        self,
-        current: tuple[int, int],
-        neighbor: tuple[int, int],
-        c_s: tuple[float, float, float],
-        c_g: tuple[float, float, float],
-    ) -> "ArcProfile | None":
-        """`terrain_profile` memoised on the cell pair. See `_profile_cache`."""
-        key = (current, neighbor)
-        cached = self._profile_cache.get(key, _MISS)
-        if cached is not _MISS:
-            return cached
-
-        profile = terrain_profile(
-            c_s, c_g,
-            self.map_env,
-            self.robot_radius,
-            self.leg_radius,
-            self.foot_radius,
-            self.leg_length,
-            self.arc_max_step,
-            self._obstacle_fill,
-            self.n_lateral,
-            min_clearance_gate=self.min_clearance_gate,
-        )
-        if len(self._profile_cache) >= self._profile_cache_max:
-            self._profile_cache.popitem(last=False)  # FIFO evict
-        self._profile_cache[key] = profile
-        return profile
 
     def plan(self) -> list[tuple[float, float]] | None:
         """Run A* and return the path as a list of (x, y) world coords, or None.
@@ -1304,7 +1395,6 @@ class HoppingAStarPlanner:
         self.n_edge_checks = 0
         self.n_edges_accepted = 0
         self.path_hops = []
-        self._profile_cache.clear()
 
         start = (self.start_cell, self._speed_bin(self.v_g_initial))
 
@@ -1474,9 +1564,11 @@ class HoppingAStarPlanner:
           (b) FEASIBILITY GATE: reject if no `alpha_s` satisfies the energy band
               from `v_g_in`, the `min_apex` stance-detection floor, the
               friction cones at both contacts, and the landing-speed limit;
-          (c) CLEARANCE GATE: pick the least-injection takeoff angle whose arc
-              keeps the body `min_clearance_gate` clear of the terrain, and
-              reject if no feasible angle manages it;
+          (c) CLEARANCE GATE: solve for the shallowest takeoff angle whose arc
+              keeps the body `min_clearance_gate` clear of the terrain
+              (`clearance_floor_alpha`, reading the precomputed inflated
+              fields), and reject if that exceeds `alpha_max`. Then fly the
+              least-injection angle at or above it;
           (d) return the edge cost. Clearance does NOT appear here — it is a
               feasibility test, not a cost term. Injected energy DOES, together
               with the momentum the hop throws away; see `_edge_cost`. Note the
@@ -1515,27 +1607,29 @@ class HoppingAStarPlanner:
             return None
         alpha_min, alpha_max = interval
 
-        # (d) Arc-to-terrain clearance across the body's swept corridor. This is
+        # (d) Arc-to-terrain clearance, read off the inflated fields. This is
         # also where the flown angle is chosen, so it must run even when the
         # gate is disabled — the successor's energy depends on it.
-        alpha_s = alpha_min
+        alpha_floor = alpha_min
         if not self.disable_clearance:
-            profile = self._terrain_profile_cached(
-                current, neighbor,
+            alpha_c = clearance_floor_alpha(
                 (cx, cy, float(current_z)), (nx, ny, float(neighbor_z)),
+                self.map_env,
+                self._inflated_foot,
+                self._inflated_com,
+                self.leg_length,
+                self.arc_max_step,
             )
-            if profile is None:
-                return None
-            alpha_s, mc = alpha_for_clearance(
-                profile, alpha_min, alpha_max, self.min_clearance_gate,
-            )
-            if mc < self.min_clearance_gate:
+            if alpha_c is None:
+                return None  # the centreline leaves the map
+            if alpha_c > alpha_max:
                 return None  # no feasible arc clears the terrain
-        else:
-            # Same least-injection rule, without a terrain profile to consult.
-            alpha_s = min(
-                max(math.atan(min_energy_tan(X, Z)), alpha_min), alpha_max,
-            )
+            alpha_floor = max(alpha_min, alpha_c)
+
+        # Least-injection angle within what survives: required speed is U-shaped
+        # in alpha with its minimum at `min_energy_tan`, so the cheapest angle in
+        # `[alpha_floor, alpha_max]` is that minimum clamped into the interval.
+        alpha_s = min(max(math.atan(min_energy_tan(X, Z)), alpha_floor), alpha_max)
 
         v_s = takeoff_speed(X, Z, alpha_s, self.g)
         v_g = landing_speed(v_s, Z, self.g)

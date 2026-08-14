@@ -223,9 +223,11 @@ SPEED_BIN = 0.25  # m/s; quantisation of landing speed in the A* state. Energy
                   #
                   # THE lever on planning time, now that the energy axis is what
                   # dominates it: the deck runs 3-9x more expansions than it did
-                  # before the chain, and no amount of caching removes that (see
-                  # `_profile_cache`, which already recovers the redundant
-                  # terrain sampling). Measured on slope_crest at HOP_RADIUS=1.5:
+                  # before the chain, and no amount of caching removes that.
+                  # (The terrain-profile cache this used to point at is gone:
+                  # the planner reads precomputed inflated height fields now, so
+                  # there is nothing per-hop left to cache.) Measured on
+                  # slope_crest at HOP_RADIUS=1.5, BEFORE that change:
                   #   0.25 -> 30.0 s, 6198 expansions
                   #   0.50 -> 20.1 s, 3914 expansions, IDENTICAL path and angles
                   #   1.00 -> 17.3 s, 2884 expansions, first hop's angle shifts
@@ -255,8 +257,44 @@ MU = 1.2  # Coulomb friction coefficient, uniform over the environment (as in
 MIN_CLEARANCE = 0.15  # m; HARD gate — an arc whose body-to-terrain clearance ever
                       # drops below this is rejected outright. Clearance does NOT
                       # enter the edge cost; it is purely a feasibility test.
-ARC_SAMPLE_MAX_STEP = 0.05  # m; upper bound on sampling step along the arc's XY line
-ARC_LATERAL_SAMPLES = 5  # terrain samples across the body's width, spanning
+ARC_SAMPLE_MAX_STEP = 0.05  # m; upper bound on sampling step along the arc's XY
+                            # line, clamped to CELL_RESOLUTION/3 by both
+                            # `terrain_profile` and `clearance_floor_alpha`.
+                            #
+                            # DO NOT COARSEN THIS. It looks like it should be
+                            # safe to, since the planner now reads inflated
+                            # fields whose features are at least a dilation
+                            # radius (0.24 m) wide. It is not: the closed form
+                            # in `clearance_floor_alpha` has a POLE at each end
+                            # of the hop (its `u*(X-u)` denominator), so the
+                            # required takeoff angle is far more sensitive to
+                            # sample spacing near the endpoints than the fields
+                            # are. Measured across the whole map deck, marching
+                            # at CELL_RESOLUTION lets 333 hops through that the
+                            # reference capsule check rejects, CELL_RESOLUTION/2
+                            # lets 20 through, and CELL_RESOLUTION/3 lets none.
+ARC_LATERAL_SAMPLES = 5  # NO LONGER READ BY THE PLANNER. The planner samples the
+                         # CENTRELINE only, against `Map2D5.inflated_field`,
+                         # which has already spread each obstacle's influence
+                         # sideways by the body radius — so the body's width
+                         # lives in the map rather than in the sampling pattern,
+                         # and there are no inter-sample gaps left to tune. This
+                         # value now configures only `terrain_profile` /
+                         # `clearance_for_alpha`, which survive as the reference
+                         # implementation that `test/test_inflated_field.py`
+                         # validates the planner against.
+                         #
+                         # Two consequences of that switch, both improvements:
+                         #   * the ~20 cm obstacle that could slip between two
+                         #     lateral samples (see the note below) can no
+                         #     longer do so at any width;
+                         #   * OBSTACLES NO LONGER HAVE TO BE TWO CELLS THICK.
+                         #     That rule existed because bilinear sampling
+                         #     averaged a one-cell obstacle 50/50 with its
+                         #     neighbour and halved its effective height. An
+                         #     inflated field is a MAX, so it never under-reports.
+                         #
+                         # terrain samples across the body's width, spanning
                          # [-(R_max + MIN_CLEARANCE), +(R_max + MIN_CLEARANCE)]
                          # perpendicular to travel, where R_max is the largest
                          # of the three capsule radii (ROBOT_RADIUS, since the

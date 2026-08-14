@@ -28,12 +28,16 @@ class Map2D5:
         self._fill_cache_grid: np.ndarray | None = None
         # Memo for the per-cell surface normals (see `surface_normals`).
         self._normal_cache: np.ndarray | None = None
+        # Memo for the inflated height fields, keyed on their arguments (see
+        # `inflated_field`). A planner builds two and reads them every edge.
+        self._inflated_cache: dict[tuple[float, bool, float], np.ndarray] = {}
 
     def _invalidate_caches(self) -> None:
         """Drop every grid-derived memo. Call after any write to `self.grid`."""
         self._fill_cache_key = None
         self._fill_cache_grid = None
         self._normal_cache = None
+        self._inflated_cache = {}
 
     def _filled_grid(self, obstacle_fill: float | None) -> np.ndarray:
         """`self.grid` with OBSTACLE cells replaced by `obstacle_fill`.
@@ -278,6 +282,105 @@ class Map2D5:
                 min_margin = np.minimum(min_margin, margin)
 
         return (min_margin >= clearance) & (self.grid != self.OBSTACLE)
+
+    def inflated_field(
+        self,
+        radius: float,
+        taper: bool = True,
+        lookup_pad: float | None = None,
+    ) -> np.ndarray:
+        """Terrain inflated by a sphere (or column) of `radius`, in absolute heights.
+
+        Answers, per cell, the question *"how high must a body of this radius be
+        when passing over here, so that it touches nothing?"* — as an absolute
+        height in map coordinates, not an offset. That turns every later
+        collision query into a scalar comparison against a single number, which
+        is the entire point: the robot's size is baked into the terrain once,
+        so the robot becomes a POINT everywhere downstream.
+
+        This is the configuration-space form of the check
+        `hopping_astar_planner.clearance_for_alpha` performs sample-by-sample.
+        The difference is not the physics but the KEY: that function is keyed on
+        a hop (a cell *pair*, ~7M of them, so it can never be precomputed and
+        needs a cache), while this is keyed on a cell (2500 of them, so all
+        answers are computed up front in well under a millisecond).
+
+        Geometry. For a terrain column of height `h` at horizontal distance `d`,
+        a sphere of `radius` centred at height `z` clears it iff
+        `hypot(d, z - h) >= radius`, i.e. `z >= h + sqrt(radius^2 - d^2)`. The
+        field is the `max` of that over every neighbour in range, so the lift is
+        full `radius` directly overhead and tapers to zero at `d = radius`.
+
+        `taper=False` drops the Pythagoras term, giving a vertical COLUMN of
+        `radius` rather than a sphere: `z >= h` for every neighbour in range.
+        That is the right model for `clearance_for_alpha`'s above-the-CoM branch,
+        which uses `axis_dist = |r|` regardless of how far above the CoM the
+        terrain reaches — i.e. it already treats such terrain as a full-height
+        column. Passing `taper=True` there would silently over-reject.
+
+        `lookup_pad` (default `resolution * sqrt(2) / 2`) is what makes a
+        NEAREST-CELL lookup of the result safe, and it is not optional. A query
+        point can sit up to half a cell diagonal from the centre of the cell it
+        lands in, so without the pad the field would be blind to terrain in an
+        annulus just inside `radius` — which shows up as the field ACCEPTING
+        hops `clearance_for_alpha` rejects (26-92 cases per map on the deck; see
+        `test/test_inflated_field.py`). The pad widens the neighbour search by
+        that distance and shifts the taper outward by it, so the guarantee
+        becomes: for any query point `P`, the nearest cell's value bounds every
+        terrain point within `radius` of `P`. Correctness only ever costs
+        conservatism here, never permissiveness.
+
+        OBSTACLE columns are infinitely tall and off-map neighbours impose no
+        constraint, matching `standable_mask`.
+
+        Memoised on `(radius, taper, lookup_pad)` and dropped by
+        `_invalidate_caches`, like `surface_normals`.
+
+        Note `standable_mask` is this same object evaluated at standing height:
+        `inflated_field(com_radius + clearance) <= grid + leg_length` reproduces
+        it exactly on the whole map deck (asserted in
+        `test/test_inflated_field.py`). It is kept as a separate implementation
+        because it is computed once per planner and costs nothing, so merging
+        them would be risk without payoff — but if the two ever disagree, this
+        is why.
+        """
+        if lookup_pad is None:
+            lookup_pad = self.resolution * math.sqrt(2.0) / 2.0
+
+        key = (float(radius), bool(taper), float(lookup_pad))
+        cached = self._inflated_cache.get(key)
+        if cached is not None:
+            return cached
+
+        # Search wider than the body by the lookup pad — see the docstring.
+        reach = radius + lookup_pad
+        r_cells = int(math.ceil(reach / self.resolution))
+
+        filled = np.where(self.grid == self.OBSTACLE, np.inf, self.grid)
+        pad = max(r_cells, 1)
+        padded = np.full((self.rows + 2 * pad, self.cols + 2 * pad), -np.inf)
+        padded[pad:pad + self.rows, pad:pad + self.cols] = filled
+
+        out = np.full(self.grid.shape, -np.inf)
+        for dr in range(-r_cells, r_cells + 1):
+            for dc in range(-r_cells, r_cells + 1):
+                d = math.hypot(dr, dc) * self.resolution
+                if d >= reach:
+                    continue  # too far to matter, however tall
+                if taper:
+                    # Distance is charged against the body radius only after the
+                    # lookup pad is deducted, so a query point anywhere in the
+                    # cell is still covered.
+                    d_eff = max(0.0, d - lookup_pad)
+                    lift = math.sqrt(max(0.0, radius * radius - d_eff * d_eff))
+                else:
+                    lift = 0.0
+                h = padded[pad + dr:pad + dr + self.rows,
+                           pad + dc:pad + dc + self.cols]
+                out = np.maximum(out, h + lift)
+
+        self._inflated_cache[key] = out
+        return out
 
     def _min_abs_slope(self, axis: int) -> np.ndarray:
         """Per-cell terrain slope along one grid axis, in the min-|.| sense.

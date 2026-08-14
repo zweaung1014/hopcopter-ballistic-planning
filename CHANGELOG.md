@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — flight clearance now reads precomputed inflated height fields
+
+The planner spent **71%** of its time re-measuring static terrain:
+`terrain_profile` (42%) plus `clearance_for_alpha` (29%). Measured on one
+`plan()` call on the flat map, that came to **155,358,320 grid reads over a
+2,500-cell map — ~62,000 reads per cell of terrain that never changes**, plus
+100,689,430 arc-vs-terrain distance comparisons.
+
+The cause was structural rather than a tuning failure. A terrain profile is
+keyed on a **cell pair** (~7M of them on a 50x50 map), so it can never be
+precomputed; the 60k FIFO cache that compensated ran at a 17-34% hit rate, and
+uncapping it entirely bought only 14%.
+
+Terrain is now inflated by the robot's collision geometry **once**, per cell, at
+planner construction — the standard configuration-space move, so the robot
+becomes a POINT everywhere downstream:
+
+- **`Map2D5.inflated_field(radius, taper=?)`** (new, memoised). Per cell, the
+  absolute height a body of `radius` must be at to touch nothing, taking the max
+  over neighbours of `terrain + sqrt(radius^2 - d^2)`. 0.26 ms for the whole map
+  against 155M reads during the search.
+- **`clearance_floor_alpha`** (new free function) replaces `terrain_profile` +
+  `alpha_for_clearance` in the planner. It samples the **centreline only** — the
+  body's width is in the field now, not in the sampling pattern — and solves for
+  the clearance floor in closed form, since `_arc_z` is linear in `tan(alpha)`:
+  `T_req(u) = (H(u) - t_s - Z*u^2/X^2) * X / (u*(X-u))`. That replaces the
+  1.5-2.3 `clearance_for_alpha` calls and 8-step bisection per edge with one
+  vectorized pass, and yields the exact crossover rather than a bracket.
+- **`_profile_cache`, `_terrain_profile_cached` and the `profile_cache_size`
+  constructor parameter are gone.** Nothing per-hop is derived any more.
+
+`terrain_profile`, `clearance_for_alpha`, `alpha_for_clearance` and
+`min_clearance` remain as the **reference implementation**, which the demos and
+`visualizer.py` still use and which `test/test_inflated_field.py` validates the
+planner against.
+
+**The feasible takeoff-angle interval is untouched.** `feasible_alpha_interval`
+— the energy band, `min_apex`, both friction cones, the landing-speed cap — is
+unchanged, as is the least-injection rule for picking the flown angle. Only the
+clearance floor inside that interval changed how it is found.
+
+Measured across the deck (same start/goal, same energy seed):
+
+| scenario | before | after | speedup | path |
+|---|---|---|---|---|
+| flat | 15.7 s | 6.6 s | 2.4x | identical |
+| low_wall | 38.6 s | 18.6 s | 2.1x | changed |
+| bypass | 157.5 s | 45.8 s | 3.4x | changed |
+| stairs | 241.6 s | 75.5 s | 3.2x | changed |
+| tall_stairs | 196.6 s | 96.0 s | 2.0x | changed |
+| slope_crest | 63.1 s | 41.8 s | 1.5x | changed |
+| **total** | **713 s** | **284 s** | **2.5x** | |
+
+`flat` is identical down to the expansion and edge-check counts. Everywhere else
+the path moves because the check is stricter — see below.
+
+### Fixed — flight clearance no longer has lateral sampling gaps or bilinear under-reads
+
+Two approximations in the old check are gone, and with them a documented
+restriction on map authoring:
+
+- It raked only `ARC_LATERAL_SAMPLES` points across the body, **0.15 m apart** at
+  shipped values, so a ~20 cm obstacle could pass between two of them undetected.
+  The inflated field has no gaps at any obstacle width.
+- It read terrain **bilinearly**, which averages a one-cell obstacle 50/50 with
+  its neighbour and halves its effective height. An inflated field is a `max`, so
+  it never under-reports — **obstacles no longer need to be two cells thick.**
+
+Consequence: the new check is **strictly stricter**, rejecting ~5-10% more hops
+on featured maps, and **paths on those maps change**. `flat` is unaffected.
+`test/test_inflated_field.py` asserts the one-sided property that matters —
+there is **no** case where the field check accepts a hop `clearance_for_alpha`
+rejects — across seven maps and ~2,700 hops each.
+
+Two things that look optional and are not, both regression-tested:
+
+- **`lookup_pad`** (default `resolution*sqrt(2)/2`). The planner reads the field
+  with a nearest-cell lookup, so a query point can sit half a cell diagonal from
+  the centre of the cell it reads; without the pad, 1,390 of 21,000 sampled query
+  points are not bounded by the field.
+- **The CoM field must not taper.** `clearance_for_alpha`'s above-the-CoM branch
+  treats such terrain as a full-height column, so a sphere there over-rejects
+  (13,344 extra rejections across the deck).
+- **`ARC_SAMPLE_MAX_STEP` must not be coarsened**, despite the fields being
+  smooth at the scale of their own dilation radius. `T_req` has a pole at each
+  end of the hop (its `u*(X-u)` denominator), so the answer is far more
+  sensitive to sample spacing near the endpoints than the fields are: marching
+  at `CELL_RESOLUTION` lets 333 hops through that the reference rejects,
+  `CELL_RESOLUTION/2` lets 20 through, `CELL_RESOLUTION/3` none. The saving over
+  the old check is the lateral rake and the bisection, not a coarser march.
+- **The two arc endpoints stay out of scope**, exactly as `clearance_for_alpha`
+  documents, and must not be checked with the fields instead. An inflated field
+  is a **disc**, so at `u = 0` it sees terrain *behind* the takeoff that the
+  reference's corridor never samples. On `slope_crest`'s 0.35 ramp the ground
+  0.24 m uphill sits 0.084 m above the foot, so an endpoint test rejected every
+  hop off every ramp cell and `plan()` returned `None` from the start state.
+
+### Added — `test/test_inflated_field.py`
+
+Pins the inflated-field check to the reference capsule check it replaced, in the
+repo's assertion style (PASS/FAIL prints, `sys.exit(1)`). Also asserts the
+equivalence `standable_mask == (inflated_field(com_radius+gate) <= grid +
+leg_length)`, which holds exactly on the whole deck and is why the two remain
+separate implementations rather than being merged.
+
 ### Changed — trimmed redundant checks from `_validate_and_cost` / `feasible_alpha_interval`
 
 Two checks in the hottest path of the planner were provably redundant given how
