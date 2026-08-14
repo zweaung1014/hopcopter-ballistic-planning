@@ -171,7 +171,6 @@ def make_planner(
     disable_clearance: bool,
     start: tuple[float, float],
     goal: tuple[float, float],
-    n_angles: int = N_ANGLES,
     V_max: float = V_MAX,
     **overrides,
 ) -> HoppingAStarPlanner:
@@ -185,7 +184,6 @@ def make_planner(
         map_env=m,
         start=start,
         goal=goal,
-        n_angles=n_angles,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
         g=config.G_ACCEL,
@@ -208,6 +206,7 @@ def make_planner(
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_scan_step=config.HOP_SCAN_STEP,
+        hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
         disable_clearance=disable_clearance,
     )
     kwargs.update(overrides)
@@ -412,12 +411,14 @@ def enumerate_ring_candidates(
     planner: HoppingAStarPlanner,
     cell: tuple[int, int],
     v_g_in: float | None = None,
+    n_angles: int = N_ANGLES,
 ) -> list[dict]:
     """All `n_angles` full-radius ring candidates from `cell`, with a verdict each.
 
-    Scans only the full ring radius, not the planner's inward ray-search, so
-    the figure stays readable.  Out-of-bounds and physics-infeasible
-    candidates are kept so they show up as rejections.
+    Scans only a single full-radius ring, not the planner's scanline disk
+    fill (`HoppingAStarPlanner._generate_hop_neighbors`), so the figure stays
+    readable.  Out-of-bounds and physics-infeasible candidates are kept so
+    they show up as rejections.
 
     `v_g_in` is the speed the robot arrived at `cell` with, which sets the
     energy band and so decides which candidates are reachable at all — and,
@@ -446,7 +447,9 @@ def enumerate_ring_candidates(
 
     seen: set = {cell}
     out: list[dict] = []
-    for dx, dy in planner._hop_dirs:
+    for i in range(n_angles):
+        a = 2.0 * math.pi * i / n_angles
+        dx, dy = math.cos(a), math.sin(a)
         tx = px + r * dx
         ty = py + r * dy
         if not m.is_within_bounds(tx, ty):

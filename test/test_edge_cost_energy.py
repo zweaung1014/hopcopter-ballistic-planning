@@ -63,7 +63,6 @@ def make_planner(m: Map2D5, **overrides) -> HoppingAStarPlanner:
     """
     kwargs = dict(
         map_env=m, start=(0.5, 2.5), goal=(4.5, 2.5),
-        n_angles=config.HOP_N_ANGLES,
         w_energy=config.W_ENERGY, g=G, V_max=config.V_MAX, mass=MASS, eta=ETA,
         e_inject_max=config.E_INJECT_MAX, min_apex=config.MIN_APEX_HEIGHT,
         h_initial=H_STEADY, V_g_max=config.V_G_MAX, speed_bin=config.SPEED_BIN,
@@ -75,6 +74,7 @@ def make_planner(m: Map2D5, **overrides) -> HoppingAStarPlanner:
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_scan_step=config.HOP_SCAN_STEP,
+        hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
     )
     kwargs.update(overrides)
     return HoppingAStarPlanner(**kwargs)

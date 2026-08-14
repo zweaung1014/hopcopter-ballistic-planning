@@ -35,26 +35,57 @@ MAX_JUMP_HEIGHT = 0.5  # meters; edges with dz > this are impassable
 # not the robot's physics, was choosing hop length. Sizing it from the actual
 # energy state fixes that at the source instead of hand-picking a bigger
 # constant.
-HOP_N_ANGLES = 16  # number of evenly spaced candidate hop directions per expansion
-HOP_SCAN_STEP = 0.1  # m; spacing of the radius ladder the inward ray-search walks
-                     # when generating candidate landing cells. Along any one
-                     # direction, candidates sit at the state's max radius, that
-                     # radius minus step, ... so this is what quantizes how far a
-                     # hop can go.
+HOP_N_ANGLES = 16  # NO LONGER READ BY THE PLANNER. `_generate_hop_neighbors`
+                   # fills its candidate disk with a `HOP_SCAN_STEP`-spaced
+                   # lattice (a scanline circle fill) rather than sampling
+                   # fixed directions, so this constant now configures only the
+                   # single-ring diagnostic visualizations —
+                   # `test/demo_common.py::enumerate_ring_candidates` and
+                   # `test/demo_planner_reroute.py::enumerate_ring_candidates`
+                   # — which still sample one ring of evenly spaced directions
+                   # for figure readability, deliberately simpler than what the
+                   # planner itself does.
+HOP_SCAN_STEP = 0.1  # m; lattice spacing of the scanline circle-fill that
+                     # generates candidate landing cells, AT the reference
+                     # radius `HOP_SCAN_STEP_REF_RADIUS` below (see
+                     # `HoppingAStarPlanner._generate_hop_neighbors`).
                      #
                      # It is a separate parameter from CELL_RESOLUTION (rather than
-                     # just reading the grid) so it can be tuned for speed: the
-                     # branching factor is directly proportional to 1/step, and
-                     # coarsening it is the cheapest way to make planning faster.
+                     # just reading the grid) so it can be tuned for speed. At a
+                     # FLAT spacing, candidate count scales as
+                     # ~pi * hop_radius^2 / step^2 (an area fill) — measured on
+                     # stairs/tall_stairs/slope_crest, that made the scanline fill
+                     # run 5.4-6.4x slower than the old ray-search (up to 572.8s vs
+                     # 94.1s per plan), because hop_radius reaches ~5.5 m right
+                     # after a big drop. HOP_SCAN_STEP_REF_RADIUS fixes the SHAPE
+                     # of that scaling (back to ~linear in hop_radius, like the old
+                     # ray-search); this parameter still controls the overall
+                     # density, and coarsening it is still the cheapest lever on
+                     # planning time.
                      #
-                     # But coarsening it also makes straight-line progress lumpy —
-                     # at 0.3 m, straight-ahead landings are 0.3 m apart while
-                     # diagonal ones are not, so A* picks up lateral doglegs to
-                     # reach x-positions the straight ladder skips. Keeping it at
+                     # Coarsening it also makes straight-line progress lumpy —
+                     # candidate spacing along any lattice axis is exactly `step`,
+                     # so a coarse step can make A* pick up lateral doglegs to
+                     # reach x-positions the lattice skips. Keeping it at
                      # CELL_RESOLUTION avoids that: candidates are then as fine as
-                     # the map itself. Measured on slope_crest: 0.3 -> a 5-hop path
-                     # with a 0.3 m y-detour in 2.6 s; 0.1 -> a straight 4-hop path
-                     # in 7.2 s.
+                     # the map itself.
+HOP_SCAN_STEP_REF_RADIUS = 1.0  # m; hop_radius below which HOP_SCAN_STEP is the
+                     # spacing actually used. Above it, the effective spacing
+                     # widens as `HOP_SCAN_STEP * sqrt(hop_radius /
+                     # HOP_SCAN_STEP_REF_RADIUS)`, trading candidate DENSITY at
+                     # large radii for keeping candidate COUNT growth linear
+                     # rather than quadratic in hop_radius. 1.0 m is the flat
+                     # steady-state hop length referenced throughout this
+                     # codebase (see W_ENERGY's derivation above), so ordinary
+                     # hops see no change; only the rare large-radius hops that
+                     # were driving the 5-6x regression get coarsened. Measured
+                     # on stairs/tall_stairs/slope_crest WITH this widening:
+                     # 1.3-1.7x slower than the old ray-search (down from
+                     # 5.4-6.4x with a flat HOP_SCAN_STEP) — the residual gap is
+                     # the scanline fill's inherently higher candidate density
+                     # even at/below the reference radius (a disk fill visits
+                     # more points than 16 rays do), not further large-radius
+                     # blowup.
 
 W_ENERGY = 0.84  # m per J; the exchange rate between energy and distance in the
                  # edge cost. See `HoppingAStarPlanner._edge_cost`:

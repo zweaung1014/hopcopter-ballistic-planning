@@ -34,7 +34,6 @@ def main():
         map_env=env_map,
         start=config.START,
         goal=config.GOAL,
-        n_angles=config.HOP_N_ANGLES,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
         g=config.G_ACCEL,
@@ -57,6 +56,7 @@ def main():
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_scan_step=config.HOP_SCAN_STEP,
+        hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
     )
     path = planner.plan()
 

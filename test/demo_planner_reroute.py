@@ -90,7 +90,6 @@ def make_planner(m: Map2D5) -> HoppingAStarPlanner:
         map_env=m,
         start=START,
         goal=GOAL,
-        n_angles=N_ANGLES,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
         g=config.G_ACCEL,
@@ -113,13 +112,20 @@ def make_planner(m: Map2D5) -> HoppingAStarPlanner:
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_scan_step=config.HOP_SCAN_STEP,
+        hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
     )
 
 
-def enumerate_ring_candidates(planner: HoppingAStarPlanner, parent_cell):
-    """Regenerate the same ring candidates the planner would evaluate
-    from `parent_cell`, and classify each as ACCEPTED / REJECTED, with the
+def enumerate_ring_candidates(
+    planner: HoppingAStarPlanner, parent_cell, n_angles: int = N_ANGLES,
+):
+    """Regenerate a single ring of `n_angles` evenly spaced candidates from
+    `parent_cell`, and classify each as ACCEPTED / REJECTED, with the
     parameters used to make that decision.
+
+    Deliberately simpler than the planner's own scanline disk fill
+    (`HoppingAStarPlanner._generate_hop_neighbors`) — one ring, not an area
+    fill — so the figure stays readable.
 
     Returns a list of dicts with keys:
         cell, c_s, c_g, X, Z, alpha_s, mc, accepted, reason
@@ -135,7 +141,9 @@ def enumerate_ring_candidates(planner: HoppingAStarPlanner, parent_cell):
 
     seen: set = {parent_cell}
     out: list = []
-    for dx, dy in planner._hop_dirs:
+    for i in range(n_angles):
+        a = 2.0 * math.pi * i / n_angles
+        dx, dy = math.cos(a), math.sin(a)
         tx = px + r * dx
         ty = py + r * dy
         if not m.is_within_bounds(tx, ty):

@@ -32,7 +32,6 @@ from maps.tall_stairs import build as build_map
 # Mirrors the scenario in test/demo_tall_stairs.py.
 START = (0.5, 2.5)
 GOAL = (4.0, 2.5)
-N_ANGLES = 16
 V_MAX = config.V_MAX
 
 # A plan() call is ~2 s at the shipped 0.1 m resolution (it was ~0.3 s at 0.2 m),
@@ -46,7 +45,6 @@ def make_planner(m: Map2D5, disable_clearance: bool) -> HoppingAStarPlanner:
         map_env=m,
         start=START,
         goal=GOAL,
-        n_angles=N_ANGLES,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
         g=config.G_ACCEL,
@@ -69,6 +67,7 @@ def make_planner(m: Map2D5, disable_clearance: bool) -> HoppingAStarPlanner:
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_scan_step=config.HOP_SCAN_STEP,
+        hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
         disable_clearance=disable_clearance,
     )
 
