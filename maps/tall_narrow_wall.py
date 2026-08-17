@@ -45,7 +45,7 @@ import config
 from map2d5 import Map2D5
 
 
-WALL_HEIGHT = 1.40   # m — terrain elevation of the narrow ridge (calibrated; see above)
+WALL_HEIGHT = 0.50   # m — terrain elevation of the narrow ridge (calibrated; see above)
 WALL_XMIN   = 2.3    # m
 WALL_XMAX   = 2.7    # m
 WALL_YMIN   = 0.8    # m
