@@ -269,10 +269,10 @@ The cone closes the largest one from `alpha_range_old.md`. Still assumed, not ve
   landing orientation constraint (2) asks for, at no energy cost.
 * **μ is uniform over the environment**, as in the paper. Per-cell friction would slot in
   wherever `self.mu` is read, without touching the interval math.
-* **Normals are per-cell, not per-contact-patch.** `FOOT_TIP_RADIUS` (0.02 m) is well under
-  `CELL_RESOLUTION` (0.1 m), so a foot-sized plane fit would collapse to the single-cell
-  case anyway — but this is what makes the min-|slope| choice a modelling decision rather
-  than an approximation of something better-defined.
+* **Normals are per-cell, not per-contact-patch.** The physical foot's contact patch
+  (a few cm across) is well under `CELL_RESOLUTION` (0.1 m), so a foot-sized plane fit
+  would collapse to the single-cell case anyway — but this is what makes the min-|slope|
+  choice a modelling decision rather than an approximation of something better-defined.
 
 ---
 

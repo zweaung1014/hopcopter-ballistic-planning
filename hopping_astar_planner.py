@@ -43,22 +43,27 @@ The robot's center of mass (the point the parabola actually tracks) sits
 `terrain_z + leg_length`, and terrain is sampled across the body's full width,
 not just along the centreline.
 
-Collision geometry is a capsule from the foot to the CoM with three
-independently-sized regions, not one uniform radius:
+Collision geometry is a single uniform vertical cylinder, radius `robot_radius`,
+spanning the foot to the top of the body (`leg_length + robot_radius` above the
+foot) — not a multi-region capsule. There is only one radius now, but flight
+clearance still reads TWO precomputed inflated fields built from it
+(`_inflated_foot`, tapered; `_inflated_com`, untapered) — an untapered field
+alone cannot enforce the safety-margin gate near the ground (it reports zero
+lift over flat terrain, so it can't tell "just clear" from "clear by the full
+gate"), and a tapered field alone cannot cheaply tell "flat ground" from "real
+obstacle" (it always shows some lift, even over nothing). See
+`clearance_floor_alpha`'s docstring for the exact roles.
 
-  * `robot_radius` — the CoM sphere (the robot's actual body, the widest part);
-  * `leg_radius` — the leg-cylinder sides (much thinner than the body);
-  * `foot_radius` — the hemispherical foot tip (slightly fatter than the leg).
-
-  * **Stance** (`Map2D5.standable_mask`): sphere at CoM (`robot_radius`) + upper
-    `1 - frac` of the leg-cylinder sides (`leg_radius`). Bottom `frac` (default
-    1/3) is exempt so that modest graded slopes stay standable. No foot-tip
-    component at stance — the foot is on the ground by definition.
-  * **Flight** (`terrain_profile` / `clearance_for_alpha`): the full capsule —
-    sphere (top hemisphere, `robot_radius`) + full cylinder (`leg_radius`) +
-    bottom hemisphere at the foot (`foot_radius`), so terrain directly under
-    the foot must clear the foot tip by `foot_radius + min_clearance_gate`.
-    Endpoints (u=0, u=X) are stance configurations and are masked out;
+  * **Stance** (`Map2D5.standable_mask`): is the foot's own cell clear of
+    everything within `robot_radius + min_clearance_gate`? Reuses
+    `_inflated_com`'s exact field (same radius, same untapered form) — its own
+    reference height is the CoM, not the foot, so there is no near-ground cap
+    region to round off and the untapered form alone suffices.
+  * **Flight** (`clearance_floor_alpha`, the closed-form fast path; `terrain_profile`
+    / `clearance_for_alpha` survive as the sample-by-sample reference
+    implementation `test/test_inflated_field.py` validates it against):
+    same two-field test, evaluated along the arc's centreline at each interior
+    sample. Endpoints (u=0, u=X) are stance configurations and are masked out;
     `standable_mask` gates them.
 
 Clearance is a hard feasibility gate (`min_clearance_gate`), not a cost term:
@@ -688,10 +693,9 @@ class ArcProfile(NamedTuple):
     candidate angles reuse one terrain lookup (see `alpha_for_clearance`).
 
     Terrain is stored **per (u, lateral offset) sample** — no max collapse —
-    because the capsule clearance check needs both the lateral offset `r` and
-    the terrain height at that offset. Collapsing to max terrain per `u`
-    (as the old sphere-only check did) throws away `r` and cannot express the
-    foot bottom-cap.
+    because the clearance check needs both the lateral offset `r` and the
+    terrain height at that offset. Collapsing to max terrain per `u` throws
+    away `r` and cannot express the foot bottom-cap.
     """
     u: np.ndarray            # horizontal traversal samples, shape (n_u,)
     terrain: np.ndarray      # bilinear terrain, shape (n_u, n_lateral)
@@ -699,9 +703,7 @@ class ArcProfile(NamedTuple):
     X: float                 # horizontal hop distance
     Z: float                 # terrain elevation change, z_g - z_s
     z_s: float               # CoM height at takeoff = terrain + leg_length
-    com_radius: float        # CoM sphere radius (the robot's actual body)
-    leg_radius: float        # leg-cylinder sides radius (thin)
-    foot_radius: float       # foot-tip hemisphere radius (slightly fatter than leg)
+    radius: float            # the robot's single collision-cylinder radius
     leg_length: float        # CoM height above the foot; foot_h = z_arc - L
     min_clearance_gate: float  # the gate the caller will compare mc against;
                                # used by clearance_for_alpha to size the
@@ -714,9 +716,7 @@ def terrain_profile(
     c_s: tuple[float, float, float],
     c_g: tuple[float, float, float],
     height_map: Map2D5,
-    com_radius: float,
-    leg_radius: float,
-    foot_radius: float,
+    radius: float,
     leg_length: float,
     max_step: float,
     obstacle_fill: float,
@@ -728,13 +728,10 @@ def terrain_profile(
     Marches the closed interval `u in [0, X]` in steps of
     `min(max_step, height_map.resolution / 3)`, so terrain is sampled at least
     ~3x per grid cell. At each `u`, `n_lateral` points spanning
-    `[-(r_max + min_clearance_gate), +(r_max + min_clearance_gate)]`
-    perpendicular to travel are sampled, where `r_max = max(com_radius,
-    leg_radius, foot_radius)` — the CoM sphere in practice, since it's the
-    widest part (`config.py` asserts `ROBOT_RADIUS` is the largest of the
-    three). Terrain values are kept per-sample (no max collapse) because the
-    capsule clearance check needs each sample's lateral offset independently
-    — see `clearance_for_alpha`.
+    `[-(radius + min_clearance_gate), +(radius + min_clearance_gate)]`
+    perpendicular to travel are sampled. Terrain values are kept per-sample
+    (no max collapse) because the clearance check needs each sample's lateral
+    offset independently — see `clearance_for_alpha`.
 
     The corridor half-width includes `min_clearance_gate` (not just `r_max`)
     so that terrain in the safety-margin band around the body is also
@@ -780,7 +777,7 @@ def terrain_profile(
                | (cy < 0.0) | (cy >= height_map.size_y))
     )
 
-    corridor_half_width = max(com_radius, leg_radius, foot_radius) + min_clearance_gate
+    corridor_half_width = radius + min_clearance_gate
     if n_lateral <= 1:
         offsets = np.zeros(1)
     else:
@@ -799,9 +796,7 @@ def terrain_profile(
         X=X,
         Z=t_g - t_s,
         z_s=t_s + leg_length,
-        com_radius=com_radius,
-        leg_radius=leg_radius,
-        foot_radius=foot_radius,
+        radius=radius,
         leg_length=leg_length,
         min_clearance_gate=min_clearance_gate,
         out_of_bounds=out_of_bounds,
@@ -811,42 +806,32 @@ def terrain_profile(
 def clearance_for_alpha(profile: ArcProfile, alpha_s: float) -> float:
     """Minimum body-to-terrain clearance over a profile at one takeoff angle.
 
-    Models the robot in flight as a **capsule** with axis from the foot
-    (`foot_h = arc_z - leg_length`) to the CoM (`arc_z = z_arc`), covering
-    three collision regions, each with its own radius:
-
-      * top hemisphere at the CoM, radius `com_radius` — the robot's actual
-        body, the widest part;
-      * cylinder sides along the leg, radius `leg_radius` — much thinner;
-      * bottom hemisphere at the foot, radius `foot_radius` — ensures terrain
-        directly under the foot must clear the foot tip by
-        `foot_radius + clearance`, not just `clearance`.
+    Models the robot in flight as a single uniform-radius **cylinder**, radius
+    `profile.radius`, with axis from the foot (`foot_h = arc_z - leg_length`)
+    to the top of the body — not a multi-region capsule, but still two
+    distinct nearest-point geometries depending on where the terrain sample
+    falls relative to the foot, exactly as the old capsule model had (just
+    with one radius instead of three):
 
     Terrain is treated as a solid column (pillar) from the ground up to
-    `h_terr`, the same convention `Map2D5.standable_mask` uses for its sphere
-    check. For two vertical bars (the terrain pillar at offset `r` and the
-    capsule's axis segment at offset 0), the distance between them is a
-    geometry fact: if their height ranges overlap at all, the closest points
-    are at the same height, so the distance is purely horizontal (`|r|`);
-    only a genuine vertical gap (the pillar too short to reach the segment)
-    produces a diagonal distance. Concretely, for a terrain sample at lateral
-    offset `r` (signed) and height `h_terr`:
+    `h_terr`, the same convention `Map2D5.standable_mask` uses. For a terrain
+    sample at lateral offset `r` (signed) and height `h_terr`:
 
-        h_terr < foot_h            : axis_dist = hypot(r, foot_h - h_terr)
-                                      radius = foot_radius
-                                      (pillar doesn't reach the foot -> a
-                                       real gap -> bottom hemisphere nearest)
-        foot_h <= h_terr <= z_arc  : axis_dist = |r|
-                                      radius = leg_radius
-                                      (pillar overlaps the leg's height range)
-        h_terr > z_arc              : axis_dist = |r|
-                                      radius = com_radius
-                                      (pillar reaches past the CoM -> its
-                                       material is also present at height
-                                       z_arc itself -> top hemisphere nearest)
+        h_terr >= foot_h  : the pillar overlaps the cylinder's height range,
+                             so the closest points are at the same height —
+                             clearance is purely horizontal, `|r| - radius`
+                             (the cylinder's SIDE wall).
+        h_terr < foot_h   : the pillar falls short of the foot -> a genuine
+                             gap, nearest point is the bottom-cap hemisphere
+                             centred AT the foot point, `hypot(r, foot_h -
+                             h_terr) - radius`.
 
-    Capsule clearance is `axis_dist - radius`. The min over all (u, r) samples
-    is what the gate compares against.
+    The min over all (u, r) samples is what the gate compares against. This
+    is also EXACTLY what `Map2D5.inflated_field(radius, taper=True)` computes
+    when queried at the foot's own height (see `clearance_floor_alpha`) — the
+    hemisphere-at-a-point convention, not a more literal "flat cap + rounded
+    rim" shape, is what keeps the two implementations in exact correspondence
+    rather than merely close.
 
     **Endpoint-transition mask**. Under a rigid-vertical-leg flight model,
     samples near u=0 and u=X have foot_h very close to the endpoint terrain
@@ -854,23 +839,17 @@ def clearance_for_alpha(profile: ArcProfile, alpha_s: float) -> float:
     check would report the foot skimming ground and reject every hop.
     `standable_mask` already validates stance at both endpoints, so this
     function masks samples where the sample terrain is at-or-below the taller
-    endpoint AND the foot has not yet risen a full `foot_radius` above that
+    endpoint AND the foot has not yet risen a full `radius` above that
     endpoint. Walls (terrain > endpoint_max) are never masked — the arc must
     still clear them meaningfully.
 
     Monotonicity in `tan(α)`: raising α lifts `arc_z(u)` (and therefore
-    `foot_h`) at every interior `u` by the same amount (they're a fixed
-    `leg_length` apart). For a fixed terrain sample, this only ever pushes it
-    in one direction through the three cases above — never backwards — and at
-    each such crossing the radius can only shrink (`com_radius -> leg_radius`,
-    or the pre-existing case where the below-foot `delta` grows), so capsule
-    clearance is monotone nondecreasing in `tan(α)` overall, and
-    `alpha_for_clearance`'s bisection remains valid. The one exception is the
-    exact `h_terr == foot_h` crossing, where the radius switches from
-    `leg_radius` to the (larger) `foot_radius` — a discontinuous, sub-
-    centimeter *decrease* in clearance right at that single crossing, far
-    below `min_clearance_gate` and not worth correcting with true nearest-
-    point-on-cone geometry.
+    `foot_h`) at every interior `u` by the same amount, which only ever moves
+    a fixed terrain sample from the below-foot case toward (never away from)
+    the side-wall case, and clearance is continuous across that crossing (both
+    forms agree at `h_terr = foot_h`, where both reduce to `|r| - radius`) —
+    so overall clearance is monotone nondecreasing in `tan(α)`, and
+    `alpha_for_clearance`'s bisection remains valid.
 
     This is the cheap half of the split: a handful of vectorized ops on an
     array that `terrain_profile` already paid for.
@@ -880,33 +859,28 @@ def clearance_for_alpha(profile: ArcProfile, alpha_s: float) -> float:
     z_arc = _arc_z(profile.u, profile.X, profile.Z, profile.z_s, alpha_s)
     foot_h = z_arc - profile.leg_length  # shape (n_u,)
     # below_foot > 0 -> terrain below the foot (bottom-cap region);
-    # below_foot <= 0 -> terrain reaches foot height or above (leg / CoM region).
+    # below_foot <= 0 -> terrain reaches foot height or above (side-wall region).
     below_foot = foot_h[:, None] - profile.terrain  # shape (n_u, n_lateral)
-    above_com = profile.terrain - z_arc[:, None]    # > 0 -> terrain above the CoM
     r_abs = np.abs(profile.offsets)[None, :]        # shape (1, n_lateral)
     axis_dist = np.where(
         below_foot > 0.0,
         np.hypot(r_abs, below_foot),
-        r_abs + np.zeros_like(below_foot),  # broadcast to full shape
+        r_abs + np.zeros_like(below_foot),
     )
-    radius = np.where(
-        below_foot > 0.0, profile.foot_radius,
-        np.where(above_com > 0.0, profile.com_radius, profile.leg_radius),
-    )
-    capsule_clearance = axis_dist - radius
+    capsule_clearance = axis_dist - profile.radius
     # Endpoint-transition mask. Near takeoff and landing the rigid-vertical-leg
     # model reports the foot grazing endpoint terrain (foot_h ≈ terrain → tiny
-    # below_foot → tiny axis_dist → spurious fail). `standable_mask` has
+    # below_foot → tiny cap_clearance → spurious fail). `standable_mask` has
     # already validated stance there. Mask samples where BOTH:
     #   (a) the terrain at this sample is at or below the taller endpoint's
     #       terrain — so this isn't a wall, and
-    #   (b) the foot has not yet risen a full `foot_radius + gate` above the
+    #   (b) the foot has not yet risen a full `radius + gate` above the
     #       taller endpoint's terrain — so we're still in the takeoff/landing
     #       transition where the real leg is retracted, not extended.
     # The `+ gate` term is what stops mc from stalling at the mask boundary:
-    # without it, the first sample past `foot_h = endpoint_max + foot_radius`
-    # would give `capsule_clear ≈ 0 < gate` and drag mc down to zero regardless
-    # of what the real flight-portion of the arc looks like.
+    # without it, the first sample past `foot_h = endpoint_max + radius` would
+    # give `capsule_clear ≈ 0 < gate` and drag mc down to zero regardless of
+    # what the real flight-portion of the arc looks like.
     # Walls (terrain above endpoint_max) are never masked — the arc must
     # actually clear them. Endpoint rows (u=0, u=X) are subsumed by this mask
     # because `foot_h = t_s` and `foot_h = t_g` there.
@@ -914,7 +888,7 @@ def clearance_for_alpha(profile: ArcProfile, alpha_s: float) -> float:
     t_g = t_s + profile.Z
     endpoint_max = max(t_s, t_g)
     near_endpoint_terrain = profile.terrain <= endpoint_max + 1e-9
-    lift_threshold = endpoint_max + profile.foot_radius + profile.min_clearance_gate
+    lift_threshold = endpoint_max + profile.radius + profile.min_clearance_gate
     foot_low = (foot_h < lift_threshold)[:, None]
     capsule_clearance = np.where(
         near_endpoint_terrain & foot_low, np.inf, capsule_clearance,
@@ -927,9 +901,7 @@ def min_clearance(
     c_g: tuple[float, float, float],
     alpha_s: float,
     height_map: Map2D5,
-    com_radius: float,
-    leg_radius: float,
-    foot_radius: float,
+    radius: float,
     leg_length: float,
     max_step: float,
     obstacle_fill: float,
@@ -946,7 +918,7 @@ def min_clearance(
     `_arc_z` does not need one.
     """
     profile = terrain_profile(
-        c_s, c_g, height_map, com_radius, leg_radius, foot_radius, leg_length,
+        c_s, c_g, height_map, radius, leg_length,
         max_step, obstacle_fill, n_lateral,
         min_clearance_gate=min_clearance_gate,
     )
@@ -1037,22 +1009,41 @@ def clearance_floor_alpha(
     rejects when `alpha_c` exceeds `alpha_max` — this function knows nothing
     about the energy chain or the friction cones.
 
-    Two facts make this exact rather than a search.
+    Two fields, ONE radius. Both `inflated_foot` and `inflated_com` are built
+    from the same `robot_radius + min_clearance_gate` now (there is only one
+    radius in the model), but they still cannot collapse into a single array,
+    because they answer two different questions:
+
+      * `inflated_com` (`taper=False`) is the cheap, EXACT "is there a real
+        obstacle here at all" detector: an untapered field returns the raw
+        terrain height with no lift added, so flat ground reads back as
+        flat ground. A tapered field cannot serve this role — it always
+        reports a lift of up to a full `radius` even over perfectly flat
+        terrain (`sqrt(radius^2 - 0^2) = radius` directly overhead), which
+        would flag every hop over open ground as "constrained."
+      * `inflated_foot` (`taper=True`) is what actually prices a genuine
+        obstacle once one is detected, matching `clearance_for_alpha`'s
+        bottom-cap hemisphere exactly (see its docstring) — required because
+        the untapered field alone does not enforce the safety-margin GATE
+        near the ground: it only asks "is the foot below this terrain," with
+        no minimum standoff, which is loose enough to fail
+        `test/test_inflated_field.py`'s never-more-permissive sweep.
+
+    Two facts make the rest of this exact rather than a search.
 
     **The robot is a point.** `Map2D5.inflated_field` has already baked the
-    body's radii into the terrain, so the whole capsule test collapses to one
-    scalar comparison per sample, against
+    body's radius into the terrain, so the whole cylinder test collapses to
+    one scalar comparison per sample, against
 
-        H(u) = max( inflated_foot(u),  inflated_com(u) - leg_length )
+        H(u) = inflated_foot(u)
 
-    `inflated_foot` carries the Pythagoras taper (the foot tip is a sphere);
-    `inflated_com` does not, because `clearance_for_alpha`'s above-the-CoM
-    branch treats such terrain as a full-height column. The leg-cylinder band
-    needs no field of its own: `foot_radius + gate` exceeds `leg_radius + gate`
-    at any sane geometry, so the foot field already forces terrain below the
-    foot everywhere the leg check could fire. Only the CENTRELINE is sampled —
-    the body's width is in the field, not in the sampling pattern, which is
-    what removes the old `n_lateral` rake and its 15 cm gaps.
+    and the hop clears at `u` iff `foot_h(u) >= H(u)`. That single comparison
+    is EXACTLY the reference two-branch test in `clearance_for_alpha` — terrain
+    below the foot needs `hypot(d, foot_h - h) >= radius + gate` (which is what
+    the tapered field's `h + sqrt(R^2 - d^2)` bound encodes), and terrain at or
+    above the foot needs `d >= radius + gate` (which the same bound gives, since
+    the lift is then `>= 0` on top of an already-too-high `h`). Verified by
+    brute force against the reference, not assumed.
 
     **Arc height is linear in `tan(alpha)`.** From `_arc_z`, with the leg offset
     cancelled out so `foot_h(0) = t_s`,
@@ -1070,14 +1061,15 @@ def clearance_floor_alpha(
     **The endpoint exemption**, which the old code expressed as an
     alpha-dependent mask, becomes alpha-FREE here: a sample whose terrain is at
     or below `max(t_s, t_g)` can never reject the hop. Either the old mask
-    covered it, or the foot had already risen a full `foot_radius + gate` above
-    it, which puts it in the bottom-cap branch with clearance to spare. So only
+    covered it, or the foot had already risen a full `radius + gate` above it,
+    which puts it in the bottom-cap branch with clearance to spare. So only
     terrain strictly above BOTH endpoints constrains anything — tested as
-    `inflated_com(u) > max(t_s, t_g)`, which holds exactly when some terrain
-    within the CoM reach of `u` is above that height. Consequence worth
-    knowing: a hop up onto a step, or down off one, is unconstrained by
-    clearance no matter how big the step, because nothing en route is above both
-    ends. Only genuine walls bite.
+    `inflated_com(u) > max(t_s, t_g)`, using the untapered field specifically
+    because it is the one that reads back as exactly the raw terrain height
+    with no artificial lift, so flat ground never registers as "active."
+    Consequence worth knowing: a hop up onto a step, or down off one, is
+    unconstrained by clearance no matter how big the step, because nothing en
+    route is above both ends. Only genuine walls bite.
 
     `u = 0` and `u = X` are excluded (zero denominator). They are stance
     configurations, and `Map2D5.standable_mask` gates them — the same division of
@@ -1127,7 +1119,11 @@ def clearance_floor_alpha(
     np.clip(ri, 0, height_map.rows - 1, out=ri)
 
     f_com = inflated_com[ri, ci]
-    H = np.maximum(inflated_foot[ri, ci], f_com - leg_length)
+    # `inflated_foot` alone IS the height bound: it is provably >= `inflated_com`
+    # pointwise (same radius, same reach, non-negative taper lift), so a
+    # `max(inflated_foot, inflated_com - leg_length)` would never pick the second
+    # term. `inflated_com` is used ONLY for the `active` mask below.
+    H = inflated_foot[ri, ci]
 
     # Only terrain above BOTH endpoints can reject the hop — see the docstring.
     active = f_com > max(t_s, t_g)
@@ -1230,20 +1226,11 @@ class HoppingAStarPlanner:
         # only, like `disable_clearance`; the Eq. 4 and leg-energy gates stay.
         mu: float | None = 1.2,
         robot_radius: float = 0.15,
-        leg_radius: float = 0.01,
-        foot_radius: float = 0.02,
         leg_length: float = 0.4,
         min_clearance_gate: float = 0.15,
         arc_max_step: float = 0.05,
         n_lateral: int = 3,
         obstacle_wall_extra: float = 1.5,
-        # Fraction of `leg_length` (measured from the foot upward) that the
-        # stance-time leg-cylinder-sides check ignores. The bottom `frac` of
-        # the leg is exempt from the check so that graded slopes stay standable
-        # (a rigid vertical leg would otherwise reject every uphill neighbour
-        # inside `leg_radius + min_clearance_gate`). See
-        # `Map2D5.standable_mask` for the max-grade derivation.
-        leg_clearance_start_frac: float = 1.0 / 3.0,
         # Lattice spacing of the scanline circle-fill that generates candidate
         # landing cells, in world metres, AT the reference radius
         # `hop_scan_step_ref_radius` below — not a flat spacing at every
@@ -1309,13 +1296,10 @@ class HoppingAStarPlanner:
         self.V_max = V_max
         self.mu = mu
         self.robot_radius = robot_radius
-        self.leg_radius = leg_radius
-        self.foot_radius = foot_radius
         self.leg_length = leg_length
         self.min_clearance_gate = min_clearance_gate
         self.arc_max_step = arc_max_step
         self.n_lateral = n_lateral
-        self.leg_clearance_start_frac = leg_clearance_start_frac
         self.hop_scan_step = hop_scan_step
         self.hop_scan_step_ref_radius = hop_scan_step_ref_radius
         self.disable_clearance = disable_clearance
@@ -1353,8 +1337,7 @@ class HoppingAStarPlanner:
         # against this catches body-vs-terrain overlap for ~1us instead of
         # discovering the same collision by marching a whole arc.
         self._standable = map_env.standable_mask(
-            robot_radius, leg_radius, min_clearance_gate, leg_length,
-            leg_clearance_start_frac=leg_clearance_start_frac,
+            robot_radius, min_clearance_gate, leg_length,
         )
 
         # Per-cell outward surface normals, for the friction cone at both
@@ -1363,10 +1346,21 @@ class HoppingAStarPlanner:
 
         # Terrain inflated by the body, so the flight-clearance check can treat
         # the robot as a POINT (see `Map2D5.inflated_field` and
-        # `clearance_floor_alpha`). Two fields, because the capsule's regions
-        # have different radii AND different shapes: the foot tip is a sphere
-        # (tapered), while terrain above the CoM is treated as a full-height
-        # column by the reference check, so its field must NOT taper.
+        # `clearance_floor_alpha`). Two fields, ONE radius now — both built
+        # from `robot_radius + min_clearance_gate`, unlike the old capsule
+        # model's two different radii, but they still don't collapse into one
+        # array: `_inflated_com` (untapered) is the exact "is there a real
+        # obstacle at all" detector (a tapered field always shows a lift even
+        # over flat ground), and `_inflated_foot` (tapered) is what correctly
+        # enforces the safety-margin gate once an obstacle is found — an
+        # untapered-only check does not enforce any minimum standoff near the
+        # ground, which fails `test/test_inflated_field.py`'s never-more-
+        # permissive sweep. `standable_mask` above only needs the untapered
+        # form (its own reference height is the CoM, `leg_length` above the
+        # foot, not the foot itself, so there is no analogous near-ground cap
+        # region to round off) and reuses `_inflated_com`'s exact args, so it
+        # costs nothing extra: `inflated_field` memoises on `(radius, taper,
+        # lookup_pad)`.
         #
         # This is what replaced per-hop terrain sampling. A profile was keyed on
         # a cell PAIR (~7M of them, hence a 60k FIFO cache running at a 17-34%
@@ -1374,7 +1368,7 @@ class HoppingAStarPlanner:
         # are keyed on a cell, so all 2500 answers are computed here, once, in
         # well under a millisecond.
         self._inflated_foot = map_env.inflated_field(
-            foot_radius + min_clearance_gate, taper=True,
+            robot_radius + min_clearance_gate, taper=True,
         )
         self._inflated_com = map_env.inflated_field(
             robot_radius + min_clearance_gate, taper=False,

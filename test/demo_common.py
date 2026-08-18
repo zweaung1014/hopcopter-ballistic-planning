@@ -190,8 +190,6 @@ def make_planner(
         V_max=V_max,
         mu=config.MU,
         robot_radius=config.ROBOT_RADIUS,
-        leg_radius=config.LEG_CYLINDER_RADIUS,
-        foot_radius=config.FOOT_TIP_RADIUS,
         mass=config.ROBOT_MASS,
         eta=config.ETA_HOP,
         e_inject_max=config.E_INJECT_MAX,
@@ -204,7 +202,6 @@ def make_planner(
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
-        leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_scan_step=config.HOP_SCAN_STEP,
         hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
         disable_clearance=disable_clearance,
@@ -299,7 +296,7 @@ def diagnose_edge(
         return infeasible
     profile = terrain_profile(
         (p0[0], p0[1], z0), (p1[0], p1[1], z1),
-        m, planner.robot_radius, planner.leg_radius, planner.foot_radius, planner.leg_length,
+        m, planner.robot_radius, planner.leg_length,
         planner.arc_max_step, planner._obstacle_fill, planner.n_lateral,
         min_clearance_gate=planner.min_clearance_gate,
     )
@@ -499,7 +496,7 @@ def enumerate_ring_candidates(
             continue
 
         profile = terrain_profile(
-            c_s, c_g, m, planner.robot_radius, planner.leg_radius, planner.foot_radius, planner.leg_length,
+            c_s, c_g, m, planner.robot_radius, planner.leg_length,
             planner.arc_max_step, obs, planner.n_lateral,
         )
         gate = planner.min_clearance_gate

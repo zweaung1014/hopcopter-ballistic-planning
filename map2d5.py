@@ -185,103 +185,28 @@ class Map2D5:
 
     def standable_mask(
         self,
-        com_radius: float,
-        leg_radius: float,
+        radius: float,
         clearance: float,
         leg_length: float,
-        leg_clearance_start_frac: float = 1.0 / 3.0,
     ) -> np.ndarray:
         """Boolean grid of cells where the robot can stand without clipping terrain.
 
-        The body has two collision components at stance, each with its own
-        radius:
-
-          * a sphere of `com_radius` centred at `center_z = grid[r, c] +
-            leg_length` (the CoM the ballistic arc tracks);
-          * the SIDES of the leg cylinder from `foot_z + leg_length * frac` up
-            to `center_z`, radius `leg_radius`, where `foot_z = grid[r, c]` and
-            `frac = leg_clearance_start_frac`. The BOTTOM `frac` of the leg is
-            deliberately exempt from the check — the foot is on the ground by
-            definition, and without an exempt slab any rigid-vertical-leg model
-            would condemn every graded slope. No bottom cap (no cap either at
-            the exempt-zone top): this is `open` cylinder sides, so terrain
-            below the exempt threshold does not fire the leg constraint.
-
-        A cell is standable iff every terrain point around it stays at least
-        `clearance` from BOTH components.
-
-        Sphere distance (unchanged from the point-mass calc): for a terrain
-        column at horizontal distance `d` with top at height `h`,
-
-            d                       when h >= center_z
-            hypot(d, center_z - h)  otherwise
-
-        Leg-cylinder-sides distance: only fires when the column top rises into
-        the checked zone (`h >= foot_z + leg_length * frac`). When it does, the
-        column has points at horizontal distance `d` inside the cylinder's
-        z-range, so the distance to the leg axis is exactly `d`; below the
-        exempt threshold the leg check is skipped (return `+inf`).
-
-        Combined margin = min(sphere_dist - com_radius, leg_dist - leg_radius).
-        Cell is standable iff that combined margin is `>= clearance` at every
-        relevant offset — taking the min of the two independently-adjusted
-        margins (rather than combining raw distances first) is what lets the
-        two components carry different radii while still correctly reporting
-        a collision if *either* one is too close.
-
-        Max standable constant grade: the leg-cylinder-sides ceiling is
-        `(L * frac) / (leg_radius + clearance)`, and the CoM-sphere-alone
-        ceiling is `sqrt((L / (com_radius + clearance))^2 - 1)`; the tighter
-        of the two governs. See `config.py`'s `LEG_CLEARANCE_START_FRAC`
-        comment for the shipped values. Anything steeper than the tighter
-        ceiling is un-standable everywhere under the rigid-vertical-leg model.
-
-        Only offsets closer than `max(com_radius, leg_radius) + clearance` can
-        ever fail (beyond that even an infinitely tall column is far enough
-        away), so the neighbourhood is bounded by that. OBSTACLE columns are
-        treated as infinitely tall. Off-map neighbours are ignored.
+        The robot's single collision cylinder (radius `radius`, foot to top of
+        body) is standable at a cell iff its bottom (the foot, at the cell's own
+        terrain height) clears every nearby terrain column within `radius +
+        clearance` — exactly the same test `clearance_floor_alpha` runs during
+        flight, evaluated at standing height. So this is just
+        `inflated_field` read at `grid + leg_length`, not a bespoke geometry
+        calculation: `inflated_field` memoises on `(radius, taper, lookup_pad)`,
+        so calling it with the same `radius + clearance, taper=False` the
+        planner already built for flight clearance hits that cache rather than
+        recomputing anything.
 
         Computed once per planner. Screening landing cells against this is far
         cheaper than discovering the same collision by marching an arc.
         """
-        reach = max(com_radius, leg_radius) + clearance
-        r_cells = int(math.ceil(reach / self.resolution))
-
-        filled = np.where(self.grid == self.OBSTACLE, np.inf, self.grid)
-
-        pad = max(r_cells, 1)
-        padded = np.full((self.rows + 2 * pad, self.cols + 2 * pad), -np.inf)
-        padded[pad:pad + self.rows, pad:pad + self.cols] = filled
-
-        center_z = self.grid + leg_length
-        # Top of the exempt slab — any neighbour column whose top rises above
-        # this triggers the leg-cylinder-sides check.
-        leg_exempt_top = self.grid + leg_length * leg_clearance_start_frac
-        min_margin = np.full(self.grid.shape, np.inf)
-
-        for dr in range(-r_cells, r_cells + 1):
-            for dc in range(-r_cells, r_cells + 1):
-                d = math.hypot(dr, dc) * self.resolution
-                if d >= reach:
-                    continue  # too far to matter, however tall
-                h = padded[pad + dr:pad + dr + self.rows,
-                           pad + dc:pad + dc + self.cols]
-                # Sphere at CoM.
-                sphere_dist = np.where(
-                    h >= center_z,
-                    d,
-                    np.hypot(d, center_z - np.where(np.isneginf(h), center_z, h)),
-                )
-                # Leg cylinder sides (open, upper `1 - frac` of leg). Only fires
-                # when the column top rises into the checked zone; otherwise
-                # `+inf` so it never becomes the minimum.
-                leg_dist = np.where(h >= leg_exempt_top, d, np.inf)
-                margin = np.minimum(sphere_dist - com_radius, leg_dist - leg_radius)
-                # Off-map neighbours (-inf) impose no constraint.
-                margin = np.where(np.isneginf(h), np.inf, margin)
-                min_margin = np.minimum(min_margin, margin)
-
-        return (min_margin >= clearance) & (self.grid != self.OBSTACLE)
+        field = self.inflated_field(radius + clearance, taper=False)
+        return (field <= self.grid + leg_length) & (self.grid != self.OBSTACLE)
 
     def inflated_field(
         self,
@@ -336,13 +261,12 @@ class Map2D5:
         Memoised on `(radius, taper, lookup_pad)` and dropped by
         `_invalidate_caches`, like `surface_normals`.
 
-        Note `standable_mask` is this same object evaluated at standing height:
-        `inflated_field(com_radius + clearance) <= grid + leg_length` reproduces
-        it exactly on the whole map deck (asserted in
-        `test/test_inflated_field.py`). It is kept as a separate implementation
-        because it is computed once per planner and costs nothing, so merging
-        them would be risk without payoff — but if the two ever disagree, this
-        is why.
+        Note `standable_mask` is now literally a thin wrapper over this method,
+        evaluated at standing height:
+        `inflated_field(radius + clearance, taper=False) <= grid + leg_length`.
+        It used to be a separate implementation; `test/test_inflated_field.py`
+        still pins the two together so that reintroducing bespoke geometry
+        there shows up as a failure.
         """
         if lookup_pad is None:
             lookup_pad = self.resolution * math.sqrt(2.0) / 2.0

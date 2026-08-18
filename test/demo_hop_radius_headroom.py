@@ -84,7 +84,7 @@ def classify_gate(planner, m, p0, p1, v_g_in) -> str:
 
     profile = terrain_profile(
         (p0[0], p0[1], z0), (p1[0], p1[1], nz), m,
-        planner.robot_radius, planner.leg_radius, planner.foot_radius,
+        planner.robot_radius,
         planner.leg_length, planner.arc_max_step, planner._obstacle_fill,
         planner.n_lateral, min_clearance_gate=planner.min_clearance_gate,
     )

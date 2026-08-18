@@ -74,8 +74,6 @@ TAKEOFF_XS = [1.1, 1.4, 1.9, 2.4]  # sweep values, closer -> shorter X
 G = config.G_ACCEL
 V_MAX = config.V_MAX
 ROBOT_R = config.ROBOT_RADIUS
-LEG_R = config.LEG_CYLINDER_RADIUS
-FOOT_R = config.FOOT_TIP_RADIUS
 LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
@@ -143,7 +141,7 @@ def main() -> int:
             continue
         alpha_min, alpha_max = iv
         profile = terrain_profile(
-            c_s, c_g, m, ROBOT_R, LEG_R, FOOT_R, LEG, MAX_STEP, obs_fill,
+            c_s, c_g, m, ROBOT_R, LEG, MAX_STEP, obs_fill,
             config.ARC_LATERAL_SAMPLES,
             min_clearance_gate=GATE,
         )

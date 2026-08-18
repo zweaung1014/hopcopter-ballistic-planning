@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — collision geometry is a single uniform cylinder, not a 3-radius capsule
+
+The robot's collision volume was a capsule with three independently-sized
+regions (a CoM sphere `ROBOT_RADIUS`=0.15 m, a thin leg cylinder
+`LEG_CYLINDER_RADIUS`=0.01 m, a foot-tip hemisphere `FOOT_TIP_RADIUS`=0.02 m),
+a bespoke two-component stance check (`Map2D5.standable_mask`, with a
+`LEG_CLEARANCE_START_FRAC` exemption for the thin leg near the ground), and
+three-way height-banded logic in the flight reference check
+(`terrain_profile`/`clearance_for_alpha`). Judged over-engineered relative to
+what it bought; replaced with one uniform vertical cylinder, radius
+`ROBOT_RADIUS` alone, spanning the foot to the top of the body.
+
+- **`LEG_CYLINDER_RADIUS`, `FOOT_TIP_RADIUS`, `LEG_CLEARANCE_START_FRAC`
+  removed from `config.py`** and from every function signature that took them
+  (`HoppingAStarPlanner.__init__`, `Map2D5.standable_mask`, `ArcProfile`,
+  `terrain_profile`, `clearance_for_alpha`, `min_clearance`).
+- **`Map2D5.standable_mask` collapses from a ~90-line two-component margin
+  computation to a two-line wrapper around `Map2D5.inflated_field`** — stance
+  is now just "is the foot's own cell clear of everything within
+  `ROBOT_RADIUS + MIN_CLEARANCE`," reusing the exact field flight clearance
+  already builds (same memoisation key), rather than a separate geometry
+  calculation.
+- **Flight clearance still reads two precomputed fields, not one**, even
+  though there is only one radius now: `_inflated_com` (untapered) is the
+  exact "is there a real obstacle here at all" detector — an untapered field
+  reads back as the raw terrain height with no lift, so flat ground never
+  registers as an obstacle — while `_inflated_foot` (tapered) is what actually
+  enforces the safety-margin gate near the ground, because the untapered form
+  alone imposes no minimum standoff there. This was discovered, not assumed:
+  an initial single-field version passed `plan()` smoke tests but failed
+  `test/test_inflated_field.py`'s never-more-permissive sweep outright (27-
+  1403 violations per map) before being corrected.
+- **Max standable grade rises from ~0.88 to ~1.33** (`LEG_LENGTH /
+  (ROBOT_RADIUS + MIN_CLEARANCE)`, verified numerically against
+  `standable_mask`, not just by formula) — a flat cylinder has no lateral
+  taper the way the old CoM sphere did, so at a fixed radius it is *less*
+  restrictive in this comparison, not more. No shipped map is affected (the
+  steepest, `maps/slope_crest.py`, ships at grade 0.35), but it is a real,
+  intentional widening of what counts as standable.
+- **`OBSTACLE_WALL_EXTRA`'s binding-case formula** changes from
+  `LEG_LENGTH + MAX_APEX_HEIGHT - FOOT_TIP_RADIUS - MIN_CLEARANCE` to
+  `LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE` = 2.85 m; the
+  shipped constant (3.1 m) already clears it, so no value changed, just the
+  formula and the assert that checks it.
+- **The `LEG_LENGTH - ROBOT_RADIUS > MIN_CLEARANCE` assert is gone.** It
+  guarded a sphere-specific failure mode (the CoM sphere's rounded underside
+  clipping its own foot's ground contact); a flat-capped cylinder's bottom
+  sits exactly at the foot's height by construction, contributing zero
+  self-lift regardless of `ROBOT_RADIUS`, so that failure mode no longer
+  exists.
+- **`test/test_clearance_rejection.py`'s `PILLAR_H` recalibrated a third time**
+  (0.9 → 0.45 → 1.6 → 1.2), for the same reason as the two prior
+  recalibrations documented in that file: the bottom-cap region's effective
+  radius changed (this time from `FOOT_TIP_RADIUS`=0.02 m to the full
+  `ROBOT_RADIUS`=0.15 m), which changes exactly which takeoff distances clear
+  a fixed-height pillar.
+- **`test/test_inflated_field.py` rewritten**: `check_com_field_must_not_taper`
+  and `check_standable_mask_equivalence` (both specific to the old two-shape,
+  two-different-radii distinction) are removed/replaced; the core
+  never-more-permissive and lookup-pad checks carry over, rebuilt around one
+  radius.
+
 ### Changed — candidate landing cells now come from a scanline circle fill, not a ray-search
 
 `_generate_hop_neighbors` sampled candidates with a **polar ray-search**: 16

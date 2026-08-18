@@ -1,10 +1,11 @@
 """The inflated-height-field clearance check must never be more permissive than
-the sample-by-sample capsule check it replaced.
+the sample-by-sample cylinder check it replaced.
 
 `Map2D5.inflated_field` + `clearance_floor_alpha` bake the robot's collision
-geometry into the terrain once, so the planner can treat the robot as a point.
-`terrain_profile` + `clearance_for_alpha` remain in the tree as the REFERENCE
-implementation, and this file is what pins the new path to them.
+geometry (a single uniform vertical cylinder) into the terrain once, so the
+planner can treat the robot as a point. `terrain_profile` + `clearance_for_alpha`
+remain in the tree as the REFERENCE implementation, and this file is what pins
+the new path to them.
 
 The bar is deliberately one-sided. The two are *not* expected to agree
 everywhere, because the reference is approximate in two ways the field version
@@ -42,8 +43,6 @@ from hopping_astar_planner import (
 from map2d5 import Map2D5
 
 ROBOT_R = config.ROBOT_RADIUS
-LEG_R = config.LEG_CYLINDER_RADIUS
-FOOT_R = config.FOOT_TIP_RADIUS
 LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
 RES = config.CELL_RESOLUTION
@@ -78,11 +77,17 @@ def _deck() -> list[tuple[str, Map2D5]]:
     return maps
 
 
-def _fields(m: Map2D5, lookup_pad=None, com_taper=False):
-    """The two fields the planner builds, with the knobs this file regresses."""
+def _fields(m: Map2D5, lookup_pad=None) -> tuple[np.ndarray, np.ndarray]:
+    """The two fields the planner builds, with the knob this file regresses.
+
+    One radius now (`ROBOT_R + GATE`) instead of the old capsule's two, but
+    still two arrays: `taper=True` is the exact "obstacle or not" detector,
+    `taper=False` correctly enforces the safety-margin gate near the ground.
+    See `clearance_floor_alpha`'s docstring for why neither alone suffices.
+    """
     return (
-        m.inflated_field(FOOT_R + GATE, taper=True, lookup_pad=lookup_pad),
-        m.inflated_field(ROBOT_R + GATE, taper=com_taper, lookup_pad=lookup_pad),
+        m.inflated_field(ROBOT_R + GATE, taper=True, lookup_pad=lookup_pad),
+        m.inflated_field(ROBOT_R + GATE, taper=False, lookup_pad=lookup_pad),
     )
 
 
@@ -136,7 +141,7 @@ def _sweep(m: Map2D5, f_foot, f_com, seed: int = 7) -> tuple[int, int, int]:
         alpha = rng.uniform(math.radians(40.0), math.radians(85.0))
 
         prof = terrain_profile(
-            (x0, y0, t_s), (x1, y1, t_g), m, ROBOT_R, LEG_R, FOOT_R, LEG,
+            (x0, y0, t_s), (x1, y1, t_g), m, ROBOT_R, LEG,
             MAX_STEP, OBS_FILL, N_LAT, min_clearance_gate=GATE,
         )
         if prof is None or prof.out_of_bounds:
@@ -159,7 +164,7 @@ def _sweep(m: Map2D5, f_foot, f_com, seed: int = 7) -> tuple[int, int, int]:
 
 def check_never_more_permissive() -> bool:
     """THE assertion: the field check never accepts what the reference rejects."""
-    print("field vs reference capsule check — the field must never be looser\n")
+    print("field vs reference cylinder check — the field must never be looser\n")
     print(f"  {'map':<22}{'compared':>9}{'stricter':>10}{'LOOSER':>9}")
     all_ok = True
     for name, m in _deck():
@@ -175,6 +180,12 @@ def check_lookup_pad_guarantee() -> bool:
     """The field must bound the sphere requirement at any query point, not just
     at cell centres — that is exactly what `lookup_pad` buys.
 
+    Checked against the TAPERED form (not the planner's own `taper=False`
+    field): the pad's job is bounding a rounded body's lift at an arbitrary
+    query point, which only shows up when there is a taper to bound. This is
+    the same geometry guarantee `inflated_field`'s docstring makes for any
+    `radius`, independent of which radius the planner happens to use.
+
     The planner reads the field with a NEAREST-CELL lookup, so a query point can
     sit up to half a cell diagonal from the centre of the cell it reads. The
     guarantee that has to hold is therefore
@@ -188,7 +199,7 @@ def check_lookup_pad_guarantee() -> bool:
     most of those, which would leave the pad looking optional when it is not.
     """
     print("\nlookup_pad — nearest-cell lookups must still bound the true sphere\n")
-    radius = FOOT_R + GATE
+    radius = ROBOT_R + GATE
     reach_cells = int(math.ceil((radius + RES) / RES))
     all_ok = True
     total_unpadded = 0
@@ -239,53 +250,23 @@ def check_lookup_pad_guarantee() -> bool:
     return all_ok
 
 
-def check_com_field_must_not_taper() -> bool:
-    """The CoM field is a COLUMN, not a sphere.
+def check_standable_mask_wraps_inflated_field() -> bool:
+    """`standable_mask` must be exactly `inflated_field` read at standing height.
 
-    `clearance_for_alpha`'s above-the-CoM branch uses `axis_dist = |r|`
-    regardless of how far above the CoM the terrain reaches — i.e. it already
-    treats such terrain as full height. Tapering that field would shave the lift
-    near the edge of the reach and silently over-reject.
-    """
-    print("\nCoM field shape — a taper there over-rejects\n")
-    flat_taper = tapered = 0
-    for _, m in _deck():
-        _, a, _ = _sweep(m, *_fields(m))
-        _, b, _ = _sweep(m, *_fields(m, com_taper=True))
-        flat_taper += a
-        tapered += b
-    ok = tapered > flat_taper
-    print(f"  [{'PASS' if ok else 'FAIL'}] column form rejects {flat_taper} hops "
-          f"the reference accepts; tapered form rejects {tapered} "
-          f"({tapered - flat_taper} more, i.e. strictly worse)")
-    return ok
-
-
-def check_standable_mask_equivalence() -> bool:
-    """`standable_mask` is this same field evaluated at standing height.
-
-    The two are separate implementations — `standable_mask` is computed once per
-    planner and costs nothing, so merging them would be risk without payoff. This
-    pins the equivalence the `inflated_field` docstring claims, so that a change
-    to either one that breaks it is caught here rather than as a mystery path
-    difference.
-
-    The CoM sphere is what governs at shipped values: `LEG_CYLINDER_RADIUS`
-    (0.01 m) is thinner than `CELL_RESOLUTION` (0.1 m), so `standable_mask`'s
-    discretized neighbour search never fires the leg-cylinder-sides check before
-    the sphere check does. Fatten the leg past a cell and this will start
-    failing — correctly, because the field would then need a leg component too.
+    There is no independent geometry left in `standable_mask` to regress against
+    — it IS `inflated_field(radius + clearance, taper=False) <= grid +
+    leg_length`, ANDed with not-OBSTACLE — so this pins the wrapper against a
+    hand-built version of that same expression rather than re-deriving the
+    check from scratch. A future edit that quietly reintroduces bespoke
+    geometry there (rather than calling `inflated_field`) will show up here as
+    the two diverging.
     """
     print("\nstandable_mask == inflated_field at standing height\n")
     all_ok = True
     for name, m in _deck():
-        truth = m.standable_mask(
-            ROBOT_R, LEG_R, GATE, LEG,
-            leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
-        )
-        # Sphere at the CoM -> the tapered form, unlike the planner's column.
-        field = m.inflated_field(ROBOT_R + GATE, taper=True, lookup_pad=0.0)
-        derived = (field <= m.grid + LEG + 1e-12) & (m.grid != Map2D5.OBSTACLE)
+        truth = m.standable_mask(ROBOT_R, GATE, LEG)
+        field = m.inflated_field(ROBOT_R + GATE, taper=False)
+        derived = (field <= m.grid + LEG) & (m.grid != Map2D5.OBSTACLE)
         n_diff = int((truth != derived).sum())
         ok = n_diff == 0
         all_ok &= ok
@@ -297,8 +278,7 @@ def check_standable_mask_equivalence() -> bool:
 def main() -> int:
     all_ok = check_never_more_permissive()
     all_ok &= check_lookup_pad_guarantee()
-    all_ok &= check_com_field_must_not_taper()
-    all_ok &= check_standable_mask_equivalence()
+    all_ok &= check_standable_mask_wraps_inflated_field()
 
     print("\n" + ("ALL PASSED" if all_ok else "SOME FAILED"))
     return 0 if all_ok else 1

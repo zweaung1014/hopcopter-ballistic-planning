@@ -67,12 +67,10 @@ def make_planner(m: Map2D5, **overrides) -> HoppingAStarPlanner:
         e_inject_max=config.E_INJECT_MAX, min_apex=config.MIN_APEX_HEIGHT,
         h_initial=H_STEADY, V_g_max=config.V_G_MAX, speed_bin=config.SPEED_BIN,
         mu=config.MU, robot_radius=config.ROBOT_RADIUS,
-        leg_radius=config.LEG_CYLINDER_RADIUS, foot_radius=config.FOOT_TIP_RADIUS,
         leg_length=config.LEG_LENGTH, min_clearance_gate=config.MIN_CLEARANCE,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         n_lateral=config.ARC_LATERAL_SAMPLES,
         obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
-        leg_clearance_start_frac=config.LEG_CLEARANCE_START_FRAC,
         hop_scan_step=config.HOP_SCAN_STEP,
         hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
     )
@@ -225,15 +223,21 @@ def case_wall_costs_more_than_flat() -> None:
     assert r_flat is not None
     flat_cost, flat_hop = r_flat
 
+    # 0.1 m, down from 0.4 m: the single-cylinder model checks the bottom-cap
+    # region at the full ROBOT_RADIUS (0.15 m) instead of the old capsule's
+    # tiny FOOT_TIP_RADIUS (0.02 m), which makes a much shorter ridge enough to
+    # force a real cost difference — 0.4 m is no longer clearable at all on
+    # this 1 m hop (blocked from ~0.13 m up), while 0.1 m clears with cost
+    # 7.178 against a flat cost of 2.005.
     m = flat_map()
-    m.paint_region(0.4, x_min=1.95, x_max=2.05)   # thin ridge at the midpoint
+    m.paint_region(0.1, x_min=1.95, x_max=2.05)   # thin ridge at the midpoint
     p_wall = make_planner(m)
     r_wall = score_hop(p_wall, 1.5, 2.5, 2.5, 2.5, V_STEADY)
-    assert r_wall is not None, "the robot should still be able to clear a 0.4 m ridge"
+    assert r_wall is not None, "the robot should still be able to clear a 0.1 m ridge"
     wall_cost, wall_hop = r_wall
 
     check(
-        "hopping over a 0.4 m ridge costs more than the same flat hop",
+        "hopping over a 0.1 m ridge costs more than the same flat hop",
         wall_cost > flat_cost,
         f"{wall_cost:.3f} vs {flat_cost:.3f}",
     )

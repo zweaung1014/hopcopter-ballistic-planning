@@ -14,25 +14,26 @@ robot has to climb):
 
 Why the ramp grade is 0.35
 --------------------------
-There is a hard ceiling on how steep a slope this robot can stand on. Its body
-is a sphere of `ROBOT_RADIUS` PLUS the upper `(1 - LEG_CLEARANCE_START_FRAC)`
-of a leg cylinder of the same radius. On a constant grade `g`, the terrain
-`(R + MIN_CLEARANCE)` metres uphill of the foot rises by `g * (R + MIN_CLEARANCE)`.
-The leg-cylinder-sides check kicks in whenever that rise exceeds
-`L * LEG_CLEARANCE_START_FRAC` (the exempt-slab height), so
+There is a hard ceiling on how steep a slope this robot can stand on. Its
+collision volume is a single uniform cylinder of radius `ROBOT_RADIUS`,
+checked at the foot: on a constant grade `g`, the terrain `(R +
+MIN_CLEARANCE)` metres uphill of the foot rises by `g * (R + MIN_CLEARANCE)`,
+and standability fails once that rise reaches `LEG_LENGTH` (a flat cylinder
+has no lateral taper to relax the check the way the old CoM sphere did), so
 
-    g_max = (L * LEG_CLEARANCE_START_FRAC) / (R + MIN_CLEARANCE)
-          = (0.4 * 1/3) / (0.2 + 0.15)
-          ≈ 0.38
+    g_max = LEG_LENGTH / (R + MIN_CLEARANCE)
+          = 0.4 / (0.15 + 0.15)
+          ≈ 1.33
 
-At the shipped geometry anything steeper is un-standable everywhere, and the
-planner returns no path at all. The ramp toe therefore reaches all the way to
-x = 0.0 (spreading the 1.05 m climb over 3.0 m for a 0.35 grade), leaving a
-0.03 slack under the 0.38 ceiling. (`Map2D5.standable_mask` verifies this
-empirically.)
-
-The earlier sphere-only stance model allowed `g_max = 0.553`, so this map used
-to ship at 0.50; the leg-cylinder check tightens the ceiling significantly.
+0.35 is now nowhere near this ceiling — it is kept at its historical value
+because there is no reason to change it, not because it is calibrated against
+a binding constraint any more. (This map's ceiling has moved twice: an earlier
+sphere-only stance model allowed `g_max = 0.553` and this ramp shipped at
+0.50; a later leg-cylinder-sides check tightened it to ~0.38, and the ramp
+dropped to 0.35 to leave slack under THAT ceiling. The single-cylinder model
+raises the ceiling again, past 0.35 by a wide margin, but 0.35 stayed since a
+map at a now-non-binding grade still validates the clearance/friction gates
+that ARE the point of this scenario.)
 
 Why the crest overshoots the shelf
 ----------------------------------
@@ -76,10 +77,10 @@ CREST_X1 = 3.3    # m; end of the flat crest
 TOP_X0   = 3.7    # m; start of the far shelf
 TOP_Z    = 0.20   # m; far shelf elevation (calibrated; see module docstring)
 
-RAMP_GRADE = CREST_Z / (RAMP_X1 - RAMP_X0)   # 0.35 — stays under the 0.38
-                                             # standability ceiling that comes
-                                             # from the leg-cylinder-sides
-                                             # stance check.
+RAMP_GRADE = CREST_Z / (RAMP_X1 - RAMP_X0)   # 0.35 — historical value, well
+                                             # under the current single-
+                                             # cylinder standability ceiling
+                                             # (~1.33); see module docstring.
 
 
 def profile_z(x: float) -> float:

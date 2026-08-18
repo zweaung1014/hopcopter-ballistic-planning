@@ -25,12 +25,6 @@ def draw_arc_side_view(
     *,
     min_clearance_gate: float = 0.15,
     n_lateral: int = 3,
-    # Defaults match config.py's LEG_CYLINDER_RADIUS / FOOT_TIP_RADIUS. Not
-    # threaded from callers (this function still draws one approximate
-    # corridor at `robot_radius`) — only used internally so the authoritative
-    # `min_c` value below matches what the planner's own gate would compute.
-    leg_radius: float = 0.01,
-    foot_radius: float = 0.02,
 ) -> float:
     """Plot the side view (u vs z) of a ballistic hop over the terrain profile.
 
@@ -101,7 +95,7 @@ def draw_arc_side_view(
 
     # Foot tip and bottom-cap envelope. The gate directly under the foot is
     # `robot_radius + min_clearance_gate` below the foot tip, since the
-    # bottom hemisphere of the capsule has radius `robot_radius`. Terrain
+    # robot's single collision cylinder has radius `robot_radius`. Terrain
     # touching the bottom envelope is the tightest thing this dense
     # (max-collapsed) plot can flag.
     z_foot = z_arc - leg_length
@@ -110,7 +104,7 @@ def draw_arc_side_view(
     # Authoritative value from the planner's own function, so the displayed
     # number matches exactly what the A* gate would evaluate.
     profile = terrain_profile(
-        c_s, c_g, height_map, robot_radius, leg_radius, foot_radius, leg_length,
+        c_s, c_g, height_map, robot_radius, leg_length,
         max_step, obstacle_fill, n_lateral,
         min_clearance_gate=min_clearance_gate,
     )

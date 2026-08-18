@@ -49,9 +49,9 @@ python test/test_hop_energy_chain.py    # energy chain: closed forms, alpha boun
 python test/test_edge_cost_energy.py    # energy-based edge cost: the momentum term,
                                         # non-negativity, and the over-a-wall case
 python test/test_inflated_field.py      # the planner's inflated-field clearance check
-                                        # vs. the reference capsule check it replaced:
-                                        # asserts it is never MORE PERMISSIVE, plus
-                                        # the lookup-pad guarantee and the
+                                        # vs. the reference sample-by-sample check it
+                                        # replaced: asserts it is never MORE PERMISSIVE,
+                                        # plus the lookup-pad guarantee and the
                                         # standable_mask equivalence
 
 # Timing/scaling benchmark (ballistic vs. baseline planner on the same scenario)
@@ -103,27 +103,37 @@ sentinel value, not a real elevation. Key methods: `world_to_grid`/`grid_to_worl
 arc in one call, with obstacle cells substituted for a tall "wall" fill value so
 they block arcs instead of producing bilinear artifacts — the substituted grid is
 memoised), `get_elevation_bilinear` (scalar wrapper over it), `set_obstacle_region`,
-`paint_region`, `standable_mask` (sphere-at-CoM, radius `ROBOT_RADIUS`, + upper
-`(1 - LEG_CLEARANCE_START_FRAC)` of the leg cylinder sides, radius
-`LEG_CYLINDER_RADIUS` — at shipped values `LEG_CYLINDER_RADIUS` is thinner than
-`CELL_RESOLUTION`, so in practice the CoM sphere, not the leg-cylinder-sides
-channel, governs the max standable grade, ~1.25 at shipped values),
+`paint_region`, `standable_mask` (is the foot's own cell clear of everything
+within `ROBOT_RADIUS + MIN_CLEARANCE` at standing height — a thin wrapper
+around `inflated_field`, see below, so the max standable grade under this
+model has a plain closed form, `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)`
+≈ 1.33 at shipped values — a flat cylinder has no lateral taper, unlike the
+old sphere-based check it replaced, so it is *less* restrictive at a fixed
+radius, not more),
 `surface_normals` (per-cell outward unit normals for the friction cone; memoised),
 `inflated_field` (terrain inflated by a sphere or column of a given radius, in
 absolute heights — the planner's flight-clearance primitive; memoised).
 
 **`inflated_field` is what makes the robot a POINT.** It answers, per cell, "how
-high must a body of this radius be when passing over here" — so the whole capsule
-test becomes one scalar comparison, and the body's width lives in the map rather
-than in a lateral sampling pattern. Two properties are load-bearing and both are
-regression-tested in `test/test_inflated_field.py`: the `lookup_pad`
+high must a body of this radius be when passing over here" — so the whole
+clearance test becomes one scalar comparison, and the body's width lives in the
+map rather than in a lateral sampling pattern. Two properties are load-bearing
+and both are regression-tested in `test/test_inflated_field.py`: the `lookup_pad`
 (`resolution*sqrt(2)/2`, without which a nearest-cell lookup can read a cell
-whose value does not bound the query point), and `taper=False` for the CoM field
-(the reference check treats terrain above the CoM as a full-height column, so a
-sphere there over-rejects). `standable_mask` is provably this same object
-evaluated at standing height — `inflated_field(com_radius+gate) <= grid +
-leg_length` — and the two are kept separate only because `standable_mask` runs
-once per planner and costs nothing.
+whose value does not bound the query point), and the choice between `taper=True`
+and `taper=False` at the SAME radius, which are NOT interchangeable even though
+there is only one radius in the model now: `taper=False` (untapered) is the
+exact "is there a real obstacle here at all" detector — it reports the raw
+terrain height with no lift added, so flat ground reads back as flat ground,
+which is what `standable_mask` needs and what `clearance_floor_alpha` uses to
+decide a sample is even worth considering; `taper=True` (tapered) is what
+actually prices a genuine obstacle once found, because the untapered form
+alone does not enforce any minimum standoff near the ground (it only asks "is
+the foot below this terrain," not "below by the gate margin"). Building both
+from the robot's one radius, rather than from two different radii the way the
+old capsule model did, is still a real simplification — it just isn't a
+single array. See `hopping_astar_planner.clearance_floor_alpha`'s docstring
+for the full derivation.
 
 **`surface_normals` uses min-|slope| one-sided differences, not a central
 difference,** and that is a correctness requirement, not a refinement. A central
@@ -233,10 +243,15 @@ generation and edge validation are non-trivial:
   reads over a 2,500-cell map, ~62,000 per cell of terrain that never changes**.
   `Map2D5.inflated_field` is keyed on a **cell** instead, so all 2,500 answers
   are computed once in 0.26 ms. Two fields are built (`_inflated_foot`,
-  `_inflated_com`), because the capsule's regions differ in radius *and* shape:
-  the foot tip is a sphere (tapered) while terrain above the CoM is treated as a
-  full-height column (untapered). **Do not add a taper to the CoM field** — it
-  silently over-rejects. The cache is gone; nothing per-hop is derived any more.
+  `_inflated_com`), both from the robot's one radius now, because they answer
+  different questions, not because of a multi-radius capsule: `_inflated_foot`
+  is tapered (a sphere) so it correctly enforces the safety-margin gate near
+  the ground, while `_inflated_com` is untapered (a full-height column) so it
+  reads back as exactly the raw terrain height, with no artificial lift, which
+  is what makes it usable as an exact "is there a real obstacle here at all"
+  detector. **Do not add a taper to the `_inflated_com` field** — it silently
+  over-rejects (a tapered field shows *some* lift even over flat ground). The
+  terrain-pair cache is gone; nothing per-hop is derived any more.
 - `disable_clearance=True` skips the stance and clearance gates but keeps the
   physics feasibility gate — used only for A/B baseline comparisons (e.g. in
   `test/benchmark_tall_stairs.py`), never for real planning. Note this is now a
@@ -344,37 +359,36 @@ above.
   needs); the planner does not. **The `u*(X-u)` denominator is a pole at each
   end,** which is why `ARC_SAMPLE_MAX_STEP` cannot be coarsened even though the
   inflated fields are smooth — see its note in `config.py`.
-- **Collision geometry is a capsule, not just a sphere, and it's checked
-  differently at stance than in flight — and it has three different radii,
-  not one.** The full collision volume is a capsule from foot to CoM with
-  three independently-sized regions: the CoM sphere (`ROBOT_RADIUS` = 0.15 m,
-  the robot's actual body), the leg-cylinder sides (`LEG_CYLINDER_RADIUS` =
-  0.01 m, thin), and the foot-tip hemisphere (`FOOT_TIP_RADIUS` = 0.02 m,
-  slightly fatter than the leg). `standable_mask` (stance) checks the sphere
-  at the CoM PLUS the upper `1 - LEG_CLEARANCE_START_FRAC` of the leg cylinder
-  sides — the bottom `frac` is exempt so graded slopes stay standable; no
-  foot-tip component at stance, since the foot is on the ground by
-  definition. `clearance_for_alpha` (flight) checks the full capsule (top
-  hemisphere at the CoM + full cylinder + bottom hemisphere at the foot), so
-  terrain right under the foot must clear the foot tip by `FOOT_TIP_RADIUS +
-  MIN_CLEARANCE`, not just `MIN_CLEARANCE`. Terrain *above* the CoM height
-  during flight is checked against `ROBOT_RADIUS`, not `LEG_CYLINDER_RADIUS`
-  — getting this wrong would silently let the CoM sphere shrink to leg-radius
-  for any obstacle taller than the current arc height, exactly the case that
-  matters most. Near-endpoint samples where the arc has barely lifted are
-  masked (the rigid-vertical-leg model would spuriously report the foot
-  grazing endpoint terrain there); `standable_mask` handles those.
-- **Max standable grade** at shipped values is governed by the CoM sphere, not
-  the leg-cylinder-sides formula you'd naively write down. The closed-form
-  leg-cylinder ceiling is `(LEG_LENGTH * LEG_CLEARANCE_START_FRAC) /
-  (LEG_CYLINDER_RADIUS + MIN_CLEARANCE)` ≈ 1.21, but `LEG_CYLINDER_RADIUS`
-  (0.01 m) is thinner than `CELL_RESOLUTION` (0.1 m), so `standable_mask`'s
-  discretized neighbour search never actually fires that check before the
-  sphere-alone ceiling `sqrt((LEG_LENGTH / (ROBOT_RADIUS +
-  MIN_CLEARANCE))^2 - 1)` ≈ 1.25 does. Both ceilings are far steeper than any
-  map grade in this repo (`maps/slope_crest.py` ships at 0.35, chosen back
-  when the ceiling was ~0.38 under the old shared-radius model — that
-  reasoning is now stale, though the grade itself is still safely standable).
+- **Collision geometry is a single uniform vertical cylinder, radius
+  `ROBOT_RADIUS` (0.15 m), spanning the foot to the top of the body
+  (`LEG_LENGTH + ROBOT_RADIUS` above the foot) — not a multi-region capsule.**
+  There used to be three independently-sized regions (CoM sphere, thin
+  leg-cylinder sides, foot-tip hemisphere); collapsing them to one radius is a
+  deliberate simplification, not an approximation of the old geometry.
+  Terrain is always a solid column rising from the ground in this codebase, so
+  a flat-capped cylinder's clearance only ever depends on its BOTTOM (the
+  foot) — its own height never enters the math. `standable_mask` (stance) and
+  `clearance_for_alpha`/`clearance_floor_alpha` (flight) both reduce to the
+  same two-case test at the foot: terrain at or above the foot's height needs
+  `|r| - ROBOT_RADIUS >= MIN_CLEARANCE` (a cylinder side-wall, no vertical
+  term); terrain below the foot needs `hypot(r, foot_h - h_terr) -
+  ROBOT_RADIUS >= MIN_CLEARANCE` (a hemisphere centred at the foot point,
+  matching what `Map2D5.inflated_field(ROBOT_RADIUS + MIN_CLEARANCE,
+  taper=True)` computes exactly when read at the foot's own height — this
+  point-hemisphere convention, not a more literal "flat cap + rounded rim"
+  shape, is what keeps the closed-form fast path in EXACT correspondence with
+  the sample-by-sample reference rather than merely close). Near-endpoint
+  samples where the arc has barely lifted are masked (the rigid-vertical-leg
+  model would spuriously report the foot grazing endpoint terrain there);
+  `standable_mask` handles those.
+- **Max standable grade** under this model is a plain closed form,
+  `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` ≈ 1.33 — a flat cylinder has
+  no lateral taper the way the old CoM sphere did, so at the same radius it is
+  LESS restrictive (~1.33 vs. the old model's ~0.88, verified numerically
+  against `standable_mask`, not just by formula). This is far steeper than any
+  map grade in this repo (`maps/slope_crest.py` ships at 0.35), so it only
+  actually binds against near-vertical walls, not graded slopes — but it is a
+  real, intentional widening of what counts as standable, not a no-op.
 - Instrumentation counters (`n_expansions`, `n_edge_checks`, `n_edges_accepted`) are
   reset at the top of `plan()` and read by the benchmark script.
 
@@ -395,9 +409,9 @@ Notable non-obvious parameters:
   factor. On flat ground the cone alone forces `alpha >= atan(1/MU)` = 39.8°, well
   above the 12.3° the pre-cone interval allowed for a 1 m hop, so it changes the
   chosen angle on essentially every edge. It also caps the steepest contactable
-  cross-slope at `MU` itself — which at 1.2 sits just under `standable_mask`'s
-  geometric ceiling (~1.21), making friction the binding standability limit by a
-  hair. `config.py` asserts the flat-ground cone floor stays below the leg-energy
+  cross-slope at `MU` itself — which at 1.2 sits comfortably under
+  `standable_mask`'s geometric ceiling (~1.33), making friction the binding
+  standability limit. `config.py` asserts the flat-ground cone floor stays below the leg-energy
   ceiling at `HOP_RADIUS`; violating it empties the interval for *every* flat hop
   and `plan()` returns None everywhere with no other symptom.
 - **`V_G_MAX` is the cap that matters; `V_MAX` and `MAX_APEX_HEIGHT` are derived from
@@ -433,10 +447,14 @@ Notable non-obvious parameters:
   the propagated speed drifts from the arc actually flown; too fine and the state
   space multiplies for no modelling gain. Rounding to nearest costs at most
   ±0.125 m/s.
-- `LEG_LENGTH - ROBOT_RADIUS` must exceed `MIN_CLEARANCE`, or *every* edge is
-  rejected and `plan()` silently returns `None` everywhere. `config.py` asserts
-  it. This is specifically about the CoM sphere's own-column stance check
-  (`ROBOT_RADIUS`, not `LEG_CYLINDER_RADIUS` or `FOOT_TIP_RADIUS`).
+- `config.py` no longer asserts `LEG_LENGTH - ROBOT_RADIUS > MIN_CLEARANCE`.
+  That assert guarded a sphere-specific failure mode — the old CoM sphere's
+  rounded underside clipping its own foot's ground contact, which would
+  reject every edge and make `plan()` silently return `None` everywhere. A
+  flat-capped cylinder's bottom sits exactly at the foot's height by
+  construction, contributing zero self-lift regardless of `ROBOT_RADIUS`
+  (verified: a flat map is standable under this model for any `ROBOT_RADIUS`,
+  even one exceeding `LEG_LENGTH`), so that failure mode does not exist here.
 - `OBSTACLE_WALL_EXTRA` **no longer gates the planner** — `inflated_field` gives
   OBSTACLE cells `+inf`, which is strictly stronger and needs no calibration
   against `MAX_APEX_HEIGHT`. It still governs the reference implementation
@@ -446,12 +464,9 @@ Notable non-obvious parameters:
   height used for obstacle cells in the clearance check — obstacles aren't just
   "tall," they're "taller than anything else on the map," so bilinear interpolation
   near an obstacle edge doesn't accidentally produce a below-wall reading. It must
-  exceed `LEG_LENGTH + MAX_APEX_HEIGHT - FOOT_TIP_RADIUS - MIN_CLEARANCE` or
-  obstacles become jumpable — this is a foot-tip/bottom-cap concern, not a CoM
-  one, since the foot is the lowest point of the flight capsule; `config.py`
-  asserts this too, along with `ROBOT_RADIUS >= LEG_CYLINDER_RADIUS` and
-  `ROBOT_RADIUS >= FOOT_TIP_RADIUS` (the lateral sampling corridor in
-  `terrain_profile` is sized off the largest of the three radii).
+  exceed `LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE` or
+  obstacles become jumpable — this is a bottom-cap concern, since the foot is
+  the lowest point of the flight cylinder; `config.py` asserts this.
 - `HOP_SCAN_STEP` is a separate parameter from `CELL_RESOLUTION` so it can be
   tuned for speed — branching factor is proportional to `1/step`, making it the
   cheapest lever on planning time. But it also quantizes how far a hop can go:

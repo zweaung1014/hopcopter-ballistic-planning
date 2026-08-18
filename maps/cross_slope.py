@@ -17,10 +17,9 @@ Why grade 0.9
 It has to clear two ceilings from opposite directions.
 
 Below the *standability* ceiling, or the stance gate rejects the hillside before
-the cone is ever consulted and the map tests nothing. `Map2D5.standable_mask`
-gives two ceilings — the leg-cylinder-sides one at `(L * frac) / (leg_radius +
-MIN_CLEARANCE)` ~ 1.21 and the CoM-sphere one at `sqrt((L / (ROBOT_RADIUS +
-MIN_CLEARANCE))^2 - 1)` ~ 1.25 — and 0.9 sits comfortably under both.
+the cone is ever consulted and the map tests nothing. `Map2D5.standable_mask`'s
+single-cylinder ceiling is `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` ~ 1.33,
+and 0.9 sits comfortably under it.
 
 Below `MU` (1.2), or the cross-slope cone degenerates (`cos(beta)/A > 1`) and no
 contact on the hillside is usable at all, which would make the map unplannable

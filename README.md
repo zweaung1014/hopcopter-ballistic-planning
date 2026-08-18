@@ -27,8 +27,10 @@ Opens a matplotlib window showing the elevation grid, the planned path and the h
 
 ## The robot
 
-The robot is a sphere of `ROBOT_RADIUS` whose centre — the point the parabola actually
-tracks — sits `LEG_LENGTH` above the contact foot. A hop is accepted only if:
+The robot's collision volume is a single uniform vertical cylinder of radius
+`ROBOT_RADIUS`, spanning the foot to the top of the body. Its CoM — the point the
+parabola actually tracks — sits `LEG_LENGTH` above the contact foot. A hop is
+accepted only if:
 
 1. the landing cell is not an obstacle;
 2. the body can **rest** there without overlapping nearby terrain;
@@ -59,7 +61,7 @@ Everything tunable lives in `config.py` and is threaded explicitly through const
 | `MAX_APEX_HEIGHT` | 1.2 m | CoM rise on a vertical in-place hop |
 | `V_MAX` | *derived* | `sqrt(2 g h)` = 4.85 m/s — change the apex, not this |
 | `LEG_LENGTH` | 0.4 m | CoM height above the foot |
-| `ROBOT_RADIUS` | 0.2 m | Body radius, lateral and vertical |
+| `ROBOT_RADIUS` | 0.15 m | Body radius, lateral and vertical |
 | `MIN_CLEARANCE` | 0.15 m | Hard clearance gate |
 | `HOP_RADIUS` | 1.0 m | Ring-sampling radius for candidate landings |
 | `HOP_SCAN_STEP` | 0.1 m | Inward ray-search step; the dominant speed/quality knob |
@@ -67,8 +69,7 @@ Everything tunable lives in `config.py` and is threaded explicitly through const
 | `ALPHA_MARGIN_FRAC` | 0.5 | Default takeoff angle within the feasible interval |
 | `OBSTACLE_WALL_EXTRA` | 1.5 m | Height obstacle cells read as during clearance checks |
 
-Two invariants are asserted at import: `LEG_LENGTH - ROBOT_RADIUS > MIN_CLEARANCE`
-(else every edge is rejected and `plan()` silently returns `None`), and
+An invariant is asserted at import:
 `OBSTACLE_WALL_EXTRA >= LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE`
 (else obstacles become jumpable).
 
