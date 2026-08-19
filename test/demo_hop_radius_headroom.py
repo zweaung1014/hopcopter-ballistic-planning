@@ -41,11 +41,9 @@ import config
 from demo_common import (
     ANNOT_FS, C_ACCEPT, C_BALL, C_CHOSEN, LABEL_FS, PRESENTATION_DPI,
     TITLE_FS, TOPDOWN_FIGSIZE, draw_topdown_compact, make_planner, out_path,
-    planner_alpha_interval, save,
+    planner_alpha_interval, planner_angle_and_clearance, save,
 )
-from hopping_astar_planner import (
-    alpha_for_clearance, feasible_alpha_interval, min_energy_tan, terrain_profile,
-)
+from hopping_astar_planner import feasible_alpha_interval, min_energy_tan
 from map2d5 import Map2D5
 from maps import flat, stairs
 
@@ -82,15 +80,12 @@ def classify_gate(planner, m, p0, p1, v_g_in) -> str:
     if iv is None:
         return "physics"
 
-    profile = terrain_profile(
-        (p0[0], p0[1], z0), (p1[0], p1[1], nz), m,
-        planner.robot_radius,
-        planner.leg_length, planner.arc_max_step, planner._obstacle_fill,
-        planner.n_lateral, min_clearance_gate=planner.min_clearance_gate,
+    picked = planner_angle_and_clearance(
+        planner, (p0[0], p0[1], z0), (p1[0], p1[1], nz), iv[0], iv[1],
     )
-    if profile is None:
-        return "clearance(profile)"
-    _, mc = alpha_for_clearance(profile, iv[0], iv[1], planner.min_clearance_gate)
+    if picked is None:
+        return "off-map"
+    _, mc = picked
     if mc < planner.min_clearance_gate:
         return "clearance"
     return "accepted?"  # shouldn't be reached if _validate_and_cost also failed
@@ -262,7 +257,8 @@ def explain_hop(planner, m, p0, p1, v_g_in, alpha_s: float) -> dict:
     """Where the FLOWN angle `alpha_s` actually sits, not just which
     constraint owns each end of the interval.
 
-    `alpha_for_clearance` picks `clamp(alpha_star, alpha_c, alpha_max)` where
+    `clearance_floor_alpha` gives `alpha_c`; the flown angle is
+    `clamp(alpha_star, alpha_c, alpha_max)` where
     `alpha_star` is the unconstrained minimum-energy angle (`min_energy_tan`).
     Reporting only "which constraint sets the interval floor" is misleading
     when the flown angle sits well above that floor, at the free minimum-
@@ -305,7 +301,7 @@ def explain_hop(planner, m, p0, p1, v_g_in, alpha_s: float) -> dict:
                 f"interior, {side} the min-energy angle by "
                 f"{abs(math.degrees(alpha_s - alpha_star)):.1f} deg -- neither "
                 f"the interval bound nor the free min-energy point; the "
-                f"clearance gate (`alpha_for_clearance`) picked this one off "
+                f"clearance gate (`clearance_floor_alpha`) picked this one off "
                 f"the terrain profile, between floor {math.degrees(alpha_min):.1f} "
                 f"and ceiling {math.degrees(alpha_max):.1f} deg"
             )

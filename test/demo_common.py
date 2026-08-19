@@ -30,14 +30,14 @@ import matplotlib.pyplot as plt
 import config
 from hopping_astar_planner import (
     HoppingAStarPlanner,
-    alpha_for_clearance,
+    arc_clearance,
+    clearance_floor_alpha,
     feasible_alpha_interval,
     injection_energy,
     landing_speed,
     max_hop_radius,
-    min_clearance,
+    min_energy_tan,
     takeoff_speed,
-    terrain_profile,
 )
 from map2d5 import Map2D5
 from visualizer import Visualizer
@@ -200,14 +200,88 @@ def make_planner(
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        n_lateral=config.ARC_LATERAL_SAMPLES,
-        obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         hop_scan_step=config.HOP_SCAN_STEP,
         hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
         disable_clearance=disable_clearance,
     )
     kwargs.update(overrides)
     return HoppingAStarPlanner(**kwargs)
+
+
+def angle_and_clearance(
+    c_s: tuple[float, float, float],
+    c_g: tuple[float, float, float],
+    height_map,
+    inflated,
+    gate: float,
+    leg_length: float,
+    max_step: float,
+    alpha_min: float,
+    alpha_max: float,
+) -> tuple[float, float] | None:
+    """The angle the planner would fly on this edge, and the clearance it gets.
+
+    `(alpha_s, mc)`, or `None` if the hop's centreline leaves the map. Replaces
+    the old `terrain_profile` + `alpha_for_clearance` pair: there is one
+    clearance implementation now, the inflated field, and this reproduces the
+    planner's own two-step rule against it —
+
+      1. `clearance_floor_alpha` gives `alpha_c`, the shallowest angle that
+         clears (`-inf` when nothing constrains the arc);
+      2. the flown angle is the least-injection one at or above that floor,
+         `clamp(atan(min_energy_tan(X, Z)), max(alpha_min, alpha_c), alpha_max)`.
+
+    `mc >= gate` exactly when `alpha_s >= alpha_c`, because `alpha_c` is defined
+    as the angle where the tightest sample sits at the gate — so callers can
+    keep testing `mc < gate` for "the clearance gate rejected this" and get the
+    planner's own verdict.
+
+    Prefer `planner_angle_and_clearance` when you have a planner: it reads all
+    of the geometry arguments off it, so a diagnostic cannot drift from the
+    planner it is explaining.
+    """
+    X = math.hypot(c_g[0] - c_s[0], c_g[1] - c_s[1])
+    Z = c_g[2] - c_s[2]
+    alpha_c = clearance_floor_alpha(
+        c_s, c_g, height_map, inflated, gate, leg_length, max_step,
+    )
+    if alpha_c is None:
+        return None
+    alpha_s = min(
+        max(math.atan(min_energy_tan(X, Z)), max(alpha_min, alpha_c)),
+        alpha_max,
+    )
+    mc = arc_clearance(
+        c_s, c_g, height_map, inflated, leg_length, max_step, alpha_s,
+    )
+    # `alpha_c` is DEFINED as the angle where the tightest sample sits exactly
+    # at the gate, so flying at or above it clears by at least `gate` — as an
+    # identity, not an approximation. Evaluating that identity in floating point
+    # lands within ~1e-16 of `gate` and can fall either side of it, which would
+    # make a caller's `mc < gate` test flip at random on boundary hops. Snap it.
+    if alpha_s >= alpha_c and mc < gate:
+        mc = gate
+    return alpha_s, mc
+
+
+def planner_angle_and_clearance(
+    planner,
+    c_s: tuple[float, float, float],
+    c_g: tuple[float, float, float],
+    alpha_min: float,
+    alpha_max: float,
+) -> tuple[float, float] | None:
+    """`angle_and_clearance` with every geometry argument read off `planner`.
+
+    **Do not re-derive the angle from the endpoints instead.** With the energy
+    chain, `alpha_min` depends on the whole path leading up to the hop; get the
+    interval from `planner_alpha_interval`, which threads that in.
+    """
+    return angle_and_clearance(
+        c_s, c_g, planner.map_env, planner._inflated,
+        planner.min_clearance_gate, planner.leg_length, planner.arc_max_step,
+        alpha_min, alpha_max,
+    )
 
 
 def planner_alpha_interval(
@@ -294,19 +368,14 @@ def diagnose_edge(
     iv = planner_alpha_interval(planner, m, p0, p1, X, Z, v_g_in)
     if iv is None:
         return infeasible
-    profile = terrain_profile(
-        (p0[0], p0[1], z0), (p1[0], p1[1], z1),
-        m, planner.robot_radius, planner.leg_length,
-        planner.arc_max_step, planner._obstacle_fill, planner.n_lateral,
-        min_clearance_gate=planner.min_clearance_gate,
+    # Follows the planner's own angle rule, so the reported alpha is the one
+    # the planner would actually have flown.
+    picked = planner_angle_and_clearance(
+        planner, (p0[0], p0[1], z0), (p1[0], p1[1], z1), iv[0], iv[1],
     )
-    if profile is None:
+    if picked is None:
         return infeasible
-    # Follows the planner's own angle rule, escalation included, so the
-    # reported alpha is the one the planner would actually have flown.
-    a, mc = alpha_for_clearance(
-        profile, iv[0], iv[1], planner.min_clearance_gate,
-    )
+    a, mc = picked
     v_s = takeoff_speed(X, Z, a, planner.g)
     T = math.tan(a)
     return {"feasible": True, "standable": standable,
@@ -434,7 +503,6 @@ def enumerate_ring_candidates(
     m = planner.map_env
     px, py = m.grid_to_world(*cell)
     pz = float(m.grid[cell[0], cell[1]])
-    obs = planner._obstacle_fill
     if v_g_in is None:
         v_g_in = planner.v_g_initial
     r = max_hop_radius(
@@ -495,12 +563,14 @@ def enumerate_ring_candidates(
             out.append(entry)
             continue
 
-        profile = terrain_profile(
-            c_s, c_g, m, planner.robot_radius, planner.leg_length,
-            planner.arc_max_step, obs, planner.n_lateral,
-        )
         gate = planner.min_clearance_gate
-        a, mc = alpha_for_clearance(profile, iv[0], iv[1], gate)
+        picked = planner_angle_and_clearance(planner, c_s, c_g, iv[0], iv[1])
+        if picked is None:
+            entry["gate"] = "clearance"
+            entry["reason"] = "arc leaves the map"
+            out.append(entry)
+            continue
+        a, mc = picked
         entry["alpha_s"] = a
         entry["mc"] = mc
         if mc < gate:

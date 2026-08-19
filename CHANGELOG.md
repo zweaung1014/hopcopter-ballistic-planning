@@ -29,16 +29,83 @@ what it bought; replaced with one uniform vertical cylinder, radius
   `ROBOT_RADIUS + MIN_CLEARANCE`," reusing the exact field flight clearance
   already builds (same memoisation key), rather than a separate geometry
   calculation.
-- **Flight clearance still reads two precomputed fields, not one**, even
-  though there is only one radius now: `_inflated_com` (untapered) is the
-  exact "is there a real obstacle here at all" detector — an untapered field
-  reads back as the raw terrain height with no lift, so flat ground never
-  registers as an obstacle — while `_inflated_foot` (tapered) is what actually
-  enforces the safety-margin gate near the ground, because the untapered form
-  alone imposes no minimum standoff there. This was discovered, not assumed:
-  an initial single-field version passed `plan()` smoke tests but failed
-  `test/test_inflated_field.py`'s never-more-permissive sweep outright (27-
-  1403 violations per map) before being corrected.
+- **The taper is gone, and with it the second field.** A tapered inflated
+  field (`h + sqrt(R^2 - d^2)`, lift falling off with lateral distance) is the
+  configuration-space form of a SPHERE — it is the ROBOT's roundness smeared
+  onto the obstacle's corner, not anything about the obstacle's own edges,
+  which stay sharp either way. This robot is a flat-bottomed cylinder with
+  square edges, so the correct inflation is a plain sideways dilation with
+  nothing added, and the safety margin around a square-edged body is
+  square-edged too: a constant, applied at the comparison.
+
+      foot_height >= inflated_field(ROBOT_RADIUS + MIN_CLEARANCE) + MIN_CLEARANCE
+
+  `Map2D5.inflated_field` therefore lost its `taper` argument entirely (a
+  `flat_radius` argument was drafted for a quarter-round margin and never
+  implemented), and the planner's `_inflated_foot` / `_inflated_com` collapse
+  to a single `_inflated`. The two fields only ever existed *because* of the
+  taper — one tapered to price obstacles, one untapered to detect them.
+
+  This corrects a real over-rejection. An intermediate version inflated by a
+  SPHERE of `ROBOT_RADIUS + MIN_CLEARANCE`, which charges the body's WIDTH as
+  VERTICAL clearance underneath a body that has no underside: it demanded
+  0.30 m of headroom over flat ground where only `MIN_CLEARANCE` = 0.15 m is
+  called for. `test/visualize_inflated_map.py` now reports 0.150 m over flat
+  ground.
+
+  Note the margin is a BOX, not a ball — `MIN_CLEARANCE` vertically and
+  laterally on each axis separately, rather than a straight-line distance
+  around the body's bottom corner. That is marginally more conservative near
+  corners, can never accept something unsafe, and is what lets the margin be a
+  constant instead of a shape.
+
+### Removed — the second clearance implementation
+
+`terrain_profile`, `clearance_for_alpha`, `alpha_for_clearance`,
+`min_clearance` and `ArcProfile` are deleted. They were a slower,
+bisection-based second answer to the question `Map2D5.inflated_field` +
+`clearance_floor_alpha` already answer in closed form, unused by the planner
+since the field landed, and kept only as a reference for
+`test/test_inflated_field.py` and as a terrain sampler for figures.
+
+They were also wrong at the margin: the corridor read terrain BILINEARLY at
+the outer edge of the body's width, which drags in cells up to a full cell
+beyond the body's true reach, so it reported collisions with walls the robot
+misses — 51 of 18592 sampled hops across the deck once the taper was removed.
+
+- **`arc_clearance` added** beside `clearance_floor_alpha`: the min gap between
+  the foot and the inflated terrain at a given angle, i.e. the `mc` number
+  every figure annotates arcs with. Both share `_arc_samples`, so the inverse
+  (which angle clears?) and the forward evaluation (by how much?) cannot drift.
+- **`demo_common.angle_and_clearance` / `planner_angle_and_clearance` added**
+  as the one supported way for a diagnostic to re-score an edge. Every
+  `test/demo_*.py`, `visualizer.draw_arc_side_view` and
+  `test/test_clearance_rejection.py` route through them.
+- **`visualizer.draw_arc_side_view` now PLOTS the inflated field** rather than
+  a max-collapsed bilinear corridor, so the picture and the verdict cannot
+  disagree. It lost its `obstacle_fill` and `n_lateral` parameters.
+- **`test/test_inflated_field.py` no longer compares two implementations.** Its
+  bar is a brute-force assertion written inside the test — for every point
+  along the arc, look at every real map cell within the body's reach and
+  require the foot to be `MIN_CLEARANCE` above all of them. 0 violations across
+  the deck, with the field 20-50 cases stricter (the `lookup_pad`'s
+  conservatism, as designed). A `check_field_is_untapered` case pins the taper
+  shut.
+- **`ARC_LATERAL_SAMPLES` and `OBSTACLE_WALL_EXTRA` removed from `config.py`**
+  (and `n_lateral` / `obstacle_wall_extra` from `HoppingAStarPlanner`), along
+  with `OBSTACLE_WALL_EXTRA`'s assert. Both existed only for bilinear corridor
+  sampling; `inflated_field` gives OBSTACLE cells `+inf`, which is strictly
+  stronger and needs no calibration against `MAX_APEX_HEIGHT`.
+- **`test/test_clearance_rejection.py`'s `PILLAR_H` recalibrated 1.6 -> 0.4**,
+  and for the first time against what the planner actually flies. Every earlier
+  value was calibrated against `terrain_profile`, which rakes samples
+  PERPENDICULAR to travel and so never sees an obstacle ahead of or behind the
+  arc. An inflated field is a DISC: against a 0.30 m-square post that is the
+  difference between "the arc must clear it" and "the arc must clear it, and
+  the landing must stand clear of it too."
+
+### Changed — the rest of the single-cylinder collapse
+
 - **Max standable grade rises from ~0.88 to ~1.33** (`LEG_LENGTH /
   (ROBOT_RADIUS + MIN_CLEARANCE)`, verified numerically against
   `standable_mask`, not just by formula) — a flat cylinder has no lateral
@@ -46,28 +113,20 @@ what it bought; replaced with one uniform vertical cylinder, radius
   restrictive in this comparison, not more. No shipped map is affected (the
   steepest, `maps/slope_crest.py`, ships at grade 0.35), but it is a real,
   intentional widening of what counts as standable.
-- **`OBSTACLE_WALL_EXTRA`'s binding-case formula** changes from
-  `LEG_LENGTH + MAX_APEX_HEIGHT - FOOT_TIP_RADIUS - MIN_CLEARANCE` to
-  `LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE` = 2.85 m; the
-  shipped constant (3.1 m) already clears it, so no value changed, just the
-  formula and the assert that checks it.
 - **The `LEG_LENGTH - ROBOT_RADIUS > MIN_CLEARANCE` assert is gone.** It
   guarded a sphere-specific failure mode (the CoM sphere's rounded underside
   clipping its own foot's ground contact); a flat-capped cylinder's bottom
   sits exactly at the foot's height by construction, contributing zero
   self-lift regardless of `ROBOT_RADIUS`, so that failure mode no longer
   exists.
-- **`test/test_clearance_rejection.py`'s `PILLAR_H` recalibrated a third time**
-  (0.9 → 0.45 → 1.6 → 1.2), for the same reason as the two prior
-  recalibrations documented in that file: the bottom-cap region's effective
-  radius changed (this time from `FOOT_TIP_RADIUS`=0.02 m to the full
-  `ROBOT_RADIUS`=0.15 m), which changes exactly which takeoff distances clear
-  a fixed-height pillar.
-- **`test/test_inflated_field.py` rewritten**: `check_com_field_must_not_taper`
-  and `check_standable_mask_equivalence` (both specific to the old two-shape,
-  two-different-radii distinction) are removed/replaced; the core
-  never-more-permissive and lookup-pad checks carry over, rebuilt around one
-  radius.
+- **`test/test_edge_cost_energy.py`'s ridge lowered 0.4 m → 0.1 m.** Not a
+  bottom-cap effect: the cylinder demands exactly `MIN_CLEARANCE` under the
+  foot, slightly LESS than the old capsule's foot tip did. What changed is
+  LATERAL — the body went from a 0.01 m leg to a 0.15 m cylinder, so with the
+  margin it sweeps 0.30 m either side and must clear a ridge from 0.30 m out,
+  while the arc has barely risen. The angle that needs (83.3° for a 0.4 m
+  ridge) is past the steady-state energy ceiling (79.2°), so the hop is
+  rejected by the ENERGY budget rather than by the clearance shape.
 
 ### Changed — candidate landing cells now come from a scanline circle fill, not a ray-search
 

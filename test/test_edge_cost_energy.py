@@ -69,8 +69,6 @@ def make_planner(m: Map2D5, **overrides) -> HoppingAStarPlanner:
         mu=config.MU, robot_radius=config.ROBOT_RADIUS,
         leg_length=config.LEG_LENGTH, min_clearance_gate=config.MIN_CLEARANCE,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        n_lateral=config.ARC_LATERAL_SAMPLES,
-        obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         hop_scan_step=config.HOP_SCAN_STEP,
         hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
     )
@@ -223,12 +221,16 @@ def case_wall_costs_more_than_flat() -> None:
     assert r_flat is not None
     flat_cost, flat_hop = r_flat
 
-    # 0.1 m, down from 0.4 m: the single-cylinder model checks the bottom-cap
-    # region at the full ROBOT_RADIUS (0.15 m) instead of the old capsule's
-    # tiny FOOT_TIP_RADIUS (0.02 m), which makes a much shorter ridge enough to
-    # force a real cost difference — 0.4 m is no longer clearable at all on
-    # this 1 m hop (blocked from ~0.13 m up), while 0.1 m clears with cost
-    # 7.178 against a flat cost of 2.005.
+    # 0.1 m, down from 0.4 m. NOT a bottom-cap effect — the cylinder demands
+    # exactly MIN_CLEARANCE (0.15 m) directly under the foot, slightly LESS
+    # than the old capsule's foot tip did (0.02 + 0.15 = 0.17 m). What changed
+    # is LATERAL: the body went from a 0.01 m leg to a 0.15 m cylinder, so with
+    # the margin it sweeps 0.30 m either side and has to clear the ridge from
+    # 0.30 m out — the foot must already be high well BEFORE reaching it, where
+    # the arc has barely risen. The angle that needs (83.3 deg at a 0.4 m
+    # ridge) is past the steady-state energy ceiling (79.2 deg), so the hop is
+    # rejected by the ENERGY budget, not by the clearance shape. 0.1 m needs
+    # 74.7 deg, inside the ceiling, and still costs visibly more than flat.
     m = flat_map()
     m.paint_region(0.1, x_min=1.95, x_max=2.05)   # thin ridge at the midpoint
     p_wall = make_planner(m)

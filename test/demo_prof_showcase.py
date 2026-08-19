@@ -154,8 +154,7 @@ def draw_arc_strip(
     fig, axes = plt.subplots(2, ncols, figsize=arcs_figsize(ncols),
                              squeeze=False)
 
-    obs_fill = ballistic_planner._obstacle_fill
-    ymax = max(1.0, obs_fill) + 0.35
+    ymax = max(1.0, float(m.grid.max())) + 0.35
 
     for row, (label, path, diags) in enumerate([
         ("Baseline", path_base, diags_base),
@@ -179,10 +178,9 @@ def draw_arc_strip(
                     ax,
                     (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                     d["alpha_s"], m,
-                    config.ROBOT_RADIUS, config.LEG_LENGTH, obs_fill,
+                    config.ROBOT_RADIUS, config.LEG_LENGTH,
                     config.ARC_SAMPLE_MAX_STEP,
                     min_clearance_gate=config.MIN_CLEARANCE,
-                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.05, ymax)
             if i == 0:

@@ -13,11 +13,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
-from hopping_astar_planner import (
-    alpha_for_clearance,
-    feasible_alpha_interval,
-    terrain_profile,
-)
+from demo_common import angle_and_clearance
+from hopping_astar_planner import feasible_alpha_interval
 from map2d5 import Map2D5
 
 
@@ -27,16 +24,13 @@ LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
 MU = config.MU
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
-N_LAT = config.ARC_LATERAL_SAMPLES
-WALL_EXTRA = config.OBSTACLE_WALL_EXTRA
 
 # Spans here are 2.1/1.8/1.3/0.8 m, well inside the flat-hop reach
 # V_MAX^2 / g = 5.50 m, so the reach never fires and every verdict below is
 # genuinely about clearance.
 GOAL_X = 3.2
 PILLAR_X = 2.7
-PILLAR_H = 1.2   # calibrated three times now, for three successive model
-                 # changes.
+PILLAR_H = 0.4   # recalibrated for each model change; see below.
                  #
                  # It was 0.9 under a sphere-only clearance check, which needed
                  # only the CoM to clear the pillar top by (R + gate) = 0.35 m.
@@ -50,16 +44,24 @@ PILLAR_H = 1.2   # calibrated three times now, for three successive model
                  # sweep below runs 39.8 deg of takeoff-angle floor at X=2.1 up
                  # to 78.2 deg at X=0.8). A near-vertical arc clears a low
                  # pillar trivially, so 0.45 became jumpable from everywhere,
-                 # and it rose to 1.6.
+                 # and it rose to 1.6, still for the original two opposite
+                 # reasons: the pillar's TRAILING edge (arc descending limb)
+                 # blocks far-back takeoffs and the LEADING edge (arc hasn't
+                 # risen yet) blocks close-in ones.
                  #
-                 # The single-cylinder model raised the bottom-cap radius from
-                 # FOOT_TIP_RADIUS (0.02 m) to the full ROBOT_RADIUS (0.15 m) —
-                 # a much bigger effective clearance requirement right at the
-                 # ground — so 1.6 became un-jumpable everywhere and dropped to
-                 # 1.2. Still for the original two opposite reasons: the
-                 # pillar's TRAILING edge (arc descending limb) blocks far-back
-                 # takeoffs and the LEADING edge (arc hasn't risen yet) blocks
-                 # close-in ones.
+                 # The single-cylinder model did NOT move it, but pointing
+                 # this test at the PLANNER'S OWN check did, and dropped it to
+                 # 0.4. Every earlier value was calibrated against
+                 # `terrain_profile`, which rakes a line of samples
+                 # PERPENDICULAR to travel and so never sees an obstacle ahead
+                 # of or behind the arc. The inflated field is a DISC: terrain
+                 # constrains a sample from `robot_radius + gate` away in EVERY
+                 # direction, along-track included. Against a 0.30 m-square post
+                 # that is the difference between "the arc must clear it" and
+                 # "the arc must clear it, and the landing must stand clear of
+                 # it too", which no arc height can fix. The reference sampler
+                 # is gone, so 0.4 is the first value calibrated against what
+                 # the planner actually flies.
 
 # The energy state these clearance tests are evaluated in. The chain's seed —
 # the robot at the start of a plan, with sqrt(2 g H_INITIAL) of takeoff speed —
@@ -76,9 +78,19 @@ ENERGY_KW = dict(
 )
 
 
-def _obs_fill(m: Map2D5) -> float:
-    non_obs = m.grid[m.grid != Map2D5.OBSTACLE]
-    return (float(non_obs.max()) if non_obs.size else 0.0) + WALL_EXTRA
+def _mc(m: Map2D5, c_s, c_g, iv) -> float:
+    """Clearance the planner would get on this hop, at the angle it would fly.
+
+    One clearance implementation: `Map2D5.inflated_field` (memoised, so this is
+    the same array a planner on this map would build) read through
+    `demo_common.angle_and_clearance`, which applies the planner's own
+    least-injection angle rule.
+    """
+    _alpha, mc = angle_and_clearance(
+        c_s, c_g, m, m.inflated_field(ROBOT_R + GATE), GATE, LEG, MAX_STEP,
+        iv[0], iv[1],
+    )
+    return mc
 
 
 def _pillar_map(pillar_h: float, x_center: float = PILLAR_X) -> Map2D5:
@@ -99,20 +111,10 @@ def _mc_for(xs: float, goal_x: float, pillar_h: float) -> float:
     failed.
     """
     m = _pillar_map(pillar_h)
-    obs = _obs_fill(m)
-    c_s = (xs, 1.5, 0.0)
-    c_g = (goal_x, 1.5, 0.0)
     iv = feasible_alpha_interval(goal_x - xs, 0.0, config.V_MAX, G, **ENERGY_KW)
     if iv is None:
         return -math.inf  # infeasible counts as rejection
-    profile = terrain_profile(
-        c_s, c_g, m, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
-        min_clearance_gate=GATE,
-    )
-    _alpha, mc = alpha_for_clearance(
-        profile, iv[0], iv[1], GATE
-    )
-    return mc
+    return _mc(m, (xs, 1.5, 0.0), (goal_x, 1.5, 0.0), iv)
 
 
 def _check(name: str, mc: float, expect_accept: bool) -> bool:
@@ -147,11 +149,11 @@ def main() -> int:
     # cone at both contacts, and the leg-speed budget at takeoff AND landing.
     # These calls pass no normals, so they exercise the flat-ground cone.
     print("\n(2) feasible_alpha_interval boundaries:")
-    iv = feasible_alpha_interval(2.0, 0.0, 4.5, G)
+    iv = feasible_alpha_interval(2.0, 0.0, 4.5, G, **ENERGY_KW)
     ok = iv is not None
     print(f"  [{'PASS' if ok else 'FAIL'}] X=2, Z=0, V_max=4.5 -> feasible: {iv is not None}")
     all_ok &= ok
-    iv = feasible_alpha_interval(5.0, 0.0, 4.5, G)  # v_min=sqrt(g*5)=7.0 > 4.5
+    iv = feasible_alpha_interval(5.0, 0.0, 4.5, G, **ENERGY_KW)  # v_min=sqrt(g*5)=7.0 > 4.5
     ok = iv is None
     print(f"  [{'PASS' if ok else 'FAIL'}] X=5, Z=0, V_max=4.5 -> infeasible: {iv is None}")
     all_ok &= ok
@@ -162,16 +164,18 @@ def main() -> int:
     # encoded a tuned V_MAX = 4.85 m/s and broke when V_MAX became a derived
     # worst case of the energy chain (reach 2.40 m -> 5.50 m).
     reach = config.V_MAX ** 2 / G
-    ok = (feasible_alpha_interval(reach * 0.96, 0.0, config.V_MAX, G) is not None
-          and feasible_alpha_interval(reach * 1.04, 0.0, config.V_MAX, G) is None)
+    ok = (feasible_alpha_interval(reach * 0.96, 0.0, config.V_MAX, G, **ENERGY_KW)
+          is not None
+          and feasible_alpha_interval(reach * 1.04, 0.0, config.V_MAX, G, **ENERGY_KW)
+          is None)
     print(f"  [{'PASS' if ok else 'FAIL'}] flat-hop reach = V_MAX^2/g = "
           f"{reach:.2f} m (reaches {reach * 0.96:.2f} m, not {reach * 1.04:.2f} m)")
     all_ok &= ok
     # On level ground both cones reduce to the textbook Coulomb bound, so the
     # shallowest producible takeoff is atan(1/MU) — a shallower push would slide
     # the foot out. Comparing against `mu=None` isolates the cone's contribution.
-    iv_cone = feasible_alpha_interval(1.0, 0.0, config.V_MAX, G)
-    iv_bare = feasible_alpha_interval(1.0, 0.0, config.V_MAX, G, mu=None)
+    iv_cone = feasible_alpha_interval(1.0, 0.0, config.V_MAX, G, **ENERGY_KW)
+    iv_bare = feasible_alpha_interval(1.0, 0.0, config.V_MAX, G, mu=None, **ENERGY_KW)
     ok = (abs(iv_cone[0] - math.atan(1.0 / MU)) < 1e-5
           and abs(iv_cone[1] - iv_bare[1]) < 1e-9)
     print(f"  [{'PASS' if ok else 'FAIL'}] flat-ground cone floor = atan(1/MU) = "
@@ -181,29 +185,23 @@ def main() -> int:
     all_ok &= ok
 
     # -- OBSTACLE cells in the arc's XY path should always reject. --
-    # The region has to be at least two cells thick across the arc. A single
-    # OBSTACLE cell sampled along its own boundary is averaged 50/50 with its
-    # neighbour by the bilinear lookup, which halves the effective wall height
-    # — real enough that maps should never rely on one-cell obstacles.
+    # Obstacles need no minimum thickness here: `inflated_field` gives OBSTACLE
+    # cells `+inf` and is a max, never an average, so a one-cell obstacle is as
+    # un-flyable as a wide one. (The two-cell rule was a property of the
+    # bilinear corridor sampling this replaced.)
     print("\n(3) OBSTACLE region under the arc:")
     m = _pillar_map(0.0)  # ground zero everywhere
     m.set_obstacle_region(2.4, 1.35, 2.6, 1.65)
     iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G, **ENERGY_KW)
-    profile = terrain_profile(
-        (1.5, 1.5, 0.0), (3.5, 1.5, 0.0), m, ROBOT_R, LEG,
-        MAX_STEP, _obs_fill(m), N_LAT,
-        min_clearance_gate=GATE,
-    )
-    _a, mc = alpha_for_clearance(profile, iv[0], iv[1], GATE)
+    mc = _mc(m, (1.5, 1.5, 0.0), (3.5, 1.5, 0.0), iv)
     all_ok &= _check("arc over OBSTACLE region", mc, expect_accept=False)
 
-    # OBSTACLE_WALL_EXTRA must be large enough that the tallest arc the robot
-    # can fly still cannot clear an obstacle cell.
-    reach = LEG + config.MAX_APEX_HEIGHT - ROBOT_R - GATE
-    ok = WALL_EXTRA >= reach
-    print(f"  [{'PASS' if ok else 'FAIL'}] OBSTACLE_WALL_EXTRA={WALL_EXTRA} m >= "
-          f"max flyable height {reach:.2f} m")
-    all_ok &= ok
+    # A single-cell obstacle must reject just as hard — the property that
+    # replaced OBSTACLE_WALL_EXTRA's calibration against MAX_APEX_HEIGHT.
+    m1 = _pillar_map(0.0)
+    m1.set_obstacle_region(2.45, 1.45, 2.55, 1.55)
+    mc1 = _mc(m1, (1.5, 1.5, 0.0), (3.5, 1.5, 0.0), iv)
+    all_ok &= _check("arc over a ONE-CELL OBSTACLE", mc1, expect_accept=False)
 
     # -- Downhill jumps: what the two new BEAM constraints changed. --
     # This section used to assert "downhill widens the interval". That was true
@@ -215,8 +213,8 @@ def main() -> int:
     # geometric bound atan2(Z, X) below zero, and the old interval followed it
     # down — asking a push-only leg to thrust *below* the horizon. The cone
     # replaces that with the Coulomb floor, which does not depend on Z at all.
-    iv_down = feasible_alpha_interval(1.0, -0.4, config.V_MAX, G)
-    iv_down_bare = feasible_alpha_interval(1.0, -0.4, config.V_MAX, G, mu=None)
+    iv_down = feasible_alpha_interval(1.0, -0.4, config.V_MAX, G, **ENERGY_KW)
+    iv_down_bare = feasible_alpha_interval(1.0, -0.4, config.V_MAX, G, mu=None, **ENERGY_KW)
     ok = (iv_down_bare[0] < 0.0 < iv_down[0]
           and abs(iv_down[0] - math.atan(1.0 / MU)) < 1e-5)
     print(f"  [{'PASS' if ok else 'FAIL'}] X=1.0, Z=-0.4: alpha_min "
@@ -230,8 +228,8 @@ def main() -> int:
     # vertical speed alone — and it is only attained in the limit of a
     # straight-down hop, since any horizontal travel needs speed of its own.
     max_drop = config.V_MAX ** 2 / (2.0 * G)
-    ok = (feasible_alpha_interval(0.05, -(max_drop - 0.05), config.V_MAX, G) is not None
-          and feasible_alpha_interval(0.05, -(max_drop + 0.05), config.V_MAX, G) is None)
+    ok = (feasible_alpha_interval(0.05, -(max_drop - 0.05), config.V_MAX, G, **ENERGY_KW) is not None
+          and feasible_alpha_interval(0.05, -(max_drop + 0.05), config.V_MAX, G, **ENERGY_KW) is None)
     print(f"  [{'PASS' if ok else 'FAIL'}] near-vertical drop capped at "
           f"V_MAX^2/(2g) = {max_drop:.2f} m (accepts {max_drop - 0.05:.2f} m, "
           f"rejects {max_drop + 0.05:.2f} m)")
@@ -243,7 +241,7 @@ def main() -> int:
         lo, hi = 0.0, 3.0
         for _ in range(50):
             mid = 0.5 * (lo + hi)
-            if feasible_alpha_interval(X, -mid, config.V_MAX, G) is not None:
+            if feasible_alpha_interval(X, -mid, config.V_MAX, G, **ENERGY_KW) is not None:
                 lo = mid
             else:
                 hi = mid
@@ -257,7 +255,7 @@ def main() -> int:
 
     # The old geometry for this section (X=2.0, Z=-0.5, V_max=4.5) is now
     # infeasible outright: it needs |v_g| = 5.01 m/s to land, over that budget.
-    ok = feasible_alpha_interval(2.0, -0.5, 4.5, G) is None
+    ok = feasible_alpha_interval(2.0, -0.5, 4.5, G, **ENERGY_KW) is None
     print(f"  [{'PASS' if ok else 'FAIL'}] the pre-BEAM downhill case "
           f"(X=2.0, Z=-0.5, V_max=4.5) is rejected by the landing budget")
     all_ok &= ok
@@ -335,17 +333,10 @@ def main() -> int:
     # flat scenario with a short bump.
     mm = Map2D5(3.0, 2.0, 0.1)
     mm.paint_region(0.30, x_min=1.35, x_max=1.65, y_min=0.85, y_max=1.15)
-    obs = _obs_fill(mm)
     c_s = (0.4, 1.0, 0.0)
     c_g = (2.4, 1.0, 0.0)   # X=2.0 flat, well inside V_MAX
     iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G, **ENERGY_KW)
-    prof = terrain_profile(
-        c_s, c_g, mm, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
-        min_clearance_gate=GATE,
-    )
-    _, mc_bump = alpha_for_clearance(
-        prof, iv[0], iv[1], GATE,
-    )
+    mc_bump = _mc(mm, c_s, c_g, iv)
     print(f"  [{'PASS' if mc_bump >= GATE else 'FAIL'}] "
           f"flat hop over a 0.30 m bump: mc={mc_bump:+.3f} m -> "
           f"{'ACCEPT' if mc_bump >= GATE else 'REJECT'} (expected ACCEPT)")
@@ -359,17 +350,10 @@ def main() -> int:
     # reliable REJECT case across the model change.
     mm = Map2D5(3.0, 2.0, 0.1)
     mm.paint_region(1.90, x_min=1.35, x_max=1.65, y_min=0.85, y_max=1.15)
-    obs = _obs_fill(mm)
     c_s = (0.4, 1.0, 0.0)
     c_g = (2.4, 1.0, 0.0)
     iv = feasible_alpha_interval(2.0, 0.0, config.V_MAX, G, **ENERGY_KW)
-    prof = terrain_profile(
-        c_s, c_g, mm, ROBOT_R, LEG, MAX_STEP, obs, N_LAT,
-        min_clearance_gate=GATE,
-    )
-    _, mc_wall = alpha_for_clearance(
-        prof, iv[0], iv[1], GATE,
-    )
+    mc_wall = _mc(mm, c_s, c_g, iv)
     ok = mc_wall < GATE
     print(f"  [{'PASS' if ok else 'FAIL'}] flat hop over a 1.90 m wall: "
           f"mc={mc_wall:+.3f} m -> "

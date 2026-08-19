@@ -40,31 +40,30 @@ Robot model
 -----------
 The robot's center of mass (the point the parabola actually tracks) sits
 `leg_length` above the contact foot. Arcs therefore start and end at
-`terrain_z + leg_length`, and terrain is sampled across the body's full width,
-not just along the centreline.
+`terrain_z + leg_length`. The body's width is not sampled per hop: it is baked
+into the terrain once, so only the centreline is ever read.
 
-Collision geometry is a single uniform vertical cylinder, radius `robot_radius`,
-spanning the foot to the top of the body (`leg_length + robot_radius` above the
-foot) — not a multi-region capsule. There is only one radius now, but flight
-clearance still reads TWO precomputed inflated fields built from it
-(`_inflated_foot`, tapered; `_inflated_com`, untapered) — an untapered field
-alone cannot enforce the safety-margin gate near the ground (it reports zero
-lift over flat terrain, so it can't tell "just clear" from "clear by the full
-gate"), and a tapered field alone cannot cheaply tell "flat ground" from "real
-obstacle" (it always shows some lift, even over nothing). See
-`clearance_floor_alpha`'s docstring for the exact roles.
+Collision geometry is a single uniform vertical cylinder of `robot_radius` with
+a FLAT BOTTOM at the foot and SQUARE EDGES, carrying a uniform
+`min_clearance_gate` safety margin. Because the margin around a square-edged
+body is square-edged too, the whole model is one precomputed array plus one
+constant: `Map2D5.inflated_field(robot_radius + min_clearance_gate)` dilates the
+terrain sideways by the body's lateral reach, and the margin is added at the
+comparison.
 
   * **Stance** (`Map2D5.standable_mask`): is the foot's own cell clear of
-    everything within `robot_radius + min_clearance_gate`? Reuses
-    `_inflated_com`'s exact field (same radius, same untapered form) — its own
-    reference height is the CoM, not the foot, so there is no near-ground cap
-    region to round off and the untapered form alone suffices.
-  * **Flight** (`clearance_floor_alpha`, the closed-form fast path; `terrain_profile`
-    / `clearance_for_alpha` survive as the sample-by-sample reference
-    implementation `test/test_inflated_field.py` validates it against):
-    same two-field test, evaluated along the arc's centreline at each interior
-    sample. Endpoints (u=0, u=X) are stance configurations and are masked out;
-    `standable_mask` gates them.
+    everything within `robot_radius + min_clearance_gate`? The same field, read
+    at standing height.
+  * **Flight** (`clearance_floor_alpha` for the shallowest clearing angle,
+    `arc_clearance` for the resulting gap): `foot_h(u) >= inflated(u) + gate` at
+    each interior centreline sample. Endpoints (u=0, u=X) are stance
+    configurations and are masked out; `standable_mask` gates them.
+
+There is deliberately no taper and no second field. A tapered (rounded) inflation
+belongs to a body with rounded edges — a sphere — and inflating by a sphere of
+`robot_radius + min_clearance_gate` charges the body's WIDTH as vertical
+clearance underneath a body that has no underside. That was an earlier
+implementation and it over-rejected everywhere.
 
 Clearance is a hard feasibility gate (`min_clearance_gate`), not a cost term:
 a hop either has an arc that stays clear of the terrain or it does not exist.
@@ -72,7 +71,6 @@ a hop either has an arc that stays clear of the terrain or it does not exist.
 
 import heapq
 import math
-from typing import NamedTuple
 
 import numpy as np
 
@@ -279,10 +277,10 @@ def min_energy_tan(X: float, Z: float) -> float:
     textbook 45 degrees.
 
     This is the angle that minimises injected energy, so it is what
-    `alpha_for_clearance` aims at — but note it is usually *outside* the feasible
-    interval, below its floor, because the energy floor from the previous hop
-    starts at the steep branch. It matters only when the incoming speed is too
-    low to reach the target at all.
+    `clearance_floor_alpha` is measured against — but note it is usually
+    *outside* the feasible interval, below its floor, because the energy floor
+    from the previous hop starts at the steep branch. It matters only when the
+    incoming speed is too low to reach the target at all.
     """
     return (Z + math.hypot(Z, X)) / X
 
@@ -403,7 +401,7 @@ def feasible_alpha_interval(
     Campana & Laumond's BEAM, plus this robot's energy chain. Given `X` and `Z`,
     choosing `alpha` fixes the parabola completely, so every constraint reduces
     to an interval on `alpha`. Arc height is monotone increasing in `tan(alpha)`
-    (see `alpha_for_clearance`), so "higher parabola" and "larger alpha" are the
+    (see `clearance_floor_alpha`), so "higher parabola" and "larger alpha" are the
     same statement and every constraint below is literally a bound on how high
     the arc may be.
 
@@ -684,73 +682,32 @@ def predict_trajectory(
     return pts
 
 
-class ArcProfile(NamedTuple):
-    """Everything about a hop that does *not* depend on the takeoff angle.
-
-    Terrain sampling is by far the expensive part of validating a hop, and the
-    XY corridor the body sweeps is fixed by the endpoints alone — only the
-    arc's height varies with alpha. Splitting the two lets a whole sweep of
-    candidate angles reuse one terrain lookup (see `alpha_for_clearance`).
-
-    Terrain is stored **per (u, lateral offset) sample** — no max collapse —
-    because the clearance check needs both the lateral offset `r` and the
-    terrain height at that offset. Collapsing to max terrain per `u` throws
-    away `r` and cannot express the foot bottom-cap.
-    """
-    u: np.ndarray            # horizontal traversal samples, shape (n_u,)
-    terrain: np.ndarray      # bilinear terrain, shape (n_u, n_lateral)
-    offsets: np.ndarray      # signed lateral offsets, shape (n_lateral,)
-    X: float                 # horizontal hop distance
-    Z: float                 # terrain elevation change, z_g - z_s
-    z_s: float               # CoM height at takeoff = terrain + leg_length
-    radius: float            # the robot's single collision-cylinder radius
-    leg_length: float        # CoM height above the foot; foot_h = z_arc - L
-    min_clearance_gate: float  # the gate the caller will compare mc against;
-                               # used by clearance_for_alpha to size the
-                               # endpoint-transition mask so mc doesn't stall
-                               # at the mask boundary.
-    out_of_bounds: bool      # centreline left the map -> hop is infeasible
-
-
-def terrain_profile(
+def _arc_samples(
     c_s: tuple[float, float, float],
     c_g: tuple[float, float, float],
     height_map: Map2D5,
-    radius: float,
-    leg_length: float,
+    inflated: np.ndarray,
     max_step: float,
-    obstacle_fill: float,
-    n_lateral: int = 3,
-    min_clearance_gate: float = 0.0,
-) -> ArcProfile | None:
-    """Sample the terrain under the corridor the robot's body sweeps.
+):
+    """March the hop's centreline and read the inflated field along it.
 
-    Marches the closed interval `u in [0, X]` in steps of
-    `min(max_step, height_map.resolution / 3)`, so terrain is sampled at least
-    ~3x per grid cell. At each `u`, `n_lateral` points spanning
-    `[-(radius + min_clearance_gate), +(radius + min_clearance_gate)]`
-    perpendicular to travel are sampled. Terrain values are kept per-sample
-    (no max collapse) because the clearance check needs each sample's lateral
-    offset independently — see `clearance_for_alpha`.
+    Shared by `clearance_floor_alpha` and `arc_clearance` so the two cannot
+    drift: same sample spacing, same nearest-cell lookup, same `active` mask.
 
-    The corridor half-width includes `min_clearance_gate` (not just `r_max`)
-    so that terrain in the safety-margin band around the body is also
-    detected. `min_clearance_gate=0` reduces to the old body-only corridor.
+    Returns `(u, X, field, active)`, or `None` if the centreline leaves the map
+    or the hop is degenerate. `field[i]` is the tallest terrain within the
+    body's lateral reach of sample `i`; `active[i]` says whether that sample can
+    constrain the arc at all (see the endpoint exemption in
+    `clearance_floor_alpha`).
 
-    OBSTACLE cells read as `obstacle_fill` (a tall-wall value) so they block
-    arcs rather than producing bilinear artefacts.
-
-    Sampling is closed rather than trimmed at the endpoints. The endpoint
-    samples are stance configurations (foot on the ground) and are masked to
-    `+inf` by `clearance_for_alpha`, so they never rejct a hop on their own —
-    `standable_mask` is what gates stance at those points.
-
-    Lateral samples are clamped to the map (bilinear degrades to nearest-edge)
-    rather than failing the hop, so a body passing near the border does not
-    delete an `r_max`-wide ring of the map. Only the centreline leaving the
-    map marks the hop infeasible.
-
-    Returns `None` for a degenerate zero-length hop.
+    **The sampling step is not a free knob.** `clearance_floor_alpha`'s closed
+    form has a POLE at each end of the hop (its `u*(X-u)` denominator), so the
+    required takeoff angle is far more sensitive to sample spacing near the
+    endpoints than the field itself is — the field is smooth at the scale of its
+    own dilation radius, which is misleading here. Measured across the deck,
+    marching at `resolution` let 333 hops through that a sample-by-sample check
+    rejected, `resolution/2` let 20 through, and `resolution/3` let none. Hence
+    the clamp below.
     """
     x_s, y_s, t_s = c_s
     x_g, y_g, t_g = c_g
@@ -761,347 +718,6 @@ def terrain_profile(
     if X < 1e-9:
         return None
 
-    theta = math.atan2(dy, dx)
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
-
-    step = min(max_step, height_map.resolution / 3.0)
-    n = max(3, int(math.ceil(X / step)) + 1)
-    u = np.linspace(0.0, X, n)
-
-    cx = x_s + u * cos_t
-    cy = y_s + u * sin_t
-
-    out_of_bounds = bool(
-        np.any((cx < 0.0) | (cx >= height_map.size_x)
-               | (cy < 0.0) | (cy >= height_map.size_y))
-    )
-
-    corridor_half_width = radius + min_clearance_gate
-    if n_lateral <= 1:
-        offsets = np.zeros(1)
-    else:
-        offsets = np.linspace(-corridor_half_width, corridor_half_width, n_lateral)
-
-    # Perpendicular to travel is (-sin_t, cos_t).
-    px = cx[:, None] - offsets[None, :] * sin_t
-    py = cy[:, None] + offsets[None, :] * cos_t
-
-    z = height_map.sample_bilinear(px, py, obstacle_fill=obstacle_fill)
-
-    return ArcProfile(
-        u=u,
-        terrain=z,
-        offsets=offsets,
-        X=X,
-        Z=t_g - t_s,
-        z_s=t_s + leg_length,
-        radius=radius,
-        leg_length=leg_length,
-        min_clearance_gate=min_clearance_gate,
-        out_of_bounds=out_of_bounds,
-    )
-
-
-def clearance_for_alpha(profile: ArcProfile, alpha_s: float) -> float:
-    """Minimum body-to-terrain clearance over a profile at one takeoff angle.
-
-    Models the robot in flight as a single uniform-radius **cylinder**, radius
-    `profile.radius`, with axis from the foot (`foot_h = arc_z - leg_length`)
-    to the top of the body — not a multi-region capsule, but still two
-    distinct nearest-point geometries depending on where the terrain sample
-    falls relative to the foot, exactly as the old capsule model had (just
-    with one radius instead of three):
-
-    Terrain is treated as a solid column (pillar) from the ground up to
-    `h_terr`, the same convention `Map2D5.standable_mask` uses. For a terrain
-    sample at lateral offset `r` (signed) and height `h_terr`:
-
-        h_terr >= foot_h  : the pillar overlaps the cylinder's height range,
-                             so the closest points are at the same height —
-                             clearance is purely horizontal, `|r| - radius`
-                             (the cylinder's SIDE wall).
-        h_terr < foot_h   : the pillar falls short of the foot -> a genuine
-                             gap, nearest point is the bottom-cap hemisphere
-                             centred AT the foot point, `hypot(r, foot_h -
-                             h_terr) - radius`.
-
-    The min over all (u, r) samples is what the gate compares against. This
-    is also EXACTLY what `Map2D5.inflated_field(radius, taper=True)` computes
-    when queried at the foot's own height (see `clearance_floor_alpha`) — the
-    hemisphere-at-a-point convention, not a more literal "flat cap + rounded
-    rim" shape, is what keeps the two implementations in exact correspondence
-    rather than merely close.
-
-    **Endpoint-transition mask**. Under a rigid-vertical-leg flight model,
-    samples near u=0 and u=X have foot_h very close to the endpoint terrain
-    (arc rises quadratically from the takeoff CoM), so a naive bottom-cap
-    check would report the foot skimming ground and reject every hop.
-    `standable_mask` already validates stance at both endpoints, so this
-    function masks samples where the sample terrain is at-or-below the taller
-    endpoint AND the foot has not yet risen a full `radius` above that
-    endpoint. Walls (terrain > endpoint_max) are never masked — the arc must
-    still clear them meaningfully.
-
-    Monotonicity in `tan(α)`: raising α lifts `arc_z(u)` (and therefore
-    `foot_h`) at every interior `u` by the same amount, which only ever moves
-    a fixed terrain sample from the below-foot case toward (never away from)
-    the side-wall case, and clearance is continuous across that crossing (both
-    forms agree at `h_terr = foot_h`, where both reduce to `|r| - radius`) —
-    so overall clearance is monotone nondecreasing in `tan(α)`, and
-    `alpha_for_clearance`'s bisection remains valid.
-
-    This is the cheap half of the split: a handful of vectorized ops on an
-    array that `terrain_profile` already paid for.
-    """
-    if profile.out_of_bounds:
-        return -math.inf
-    z_arc = _arc_z(profile.u, profile.X, profile.Z, profile.z_s, alpha_s)
-    foot_h = z_arc - profile.leg_length  # shape (n_u,)
-    # below_foot > 0 -> terrain below the foot (bottom-cap region);
-    # below_foot <= 0 -> terrain reaches foot height or above (side-wall region).
-    below_foot = foot_h[:, None] - profile.terrain  # shape (n_u, n_lateral)
-    r_abs = np.abs(profile.offsets)[None, :]        # shape (1, n_lateral)
-    axis_dist = np.where(
-        below_foot > 0.0,
-        np.hypot(r_abs, below_foot),
-        r_abs + np.zeros_like(below_foot),
-    )
-    capsule_clearance = axis_dist - profile.radius
-    # Endpoint-transition mask. Near takeoff and landing the rigid-vertical-leg
-    # model reports the foot grazing endpoint terrain (foot_h ≈ terrain → tiny
-    # below_foot → tiny cap_clearance → spurious fail). `standable_mask` has
-    # already validated stance there. Mask samples where BOTH:
-    #   (a) the terrain at this sample is at or below the taller endpoint's
-    #       terrain — so this isn't a wall, and
-    #   (b) the foot has not yet risen a full `radius + gate` above the
-    #       taller endpoint's terrain — so we're still in the takeoff/landing
-    #       transition where the real leg is retracted, not extended.
-    # The `+ gate` term is what stops mc from stalling at the mask boundary:
-    # without it, the first sample past `foot_h = endpoint_max + radius` would
-    # give `capsule_clear ≈ 0 < gate` and drag mc down to zero regardless of
-    # what the real flight-portion of the arc looks like.
-    # Walls (terrain above endpoint_max) are never masked — the arc must
-    # actually clear them. Endpoint rows (u=0, u=X) are subsumed by this mask
-    # because `foot_h = t_s` and `foot_h = t_g` there.
-    t_s = profile.z_s - profile.leg_length
-    t_g = t_s + profile.Z
-    endpoint_max = max(t_s, t_g)
-    near_endpoint_terrain = profile.terrain <= endpoint_max + 1e-9
-    lift_threshold = endpoint_max + profile.radius + profile.min_clearance_gate
-    foot_low = (foot_h < lift_threshold)[:, None]
-    capsule_clearance = np.where(
-        near_endpoint_terrain & foot_low, np.inf, capsule_clearance,
-    )
-    return float(np.min(capsule_clearance))
-
-
-def min_clearance(
-    c_s: tuple[float, float, float],
-    c_g: tuple[float, float, float],
-    alpha_s: float,
-    height_map: Map2D5,
-    radius: float,
-    leg_length: float,
-    max_step: float,
-    obstacle_fill: float,
-    n_lateral: int = 3,
-    min_clearance_gate: float = 0.0,
-) -> float:
-    """Minimum body-to-terrain clearance over the hop.
-
-    Convenience wrapper: `terrain_profile` followed by `clearance_for_alpha`.
-    Use the two directly when evaluating several angles over one hop.
-
-    Returns `-inf` if the arc leaves the map, `+inf` for a degenerate
-    zero-length hop. Note there is no `g` parameter — the closed form in
-    `_arc_z` does not need one.
-    """
-    profile = terrain_profile(
-        c_s, c_g, height_map, radius, leg_length,
-        max_step, obstacle_fill, n_lateral,
-        min_clearance_gate=min_clearance_gate,
-    )
-    if profile is None:
-        return math.inf
-    return clearance_for_alpha(profile, alpha_s)
-
-
-def alpha_for_clearance(
-    profile: ArcProfile,
-    alpha_min: float,
-    alpha_max: float,
-    gate: float,
-    n_bisect: int = 8,
-) -> tuple[float, float]:
-    """Pick the takeoff angle needing the least injected energy that still clears.
-
-    Returns `(alpha_s, clearance)`. The caller rejects the hop when the
-    returned clearance is below `gate`.
-
-    Two monotonicity facts make this exact rather than a search.
-
-    Clearance is monotone nondecreasing in `tan(alpha)`: from `_arc_z`,
-    `dz/d(tan a) = u * (X - u) / X >= 0` for every `u` in `[0, X]`, so a
-    steeper angle lifts the whole arc at once and never trades height at one
-    point for height at another. The pointwise minimum inherits that, so the
-    set of clearing angles is always an upward-closed interval
-    `[alpha_c, alpha_max]` — which makes `alpha_c` both unique and bisectable.
-
-    Required speed, meanwhile, is U-shaped in alpha with its minimum at
-    `min_energy_tan` — so the least-injection angle over `[alpha_c, alpha_max]`
-    is exactly `clamp(alpha*, alpha_c, alpha_max)`, no search needed.
-
-    In practice the clamp almost always returns `alpha_c` itself: `alpha*` sits
-    below `alpha_min` whenever the previous hop's energy floor is binding, since
-    that floor starts at the steep branch above the minimum-energy angle. The
-    clamp matters only when the incoming speed is too low to reach the target
-    at all, where the floor goes vacuous and `alpha*` lands inside the interval.
-
-    Cost: one clearance evaluation in the common case (`alpha_min` already
-    clears), two on rejection, and the bisection only on genuinely tight hops.
-
-    NOTE this replaced a max-margin-midpoint policy. The accept/reject verdict
-    is identical either way — both reject only when even `alpha_max` fails —
-    but the reported angle is now the shallowest sufficient one rather than the
-    most comfortable one, because energy spent here is energy the *next* hop
-    does not have.
-    """
-    alpha_c = alpha_min
-    mc_c = clearance_for_alpha(profile, alpha_min)
-
-    if mc_c < gate:
-        mc_max = clearance_for_alpha(profile, alpha_max)
-        if mc_max < gate:
-            return alpha_max, mc_max  # no feasible angle clears
-
-        lo, hi = alpha_min, alpha_max  # clears at hi, not at lo
-        for _ in range(n_bisect):
-            mid = 0.5 * (lo + hi)
-            if clearance_for_alpha(profile, mid) >= gate:
-                hi = mid
-            else:
-                lo = mid
-        alpha_c, mc_c = hi, clearance_for_alpha(profile, hi)
-
-    alpha_star = math.atan(min_energy_tan(profile.X, profile.Z))
-    if alpha_star <= alpha_c:
-        return alpha_c, mc_c
-    alpha_s = min(alpha_star, alpha_max)
-    return alpha_s, clearance_for_alpha(profile, alpha_s)
-
-
-def clearance_floor_alpha(
-    c_s: tuple[float, float, float],
-    c_g: tuple[float, float, float],
-    height_map: Map2D5,
-    inflated_foot: np.ndarray,
-    inflated_com: np.ndarray,
-    leg_length: float,
-    max_step: float,
-) -> float | None:
-    """Shallowest takeoff angle whose arc clears the terrain — in closed form.
-
-    The configuration-space replacement for `terrain_profile` +
-    `alpha_for_clearance`. Returns `alpha_c` in radians, `-inf` when nothing
-    along the hop constrains the arc at all, or `None` when the centreline
-    leaves the map. The caller still clamps into `[alpha_min, alpha_max]` and
-    rejects when `alpha_c` exceeds `alpha_max` — this function knows nothing
-    about the energy chain or the friction cones.
-
-    Two fields, ONE radius. Both `inflated_foot` and `inflated_com` are built
-    from the same `robot_radius + min_clearance_gate` now (there is only one
-    radius in the model), but they still cannot collapse into a single array,
-    because they answer two different questions:
-
-      * `inflated_com` (`taper=False`) is the cheap, EXACT "is there a real
-        obstacle here at all" detector: an untapered field returns the raw
-        terrain height with no lift added, so flat ground reads back as
-        flat ground. A tapered field cannot serve this role — it always
-        reports a lift of up to a full `radius` even over perfectly flat
-        terrain (`sqrt(radius^2 - 0^2) = radius` directly overhead), which
-        would flag every hop over open ground as "constrained."
-      * `inflated_foot` (`taper=True`) is what actually prices a genuine
-        obstacle once one is detected, matching `clearance_for_alpha`'s
-        bottom-cap hemisphere exactly (see its docstring) — required because
-        the untapered field alone does not enforce the safety-margin GATE
-        near the ground: it only asks "is the foot below this terrain," with
-        no minimum standoff, which is loose enough to fail
-        `test/test_inflated_field.py`'s never-more-permissive sweep.
-
-    Two facts make the rest of this exact rather than a search.
-
-    **The robot is a point.** `Map2D5.inflated_field` has already baked the
-    body's radius into the terrain, so the whole cylinder test collapses to
-    one scalar comparison per sample, against
-
-        H(u) = inflated_foot(u)
-
-    and the hop clears at `u` iff `foot_h(u) >= H(u)`. That single comparison
-    is EXACTLY the reference two-branch test in `clearance_for_alpha` — terrain
-    below the foot needs `hypot(d, foot_h - h) >= radius + gate` (which is what
-    the tapered field's `h + sqrt(R^2 - d^2)` bound encodes), and terrain at or
-    above the foot needs `d >= radius + gate` (which the same bound gives, since
-    the lift is then `>= 0` on top of an already-too-high `h`). Verified by
-    brute force against the reference, not assumed.
-
-    **Arc height is linear in `tan(alpha)`.** From `_arc_z`, with the leg offset
-    cancelled out so `foot_h(0) = t_s`,
-
-        foot_h(u) = t_s + Z*u^2/X^2 + T * u*(X - u)/X       (T = tan alpha)
-
-    so `foot_h(u) >= H(u)` inverts to a bound on `T` directly:
-
-        T_req(u) = ( H(u) - t_s - Z*u^2/X^2 ) * X / ( u*(X - u) )
-
-    and `alpha_c = atan(max_u T_req(u))`. One vectorized pass replaces the
-    1.5-2.3 `clearance_for_alpha` calls and 8-step bisection this supersedes,
-    and it yields the exact crossover rather than a bracket around it.
-
-    **The endpoint exemption**, which the old code expressed as an
-    alpha-dependent mask, becomes alpha-FREE here: a sample whose terrain is at
-    or below `max(t_s, t_g)` can never reject the hop. Either the old mask
-    covered it, or the foot had already risen a full `radius + gate` above it,
-    which puts it in the bottom-cap branch with clearance to spare. So only
-    terrain strictly above BOTH endpoints constrains anything — tested as
-    `inflated_com(u) > max(t_s, t_g)`, using the untapered field specifically
-    because it is the one that reads back as exactly the raw terrain height
-    with no artificial lift, so flat ground never registers as "active."
-    Consequence worth knowing: a hop up onto a step, or down off one, is
-    unconstrained by clearance no matter how big the step, because nothing en
-    route is above both ends. Only genuine walls bite.
-
-    `u = 0` and `u = X` are excluded (zero denominator). They are stance
-    configurations, and `Map2D5.standable_mask` gates them — the same division of
-    labour `clearance_for_alpha` documents. **Do not try to check them here with
-    the fields instead.** An inflated field is a DISC, so at `u = 0` it also sees
-    terrain *behind* the takeoff, which the reference's corridor never samples;
-    on a graded map that is fatal rather than merely conservative. On
-    `maps/slope_crest.py`'s 0.35 ramp the ground 0.24 m uphill sits 0.084 m above
-    the foot, so an endpoint test rejected every hop off every ramp cell and
-    `plan()` returned `None` straight from the start state.
-
-    **The sampling step is not a free knob.** `T_req` has a POLE at each end (the
-    `u*(X-u)` denominator), so it is far more sensitive to sample spacing near
-    the endpoints than the fields themselves are — the fields are smooth at the
-    scale of their own dilation radius, which is misleading here. Measured across
-    the deck, marching at `resolution` lets 333 hops through that
-    `clearance_for_alpha` rejects, `resolution/2` lets 20 through, and
-    `resolution/3` — the density `terrain_profile` itself uses — lets none. Hence
-    the clamp below. The win over the old check is dropping the lateral rake and
-    the bisection, not a coarser march.
-    """
-    x_s, y_s, t_s = c_s
-    x_g, y_g, t_g = c_g
-
-    dx = x_g - x_s
-    dy = y_g - y_s
-    X = math.hypot(dx, dy)
-    if X < 1e-9:
-        return None
-
-    # Matches `terrain_profile`'s density, and that is NOT a free knob: see the
-    # docstring's note on the pole at u -> 0, X.
     step = min(max_step, height_map.resolution / 3.0)
     n = max(3, int(math.ceil(X / step)) + 1)
     u = np.linspace(0.0, X, n)
@@ -1118,25 +734,131 @@ def clearance_floor_alpha(
     np.clip(ci, 0, height_map.cols - 1, out=ci)
     np.clip(ri, 0, height_map.rows - 1, out=ri)
 
-    f_com = inflated_com[ri, ci]
-    # `inflated_foot` alone IS the height bound: it is provably >= `inflated_com`
-    # pointwise (same radius, same reach, non-negative taper lift), so a
-    # `max(inflated_foot, inflated_com - leg_length)` would never pick the second
-    # term. `inflated_com` is used ONLY for the `active` mask below.
-    H = inflated_foot[ri, ci]
+    field = inflated[ri, ci]
 
-    # Only terrain above BOTH endpoints can reject the hop — see the docstring.
-    active = f_com > max(t_s, t_g)
-    active[0] = False       # stance configurations; standable_mask gates these
+    # Only terrain above BOTH endpoints can reject the hop, and u=0/u=X are
+    # stance configurations `standable_mask` owns — see `clearance_floor_alpha`.
+    active = field > max(t_s, t_g)
+    active[0] = False
     active[-1] = False
+
+    return u, X, field, active
+
+
+def clearance_floor_alpha(
+    c_s: tuple[float, float, float],
+    c_g: tuple[float, float, float],
+    height_map: Map2D5,
+    inflated: np.ndarray,
+    gate: float,
+    leg_length: float,
+    max_step: float,
+) -> float | None:
+    """Shallowest takeoff angle whose arc clears the terrain — in closed form.
+
+    Returns `alpha_c` in radians, `-inf` when nothing along the hop constrains
+    the arc at all, or `None` when the centreline leaves the map. The caller
+    still clamps into `[alpha_min, alpha_max]` and rejects when `alpha_c`
+    exceeds `alpha_max` — this function knows nothing about the energy chain or
+    the friction cones.
+
+    **The robot is a point, and the test is one comparison.**
+    `Map2D5.inflated_field` has already dilated the terrain sideways by the
+    body's full lateral reach (`robot_radius + gate`), so the whole
+    cylinder-vs-terrain question at sample `u` collapses to
+
+        foot_h(u) >= inflated(u) + gate
+
+    That is the sharp-edged model in full: the body is a cylinder with a flat
+    bottom and square edges, its safety margin is the same shape grown outward,
+    and the margin is therefore a plain constant — `gate` of headroom under the
+    foot, `gate` of lateral standoff, each measured on its own. There is no
+    falloff with lateral distance and no rounding at the bottom edge, because a
+    flat-bottomed cylinder has neither. (Inflating by a SPHERE here was an
+    earlier implementation and was wrong twice over: it charged the body radius
+    as vertical clearance underneath the foot, where a cylinder has no extent at
+    all, demanding `radius + gate` of headroom over flat ground.)
+
+    **Arc height is linear in `tan(alpha)`.** From `_arc_z`, with the leg offset
+    cancelled out so `foot_h(0) = t_s`,
+
+        foot_h(u) = t_s + Z*u^2/X^2 + T * u*(X - u)/X       (T = tan alpha)
+
+    so `foot_h(u) >= inflated(u) + gate` inverts to a bound on `T` directly:
+
+        T_req(u) = ( inflated(u) + gate - t_s - Z*u^2/X^2 ) * X / ( u*(X - u) )
+
+    and `alpha_c = atan(max_u T_req(u))`. One vectorized pass yields the exact
+    crossover rather than a bracket around it — no bisection, no per-hop terrain
+    sampling.
+
+    **The endpoint exemption.** A sample whose field value is at or below
+    `max(t_s, t_g)` can never reject the hop, so `_arc_samples` masks it out
+    alpha-free. Either the arc has barely lifted, in which case the
+    rigid-vertical-leg model would spuriously report the foot grazing the
+    endpoint terrain it is standing on, or the foot has already risen a full
+    `robot_radius + gate` above that terrain — which is more than the `gate` the
+    test asks for, so the sample passes anyway.
+
+    Consequence worth knowing: a hop up onto a step, or down off one, is
+    unconstrained by clearance no matter how big the step, because nothing en
+    route is above both ends. Only genuine walls bite.
+
+    `u = 0` and `u = X` are excluded outright (zero denominator). They are
+    stance configurations, and `Map2D5.standable_mask` gates them. **Do not try
+    to check them here with the field instead.** An inflated field is a DISC, so
+    at `u = 0` it also sees terrain *behind* the takeoff; on a graded map that is
+    fatal rather than merely conservative. On `maps/slope_crest.py`'s 0.35 ramp
+    the ground 0.24 m uphill sits 0.084 m above the foot, so an endpoint test
+    rejected every hop off every ramp cell and `plan()` returned `None` straight
+    from the start state.
+    """
+    sampled = _arc_samples(c_s, c_g, height_map, inflated, max_step)
+    if sampled is None:
+        return None
+    u, X, field, active = sampled
     if not active.any():
         return -math.inf
 
+    t_s = c_s[2]
+    Z = c_g[2] - t_s
     ua = u[active]
-    Z = t_g - t_s
-    numer = H[active] - t_s - Z * (ua * ua) / (X * X)
+    numer = field[active] + gate - t_s - Z * (ua * ua) / (X * X)
     denom = ua * (X - ua) / X
     return float(math.atan(float(np.max(numer / denom))))
+
+
+def arc_clearance(
+    c_s: tuple[float, float, float],
+    c_g: tuple[float, float, float],
+    height_map: Map2D5,
+    inflated: np.ndarray,
+    leg_length: float,
+    max_step: float,
+    alpha_s: float,
+) -> float:
+    """Smallest gap between the foot and the inflated terrain, at one angle.
+
+    The scalar the planner's gate compares against `min_clearance_gate`, and the
+    number the figures annotate arcs with. `+inf` when nothing along the hop
+    constrains the arc; `-inf` when the centreline leaves the map.
+
+    This is the same model `clearance_floor_alpha` inverts, evaluated forwards:
+    `min over active samples of (foot_h(u) - inflated(u))`. Sharing
+    `_arc_samples` is what keeps the two exactly consistent, so an arc reported
+    as clearing by `alpha >= alpha_c` never annotates as sub-gate here.
+    """
+    sampled = _arc_samples(c_s, c_g, height_map, inflated, max_step)
+    if sampled is None:
+        return -math.inf
+    u, X, field, active = sampled
+    if not active.any():
+        return math.inf
+
+    t_s = c_s[2]
+    Z = c_g[2] - t_s
+    foot_h = _arc_z(u, X, Z, t_s + leg_length, alpha_s) - leg_length
+    return float(np.min(foot_h[active] - field[active]))
 
 
 class HoppingAStarPlanner:
@@ -1175,7 +897,7 @@ class HoppingAStarPlanner:
     stay live.
 
     Among the angles that survive every gate, the planner flies the one needing
-    the LEAST injected energy (`alpha_for_clearance`), because energy spent on
+    the LEAST injected energy, because energy spent on
     this hop is energy the next hop does not have.
 
     Clearance is a pure feasibility gate — it does not shape cost. Edge cost is
@@ -1229,8 +951,6 @@ class HoppingAStarPlanner:
         leg_length: float = 0.4,
         min_clearance_gate: float = 0.15,
         arc_max_step: float = 0.05,
-        n_lateral: int = 3,
-        obstacle_wall_extra: float = 1.5,
         # Lattice spacing of the scanline circle-fill that generates candidate
         # landing cells, in world metres, AT the reference radius
         # `hop_scan_step_ref_radius` below — not a flat spacing at every
@@ -1299,7 +1019,6 @@ class HoppingAStarPlanner:
         self.leg_length = leg_length
         self.min_clearance_gate = min_clearance_gate
         self.arc_max_step = arc_max_step
-        self.n_lateral = n_lateral
         self.hop_scan_step = hop_scan_step
         self.hop_scan_step_ref_radius = hop_scan_step_ref_radius
         self.disable_clearance = disable_clearance
@@ -1319,20 +1038,6 @@ class HoppingAStarPlanner:
         # first hop then needs no special case anywhere in the search.
         self.v_g_initial = math.sqrt(2.0 * g * h_initial / eta)
 
-        # Height used in place of OBSTACLE sentinels when terrain is sampled
-        # BILINEARLY. Setting it well above the tallest real cell makes OBSTACLE
-        # cells act as un-flyable walls.
-        #
-        # No longer read by the planner itself: `Map2D5.inflated_field` gives
-        # OBSTACLE cells `+inf` outright, which is strictly stronger and needs no
-        # calibration against `MAX_APEX_HEIGHT`. It is kept because the reference
-        # implementation (`terrain_profile`) needs it, and because most of
-        # `test/demo_*.py` reads `planner._obstacle_fill` to reproduce what the
-        # planner sees.
-        non_obs = map_env.grid[map_env.grid != Map2D5.OBSTACLE]
-        map_max_z = float(non_obs.max()) if non_obs.size > 0 else 0.0
-        self._obstacle_fill = map_max_z + obstacle_wall_extra
-
         # Cells where the robot can physically stand. Screening landing cells
         # against this catches body-vs-terrain overlap for ~1us instead of
         # discovering the same collision by marching a whole arc.
@@ -1344,34 +1049,22 @@ class HoppingAStarPlanner:
         # contact points. Like `_standable`, computed once and read per edge.
         self._normals = map_env.surface_normals()
 
-        # Terrain inflated by the body, so the flight-clearance check can treat
-        # the robot as a POINT (see `Map2D5.inflated_field` and
-        # `clearance_floor_alpha`). Two fields, ONE radius now — both built
-        # from `robot_radius + min_clearance_gate`, unlike the old capsule
-        # model's two different radii, but they still don't collapse into one
-        # array: `_inflated_com` (untapered) is the exact "is there a real
-        # obstacle at all" detector (a tapered field always shows a lift even
-        # over flat ground), and `_inflated_foot` (tapered) is what correctly
-        # enforces the safety-margin gate once an obstacle is found — an
-        # untapered-only check does not enforce any minimum standoff near the
-        # ground, which fails `test/test_inflated_field.py`'s never-more-
-        # permissive sweep. `standable_mask` above only needs the untapered
-        # form (its own reference height is the CoM, `leg_length` above the
-        # foot, not the foot itself, so there is no analogous near-ground cap
-        # region to round off) and reuses `_inflated_com`'s exact args, so it
-        # costs nothing extra: `inflated_field` memoises on `(radius, taper,
-        # lookup_pad)`.
+        # Terrain dilated sideways by the body's full lateral reach, so the
+        # flight-clearance check can treat the robot as a POINT (see
+        # `Map2D5.inflated_field` and `clearance_floor_alpha`). ONE field: the
+        # body is a sharp-edged cylinder, so the margin is a plain constant
+        # added at the comparison rather than a shape baked into the terrain,
+        # and there is nothing left for a second array to say. (There were two
+        # while the field was tapered — one tapered to price obstacles, one
+        # untapered to detect them. Both were artefacts of the taper.)
         #
         # This is what replaced per-hop terrain sampling. A profile was keyed on
         # a cell PAIR (~7M of them, hence a 60k FIFO cache running at a 17-34%
-        # hit rate and re-reading each map cell ~62,000 times per plan); these
-        # are keyed on a cell, so all 2500 answers are computed here, once, in
-        # well under a millisecond.
-        self._inflated_foot = map_env.inflated_field(
-            robot_radius + min_clearance_gate, taper=True,
-        )
-        self._inflated_com = map_env.inflated_field(
-            robot_radius + min_clearance_gate, taper=False,
+        # hit rate and re-reading each map cell ~62,000 times per plan); this is
+        # keyed on a cell, so all 2500 answers are computed here, once, in well
+        # under a millisecond.
+        self._inflated = map_env.inflated_field(
+            robot_radius + min_clearance_gate,
         )
 
         # Convert start/goal to grid coordinates
@@ -1661,8 +1354,8 @@ class HoppingAStarPlanner:
             alpha_c = clearance_floor_alpha(
                 (cx, cy, float(current_z)), (nx, ny, float(neighbor_z)),
                 self.map_env,
-                self._inflated_foot,
-                self._inflated_com,
+                self._inflated,
+                self.min_clearance_gate,
                 self.leg_length,
                 self.arc_max_step,
             )

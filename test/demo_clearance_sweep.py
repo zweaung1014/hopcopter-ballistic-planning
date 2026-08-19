@@ -38,12 +38,8 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 import config
-from demo_common import out_path
-from hopping_astar_planner import (
-    alpha_for_clearance,
-    feasible_alpha_interval,
-    terrain_profile,
-)
+from demo_common import angle_and_clearance, out_path
+from hopping_astar_planner import feasible_alpha_interval
 from map2d5 import Map2D5
 from visualizer import Visualizer, draw_arc_side_view
 
@@ -60,7 +56,7 @@ RES = config.CELL_RESOLUTION
 PILLAR_X = 2.7       # m; pillar center x
 PILLAR_Y = 1.5       # m; pillar center y
 PILLAR_HALF = 0.15   # m; pillar half-size in x and y
-PILLAR_H = 1.6       # m; pillar height. Calibrated for the leg/body geometry AND
+PILLAR_H = 0.4       # m; pillar height. Calibrated for the leg/body geometry AND
                      # for the energy chain: a robot that cannot shed the speed it
                      # arrives with is forced steep on short hops, and a
                      # near-vertical arc clears a low pillar trivially. See the
@@ -77,7 +73,6 @@ ROBOT_R = config.ROBOT_RADIUS
 LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
-WALL_EXTRA = config.OBSTACLE_WALL_EXTRA
 
 # The energy state the sweep is evaluated in: the chain's seed, i.e. the robot at
 # the start of a plan. Without it `feasible_alpha_interval` reverts to the
@@ -102,15 +97,11 @@ def build_map() -> Map2D5:
     return m
 
 
-def obstacle_fill_for(m: Map2D5) -> float:
-    non_obs = m.grid[m.grid != Map2D5.OBSTACLE]
-    z_max = float(non_obs.max()) if non_obs.size else 0.0
-    return z_max + WALL_EXTRA
-
-
 def main() -> int:
     m = build_map()
-    obs_fill = obstacle_fill_for(m)
+    # The terrain the clearance gate actually reads: dilated sideways by the
+    # body's full lateral reach. Memoised, so this is the planner's own array.
+    inflated = m.inflated_field(ROBOT_R + GATE)
 
     n = len(TAKEOFF_XS)
     fig = plt.figure(figsize=(4.2 * n, 8.0))
@@ -140,15 +131,10 @@ def main() -> int:
             n_reject += 1
             continue
         alpha_min, alpha_max = iv
-        profile = terrain_profile(
-            c_s, c_g, m, ROBOT_R, LEG, MAX_STEP, obs_fill,
-            config.ARC_LATERAL_SAMPLES,
-            min_clearance_gate=GATE,
-        )
         # Same rule the planner uses: the least-injection angle that clears,
         # which is the shallowest one whenever the energy floor is binding.
-        alpha_s, mc = alpha_for_clearance(
-            profile, alpha_min, alpha_max, GATE,
+        alpha_s, mc = angle_and_clearance(
+            c_s, c_g, m, inflated, GATE, LEG, MAX_STEP, alpha_min, alpha_max,
         )
         verdict = "ACCEPT" if mc >= GATE else "REJECT"
         print(
@@ -191,10 +177,8 @@ def main() -> int:
 
         # --- side-view panel ---
         draw_arc_side_view(
-            axes_side[i], c_s, c_g, alpha_s, m, ROBOT_R, LEG,
-            obs_fill, MAX_STEP,
+            axes_side[i], c_s, c_g, alpha_s, m, ROBOT_R, LEG, MAX_STEP,
             min_clearance_gate=GATE,
-            n_lateral=config.ARC_LATERAL_SAMPLES,
         )
         # Y range harmonised so panels are comparable.
         axes_side[i].set_ylim(-0.05, max(PILLAR_H + 0.4, 1.2))

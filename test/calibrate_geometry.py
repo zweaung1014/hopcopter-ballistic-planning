@@ -29,13 +29,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 import config
-from demo_common import V_MAX, make_planner, planner_alpha_interval
-from hopping_astar_planner import (
-    alpha_for_clearance,
-    feasible_alpha_interval,
-    max_hop_radius,
-    terrain_profile,
+from demo_common import (
+    V_MAX,
+    make_planner,
+    planner_alpha_interval,
+    planner_angle_and_clearance,
 )
+from hopping_astar_planner import feasible_alpha_interval, max_hop_radius
 from map2d5 import Map2D5
 
 # Reference hop radius for this standalone geometry search. `HOP_RADIUS` is no
@@ -135,18 +135,15 @@ def probe(m: Map2D5, x_takeoff: float, x_landing: float, planner) -> dict:
         res.update(gate="physics", mc=None, alpha_s=None)
         return res
 
-    profile = terrain_profile(
-        (p0[0], p0[1], z0), (p1[0], p1[1], z1),
-        m, planner.robot_radius, planner.leg_length,
-        planner.arc_max_step, planner._obstacle_fill, planner.n_lateral,
-        min_clearance_gate=planner.min_clearance_gate,
+    picked = planner_angle_and_clearance(
+        planner, (p0[0], p0[1], z0), (p1[0], p1[1], z1), iv[0], iv[1],
     )
-    a, mc = alpha_for_clearance(
-        profile, iv[0], iv[1],
-        planner.min_clearance_gate,
-    )
+    if picked is None:
+        res.update(gate="off-map", mc=None, alpha_s=None)
+        return res
+    a, mc = picked
     if math.isinf(mc):
-        gate = "off-map"
+        gate = "unconstrained"
     elif mc < planner.min_clearance_gate:
         gate = "clearance"
     else:

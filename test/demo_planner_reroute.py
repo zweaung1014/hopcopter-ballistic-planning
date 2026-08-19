@@ -38,13 +38,15 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 import config
-from demo_common import out_path, planner_alpha_interval
+from demo_common import (
+    out_path,
+    planner_alpha_interval,
+    planner_angle_and_clearance,
+)
 from hopping_astar_planner import (
     HoppingAStarPlanner,
-    alpha_for_clearance,
     feasible_alpha_interval,
     max_hop_radius,
-    terrain_profile,
 )
 from map2d5 import Map2D5
 from visualizer import Visualizer, draw_arc_side_view
@@ -56,11 +58,14 @@ MAP_Y = 5.0
 RES = config.CELL_RESOLUTION
 
 # Wall-like pillar blocking the direct XY route. Painted as an OBSTACLE region,
-# so its stored height is irrelevant — the clearance check substitutes
-# `_obstacle_fill = map_max_z + OBSTACLE_WALL_EXTRA`, which config guarantees is
-# taller than any arc this robot can fly.
+# so its stored height is irrelevant — `Map2D5.inflated_field` gives OBSTACLE
+# cells `+inf`, which no arc can clear at any takeoff angle.
 PILLAR_XMIN, PILLAR_XMAX = 2.8, 3.2
 PILLAR_YMIN, PILLAR_YMAX = 1.0, 3.0
+
+#: Height to draw the OBSTACLE pillar at. It is infinitely tall to the
+#: clearance check; figures need a finite number.
+PILLAR_DISPLAY_H = 1.5
 
 START = (1.0, 2.0)
 GOAL = (5.0, 2.0)
@@ -71,18 +76,11 @@ V_MAX = config.V_MAX
 def build_map() -> Map2D5:
     m = Map2D5(size_x=MAP_X, size_y=MAP_Y, resolution=RES)
     # Represent the pillar as an OBSTACLE region: landing on it is illegal,
-    # and the arc-clearance check treats these cells as tall walls (via the
-    # planner's `_obstacle_fill = map_max_z + OBSTACLE_WALL_EXTRA`). That
-    # forces the planner to route around rather than land on top of the
-    # pillar.
+    # and the arc-clearance check reads these cells as infinitely tall, so no
+    # arc clears them. That forces the planner to route around rather than
+    # land on top of the pillar.
     m.set_obstacle_region(PILLAR_XMIN, PILLAR_YMIN, PILLAR_XMAX, PILLAR_YMAX)
     return m
-
-
-def obstacle_fill_for(m: Map2D5) -> float:
-    non_obs = m.grid[m.grid != Map2D5.OBSTACLE]
-    z_max = float(non_obs.max()) if non_obs.size else 0.0
-    return z_max + config.OBSTACLE_WALL_EXTRA
 
 
 def make_planner(m: Map2D5) -> HoppingAStarPlanner:
@@ -106,8 +104,6 @@ def make_planner(m: Map2D5) -> HoppingAStarPlanner:
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        n_lateral=config.ARC_LATERAL_SAMPLES,
-        obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         hop_scan_step=config.HOP_SCAN_STEP,
         hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
     )
@@ -130,7 +126,6 @@ def enumerate_ring_candidates(
     m = planner.map_env
     px, py = m.grid_to_world(*parent_cell)
     pz = float(m.grid[parent_cell[0], parent_cell[1]])
-    obs_fill = planner._obstacle_fill
     r = max_hop_radius(
         planner.v_g_initial, planner.eta, planner.e_inject_max, planner.mass,
         planner.g, planner.V_max,
@@ -171,14 +166,12 @@ def enumerate_ring_candidates(
             entry["reason"] = "no feasible alpha (friction cone / leg energy / geometry)"
             out.append(entry)
             continue
-        profile = terrain_profile(
-            c_s, c_g, m, planner.robot_radius, planner.leg_length,
-            planner.arc_max_step, obs_fill, planner.n_lateral,
-        )
-        a, mc = alpha_for_clearance(
-            profile, iv[0], iv[1],
-            planner.min_clearance_gate,
-        )
+        picked = planner_angle_and_clearance(planner, c_s, c_g, iv[0], iv[1])
+        if picked is None:
+            entry["reason"] = "arc leaves the map"
+            out.append(entry)
+            continue
+        a, mc = picked
         entry["alpha_s"] = a
         entry["mc"] = mc
         if mc < planner.min_clearance_gate:
@@ -293,7 +286,6 @@ def draw_topdown(fig, ax, planner, path, chosen_cell, candidates):
 
 def draw_candidate_sideviews(fig, planner, candidates, chosen_cell, chosen_next):
     m = planner.map_env
-    obs_fill = planner._obstacle_fill
     n = len(candidates)
     ncols = 4
     nrows = int(math.ceil(n / ncols))
@@ -311,12 +303,11 @@ def draw_candidate_sideviews(fig, planner, candidates, chosen_cell, chosen_next)
         else:
             draw_arc_side_view(
                 ax, cand["c_s"], cand["c_g"], cand["alpha_s"],
-                m, planner.robot_radius, planner.leg_length, obs_fill,
+                m, planner.robot_radius, planner.leg_length,
                 planner.arc_max_step,
                 min_clearance_gate=planner.min_clearance_gate,
-                n_lateral=planner.n_lateral,
             )
-            ax.set_ylim(-0.05, obs_fill + 0.4)
+            ax.set_ylim(-0.05, PILLAR_DISPLAY_H + 0.4)
         marker = "  <-- CHOSEN" if cand["cell"] == chosen_next else ""
         ax.set_xlabel(f"cell {cand['cell']}{marker}")
     for j in range(len(candidates), len(axes)):

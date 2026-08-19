@@ -1,26 +1,29 @@
-"""The inflated-height-field clearance check must never be more permissive than
-the sample-by-sample cylinder check it replaced.
+"""The planner's clearance check must never accept a hop that collides.
 
 `Map2D5.inflated_field` + `clearance_floor_alpha` bake the robot's collision
-geometry (a single uniform vertical cylinder) into the terrain once, so the
-planner can treat the robot as a point. `terrain_profile` + `clearance_for_alpha`
-remain in the tree as the REFERENCE implementation, and this file is what pins
-the new path to them.
+geometry (a sharp-edged vertical cylinder plus a uniform safety margin) into the
+terrain once, so the planner can treat the robot as a POINT. That is an
+optimisation, and optimisations need something to be checked against.
 
-The bar is deliberately one-sided. The two are *not* expected to agree
-everywhere, because the reference is approximate in two ways the field version
-is not:
+They used to be checked against `terrain_profile` + `clearance_for_alpha`, a
+second, slower implementation kept in the source tree for the purpose. That
+reference is gone — it answered the same question twice, with a bisection
+instead of a closed form, and its corridor read terrain BILINEARLY at the outer
+edge of the body's width, which dragged in cells up to a full cell beyond the
+body's true reach and reported collisions with walls the robot misses (51 of
+18592 sampled hops across this deck).
 
-  * it rakes only `ARC_LATERAL_SAMPLES` points across the body, 0.15 m apart at
-    shipped values, so a ~20 cm obstacle can slip between two of them;
-  * it reads terrain BILINEARLY, which averages a thin obstacle with its
-    neighbour and halves its effective height (the reason `CLAUDE.md` required
-    obstacles to be at least two cells thick).
+What replaces it is not a third implementation but a deliberately dumb
+assertion, `_collides`, written out longhand below: for every point along the
+arc, look at every real map cell within the body's reach, and require the foot
+to be `MIN_CLEARANCE` above all of them. No sampling pattern, no interpolation,
+no closed form. It is far too slow to plan with and exactly right, which is what
+a test wants.
 
-So the field version rejects ~5-9% more hops on featured maps, and that is the
-bug being fixed rather than a regression. What must NEVER happen is the
-opposite: the field version accepting a hop the reference rejects. That is the
-assertion below.
+The bar is one-sided. The two are *not* expected to agree everywhere: the field
+is read with a NEAREST-CELL lookup, so `lookup_pad` widens it to cover any query
+point inside the cell, and that conservatism makes it reject a little more than
+the truth requires. What must NEVER happen is the opposite.
 
 Run:
     python test/test_inflated_field.py
@@ -35,11 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 import config
-from hopping_astar_planner import (
-    clearance_floor_alpha,
-    clearance_for_alpha,
-    terrain_profile,
-)
+from hopping_astar_planner import clearance_floor_alpha
 from map2d5 import Map2D5
 
 ROBOT_R = config.ROBOT_RADIUS
@@ -47,15 +46,12 @@ LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
 RES = config.CELL_RESOLUTION
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
-N_LAT = config.ARC_LATERAL_SAMPLES
 
-#: Hops per map in the agreement sweep. Large enough that the pad regression
-#: (which produces 26-92 violations per map) cannot hide in sampling noise.
-N_SAMPLES = 4000
+#: The body's total lateral reach — the radius the terrain is dilated by.
+REACH = ROBOT_R + GATE
 
-#: Obstacle fill for the reference sampler. Any value well above the map's real
-#: terrain works — the sweep maps below have no OBSTACLE cells anyway.
-OBS_FILL = 1e6
+#: Hops per map in the agreement sweep.
+N_SAMPLES = 1500
 
 
 def _bypass_wall() -> Map2D5:
@@ -77,52 +73,80 @@ def _deck() -> list[tuple[str, Map2D5]]:
     return maps
 
 
-def _fields(m: Map2D5, lookup_pad=None) -> tuple[np.ndarray, np.ndarray]:
-    """The two fields the planner builds, with the knob this file regresses.
+def _disc_max(m: Map2D5, px: float, py: float) -> float:
+    """Tallest terrain cell whose CENTRE lies within `REACH` of `(px, py)`.
 
-    One radius now (`ROBOT_R + GATE`) instead of the old capsule's two, but
-    still two arrays: `taper=True` is the exact "obstacle or not" detector,
-    `taper=False` correctly enforces the safety-margin gate near the ground.
-    See `clearance_floor_alpha`'s docstring for why neither alone suffices.
+    Brute force on purpose — this is the definition the field is an
+    optimisation of, so it must not share any code with it.
     """
-    return (
-        m.inflated_field(ROBOT_R + GATE, taper=True, lookup_pad=lookup_pad),
-        m.inflated_field(ROBOT_R + GATE, taper=False, lookup_pad=lookup_pad),
-    )
+    rc = int(math.ceil(REACH / RES)) + 1
+    qc, qr = int(px / RES), int(py / RES)
+    best = -math.inf
+    for dr in range(-rc, rc + 1):
+        for dc in range(-rc, rc + 1):
+            rr, cc = qr + dr, qc + dc
+            if not (0 <= rr < m.rows and 0 <= cc < m.cols):
+                continue
+            if math.hypot((cc + 0.5) * RES - px, (rr + 0.5) * RES - py) >= REACH:
+                continue
+            h = m.grid[rr, cc]
+            best = max(best, math.inf if h == Map2D5.OBSTACLE else float(h))
+    return best
 
 
-def _ref_interior(prof, alpha: float) -> float:
-    """`clearance_for_alpha` over the INTERIOR samples only.
+def _collides(m: Map2D5, c_s, c_g, alpha: float) -> bool:
+    """Ground truth: does the body hit anything on this arc, at this angle?
 
-    Both checks put the two arc endpoints out of scope and defer them to
-    `Map2D5.standable_mask` — `clearance_for_alpha` says so in its docstring, and
-    `clearance_floor_alpha` cannot do otherwise (its `u*(X-u)` denominator is
-    zero there, and an inflated field is a disc, so at `u=0` it would see terrain
-    *behind* the takeoff that the reference's corridor never samples). Comparing
-    them on the same scope is therefore the honest test.
+    The model spelled out with no shortcuts. The body is a cylinder with a flat
+    bottom at the foot, so the whole question at each point along the arc is
+    whether the foot clears every terrain cell within the body's reach by
+    `MIN_CLEARANCE`.
 
-    Implemented by slicing the profile rather than reimplementing the check, so
-    this cannot drift from the reference it is supposed to pin.
+    Endpoints and near-endpoint terrain are exempt for the same reason the
+    planner exempts them: `u = 0` and `u = X` are stance configurations that
+    `Map2D5.standable_mask` gates, and terrain at or below the taller endpoint
+    cannot reject a hop that starts and ends standing on it.
     """
-    return clearance_for_alpha(
-        prof._replace(u=prof.u[1:-1], terrain=prof.terrain[1:-1]), alpha,
-    )
+    x_s, y_s, t_s = c_s
+    x_g, y_g, t_g = c_g
+    dx, dy = x_g - x_s, y_g - y_s
+    X = math.hypot(dx, dy)
+
+    step = min(MAX_STEP, RES / 3.0)
+    n = max(3, int(math.ceil(X / step)) + 1)
+    u = np.linspace(0.0, X, n)
+    Z = t_g - t_s
+    T = math.tan(alpha)
+    endpoint_max = max(t_s, t_g)
+
+    for i in range(1, n - 1):
+        ui = u[i]
+        px, py = x_s + ui * (dx / X), y_s + ui * (dy / X)
+        if not (0.0 <= px < m.size_x and 0.0 <= py < m.size_y):
+            return True
+        h_max = _disc_max(m, px, py)
+        if h_max <= endpoint_max:
+            continue
+        foot_h = t_s + Z * ui * ui / (X * X) + T * ui * (X - ui) / X
+        if foot_h < h_max + GATE - 1e-12:
+            return True
+    return False
 
 
-def _sweep(m: Map2D5, f_foot, f_com, seed: int = 7) -> tuple[int, int, int]:
-    """Compare both checks over random (hop, alpha) pairs.
+def _sweep(m: Map2D5, field, seed: int = 7) -> tuple[int, int, int]:
+    """Compare the field check against `_collides` over random (hop, alpha).
 
-    Returns `(n, ref_only, field_only)` — total compared, hops the reference
-    accepts and the field rejects (expected, benign), and hops the FIELD accepts
-    and the reference rejects (never allowed).
+    Returns `(n, strict, LOOSE)` — hops compared, hops the field rejects that
+    truth allows (expected, benign: the `lookup_pad`'s conservatism), and hops
+    the FIELD accepts that truth says collide (never allowed).
 
     `alpha` is drawn rather than derived from the energy chain on purpose: the
-    two checks must agree at EVERY angle, not only at the one the planner would
-    pick, and drawing it exercises shallow arcs the chain would never fly.
+    check must hold at EVERY angle, not only at the one the planner would pick,
+    and drawing it exercises shallow arcs the chain would never fly.
     """
     rng = np.random.default_rng(seed)
     rows, cols = m.grid.shape
-    n = ref_only = field_only = 0
+    n = strict = loose = 0
 
     for _ in range(N_SAMPLES):
         r0, c0 = int(rng.integers(0, rows)), int(rng.integers(0, cols))
@@ -139,75 +163,63 @@ def _sweep(m: Map2D5, f_foot, f_com, seed: int = 7) -> tuple[int, int, int]:
             continue
 
         alpha = rng.uniform(math.radians(40.0), math.radians(85.0))
+        c_s, c_g = (x0, y0, t_s), (x1, y1, t_g)
 
-        prof = terrain_profile(
-            (x0, y0, t_s), (x1, y1, t_g), m, ROBOT_R, LEG,
-            MAX_STEP, OBS_FILL, N_LAT, min_clearance_gate=GATE,
+        alpha_c = clearance_floor_alpha(
+            c_s, c_g, m, field, GATE, LEG, MAX_STEP,
         )
-        if prof is None or prof.out_of_bounds:
+        if alpha_c is None:
             continue
         n += 1
 
-        ref_ok = _ref_interior(prof, alpha) >= GATE
-        alpha_c = clearance_floor_alpha(
-            (x0, y0, t_s), (x1, y1, t_g), m, f_foot, f_com, LEG, MAX_STEP,
-        )
-        field_ok = alpha_c is not None and alpha >= alpha_c
+        field_ok = alpha >= alpha_c
+        truth_ok = not _collides(m, c_s, c_g, alpha)
 
-        if ref_ok and not field_ok:
-            ref_only += 1
-        elif field_ok and not ref_ok:
-            field_only += 1
+        if truth_ok and not field_ok:
+            strict += 1
+        elif field_ok and not truth_ok:
+            loose += 1
 
-    return n, ref_only, field_only
+    return n, strict, loose
 
 
-def check_never_more_permissive() -> bool:
-    """THE assertion: the field check never accepts what the reference rejects."""
-    print("field vs reference cylinder check — the field must never be looser\n")
+def check_never_accepts_a_collision() -> bool:
+    """THE assertion: the field check never accepts a hop that collides."""
+    print("field check vs brute-force truth — the field must never be looser\n")
     print(f"  {'map':<22}{'compared':>9}{'stricter':>10}{'LOOSER':>9}")
     all_ok = True
     for name, m in _deck():
-        n, ref_only, field_only = _sweep(m, *_fields(m))
-        ok = field_only == 0
+        n, strict, loose = _sweep(m, m.inflated_field(REACH))
+        ok = loose == 0
         all_ok &= ok
-        print(f"  [{'PASS' if ok else 'FAIL'}] {name:<16}{n:>9}{ref_only:>10}"
-              f"{field_only:>9}")
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name:<16}{n:>9}{strict:>10}"
+              f"{loose:>9}")
     return all_ok
 
 
 def check_lookup_pad_guarantee() -> bool:
-    """The field must bound the sphere requirement at any query point, not just
-    at cell centres — that is exactly what `lookup_pad` buys.
+    """The field must bound the true reach at ANY query point, not just centres.
 
-    Checked against the TAPERED form (not the planner's own `taper=False`
-    field): the pad's job is bounding a rounded body's lift at an arbitrary
-    query point, which only shows up when there is a taper to bound. This is
-    the same geometry guarantee `inflated_field`'s docstring makes for any
-    `radius`, independent of which radius the planner happens to use.
+    That is exactly what `lookup_pad` buys, and it is not optional. The planner
+    reads the field with a NEAREST-CELL lookup, so a query point can sit up to
+    half a cell diagonal from the centre of the cell it reads. The guarantee
+    that has to hold is therefore
 
-    The planner reads the field with a NEAREST-CELL lookup, so a query point can
-    sit up to half a cell diagonal from the centre of the cell it reads. The
-    guarantee that has to hold is therefore
-
-        field[nearest_cell(P)]  >=  max over terrain T within `radius` of P of
-                                        ( height(T) + sqrt(radius^2 - |PT|^2) )
+        field[nearest_cell(P)]  >=  height of every terrain cell within
+                                    `REACH` of P
 
     for EVERY `P`, not merely for `P` at a cell centre. This checks that
-    directly, rather than inferring it from downstream accept/reject
-    disagreements: the endpoint check in `clearance_floor_alpha` happens to mask
-    most of those, which would leave the pad looking optional when it is not.
+    directly rather than inferring it from downstream accept/reject
+    disagreements: the endpoint exemption in `clearance_floor_alpha` masks most
+    of those, which would leave the pad looking optional when it is not.
     """
-    print("\nlookup_pad — nearest-cell lookups must still bound the true sphere\n")
-    radius = ROBOT_R + GATE
-    reach_cells = int(math.ceil((radius + RES) / RES))
+    print("\nlookup_pad — nearest-cell lookups must still bound the true reach\n")
     all_ok = True
     total_unpadded = 0
 
     for name, m in _deck():
-        padded = m.inflated_field(radius, taper=True)
-        unpadded = m.inflated_field(radius, taper=True, lookup_pad=0.0)
-        rows, cols = m.grid.shape
+        padded = m.inflated_field(REACH)
+        unpadded = m.inflated_field(REACH, lookup_pad=0.0)
         rng = np.random.default_rng(11)
         bad_padded = bad_unpadded = 0
 
@@ -217,19 +229,7 @@ def check_lookup_pad_guarantee() -> bool:
             py = float(rng.uniform(0.0, m.size_y))
             qc, qr = int(px / RES), int(py / RES)
 
-            required = -math.inf
-            for dr in range(-reach_cells, reach_cells + 1):
-                for dc in range(-reach_cells, reach_cells + 1):
-                    rr, cc = qr + dr, qc + dc
-                    if not (0 <= rr < rows and 0 <= cc < cols):
-                        continue
-                    d = math.hypot((cc + 0.5) * RES - px, (rr + 0.5) * RES - py)
-                    if d >= radius:
-                        continue
-                    h = m.grid[rr, cc]
-                    h = math.inf if h == Map2D5.OBSTACLE else float(h)
-                    required = max(required, h + math.sqrt(radius * radius - d * d))
-
+            required = _disc_max(m, px, py)
             if required == -math.inf:
                 continue
             if padded[qr, qc] < required - 1e-9:
@@ -250,23 +250,48 @@ def check_lookup_pad_guarantee() -> bool:
     return all_ok
 
 
+def check_field_is_untapered() -> bool:
+    """Flat ground must read back as flat ground — nothing added.
+
+    The field is a plain sideways dilation: the tallest terrain in reach, and no
+    more. A TAPERED field (the config-space form of a SPHERE) would instead lift
+    every cell by up to a full `REACH` even over bare ground, which charges the
+    body's width as vertical clearance underneath a body that has no underside.
+    That was briefly the implementation. This pins it shut: over flat terrain the
+    field must equal the terrain exactly, and over a wall it must equal the
+    wall's own height, never more.
+    """
+    print("\nno taper — the field adds nothing to the terrain it reports\n")
+    all_ok = True
+    for name, m in _deck():
+        field = m.inflated_field(REACH)
+        finite = np.isfinite(field)
+        ok = bool(np.all(field[finite] <= m.grid.max() + 1e-12))
+        flat = Map2D5(2.0, 2.0, RES)
+        flat_field = flat.inflated_field(REACH)
+        ok &= bool(np.allclose(flat_field, 0.0))
+        all_ok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name:<22}"
+              f"peak {float(field[finite].max()):+.3f} m "
+              f"(terrain peak {float(m.grid.max()):+.3f} m)")
+    return all_ok
+
+
 def check_standable_mask_wraps_inflated_field() -> bool:
     """`standable_mask` must be exactly `inflated_field` read at standing height.
 
     There is no independent geometry left in `standable_mask` to regress against
-    — it IS `inflated_field(radius + clearance, taper=False) <= grid +
-    leg_length`, ANDed with not-OBSTACLE — so this pins the wrapper against a
-    hand-built version of that same expression rather than re-deriving the
-    check from scratch. A future edit that quietly reintroduces bespoke
-    geometry there (rather than calling `inflated_field`) will show up here as
-    the two diverging.
+    — it IS `inflated_field(radius + clearance) <= grid + leg_length`, ANDed
+    with not-OBSTACLE — so this pins the wrapper against a hand-built version of
+    that same expression. A future edit that quietly reintroduces bespoke
+    geometry there will show up here as the two diverging.
     """
     print("\nstandable_mask == inflated_field at standing height\n")
     all_ok = True
     for name, m in _deck():
         truth = m.standable_mask(ROBOT_R, GATE, LEG)
-        field = m.inflated_field(ROBOT_R + GATE, taper=False)
-        derived = (field <= m.grid + LEG) & (m.grid != Map2D5.OBSTACLE)
+        derived = (m.inflated_field(REACH) <= m.grid + LEG) \
+            & (m.grid != Map2D5.OBSTACLE)
         n_diff = int((truth != derived).sum())
         ok = n_diff == 0
         all_ok &= ok
@@ -276,8 +301,9 @@ def check_standable_mask_wraps_inflated_field() -> bool:
 
 
 def main() -> int:
-    all_ok = check_never_more_permissive()
+    all_ok = check_never_accepts_a_collision()
     all_ok &= check_lookup_pad_guarantee()
+    all_ok &= check_field_is_untapered()
     all_ok &= check_standable_mask_wraps_inflated_field()
 
     print("\n" + ("ALL PASSED" if all_ok else "SOME FAILED"))

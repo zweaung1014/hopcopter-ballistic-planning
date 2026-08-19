@@ -197,81 +197,75 @@ class Map2D5:
         clearance` — exactly the same test `clearance_floor_alpha` runs during
         flight, evaluated at standing height. So this is just
         `inflated_field` read at `grid + leg_length`, not a bespoke geometry
-        calculation: `inflated_field` memoises on `(radius, taper, lookup_pad)`,
-        so calling it with the same `radius + clearance, taper=False` the
-        planner already built for flight clearance hits that cache rather than
-        recomputing anything.
+        calculation: `inflated_field` memoises on `(radius, lookup_pad)`, so
+        calling it with the same `radius + clearance` the planner already built
+        for flight clearance hits that cache rather than recomputing anything.
 
         Computed once per planner. Screening landing cells against this is far
         cheaper than discovering the same collision by marching an arc.
         """
-        field = self.inflated_field(radius + clearance, taper=False)
+        field = self.inflated_field(radius + clearance)
         return (field <= self.grid + leg_length) & (self.grid != self.OBSTACLE)
 
     def inflated_field(
         self,
         radius: float,
-        taper: bool = True,
         lookup_pad: float | None = None,
     ) -> np.ndarray:
-        """Terrain inflated by a sphere (or column) of `radius`, in absolute heights.
+        """Terrain dilated sideways by `radius`: the tallest terrain in reach.
 
-        Answers, per cell, the question *"how high must a body of this radius be
-        when passing over here, so that it touches nothing?"* — as an absolute
-        height in map coordinates, not an offset. That turns every later
-        collision query into a scalar comparison against a single number, which
-        is the entire point: the robot's size is baked into the terrain once,
-        so the robot becomes a POINT everywhere downstream.
+        Per cell, the height of the tallest terrain within `radius` of it. That
+        is all — nothing is added, so flat ground reads back as flat ground and
+        a wall reads its own true height.
 
-        This is the configuration-space form of the check
-        `hopping_astar_planner.clearance_for_alpha` performs sample-by-sample.
-        The difference is not the physics but the KEY: that function is keyed on
-        a hop (a cell *pair*, ~7M of them, so it can never be precomputed and
-        needs a cache), while this is keyed on a cell (2500 of them, so all
-        answers are computed up front in well under a millisecond).
+        This is the configuration-space form of a SHARP-EDGED body. The robot
+        is a cylinder with a flat bottom and square edges, and the safety margin
+        is the same shape grown outward, so it is square-edged too: sharp shape
+        in, sharp result out. A caller checks clearance by comparing against
+        this field plus its margin as a constant —
 
-        Geometry. For a terrain column of height `h` at horizontal distance `d`,
-        a sphere of `radius` centred at height `z` clears it iff
-        `hypot(d, z - h) >= radius`, i.e. `z >= h + sqrt(radius^2 - d^2)`. The
-        field is the `max` of that over every neighbour in range, so the lift is
-        full `radius` directly overhead and tapers to zero at `d = radius`.
+            foot_height >= inflated_field(body_radius + margin) + margin
 
-        `taper=False` drops the Pythagoras term, giving a vertical COLUMN of
-        `radius` rather than a sphere: `z >= h` for every neighbour in range.
-        That is the right model for `clearance_for_alpha`'s above-the-CoM branch,
-        which uses `axis_dist = |r|` regardless of how far above the CoM the
-        terrain reaches — i.e. it already treats such terrain as a full-height
-        column. Passing `taper=True` there would silently over-reject.
+        — which keeps the margin an explicit number at the comparison rather
+        than baking a shape into the terrain.
+
+        **There is deliberately no taper.** A tapered (rounded) field belongs to
+        a body whose edges are rounded — a sphere, or a cylinder whose bottom
+        edge has been filleted by measuring the margin as a straight-line
+        distance around the corner. This robot's body is neither. An earlier
+        version inflated by a sphere of `body + margin`, which additionally
+        charged the body radius as vertical clearance underneath the foot,
+        where a cylinder has no extent at all.
+
+        Because this is a `max` and never an average, it can never under-report,
+        which is why one-cell-thick obstacles are safe here (unlike bilinear
+        sampling, which halves them).
 
         `lookup_pad` (default `resolution * sqrt(2) / 2`) is what makes a
         NEAREST-CELL lookup of the result safe, and it is not optional. A query
         point can sit up to half a cell diagonal from the centre of the cell it
-        lands in, so without the pad the field would be blind to terrain in an
-        annulus just inside `radius` — which shows up as the field ACCEPTING
-        hops `clearance_for_alpha` rejects (26-92 cases per map on the deck; see
-        `test/test_inflated_field.py`). The pad widens the neighbour search by
-        that distance and shifts the taper outward by it, so the guarantee
-        becomes: for any query point `P`, the nearest cell's value bounds every
-        terrain point within `radius` of `P`. Correctness only ever costs
-        conservatism here, never permissiveness.
+        lands in, so without the pad the field would be blind to terrain in a
+        thin annulus just inside `radius` — which shows up as the field
+        ACCEPTING hops the reference check rejects (see
+        `test/test_inflated_field.py`). The pad widens the search by that
+        distance, so the guarantee becomes: for any query point `P`, the nearest
+        cell's value covers every terrain point within `radius` of `P`.
+        Correctness only ever costs conservatism here, never permissiveness.
 
         OBSTACLE columns are infinitely tall and off-map neighbours impose no
         constraint, matching `standable_mask`.
 
-        Memoised on `(radius, taper, lookup_pad)` and dropped by
-        `_invalidate_caches`, like `surface_normals`.
+        Memoised on `(radius, lookup_pad)` and dropped by `_invalidate_caches`,
+        like `surface_normals`.
 
-        Note `standable_mask` is now literally a thin wrapper over this method,
-        evaluated at standing height:
-        `inflated_field(radius + clearance, taper=False) <= grid + leg_length`.
-        It used to be a separate implementation; `test/test_inflated_field.py`
-        still pins the two together so that reintroducing bespoke geometry
-        there shows up as a failure.
+        Note `standable_mask` is a thin wrapper over this method, evaluated at
+        standing height; `test/test_inflated_field.py` pins the two together so
+        that reintroducing bespoke geometry there shows up as a failure.
         """
         if lookup_pad is None:
             lookup_pad = self.resolution * math.sqrt(2.0) / 2.0
 
-        key = (float(radius), bool(taper), float(lookup_pad))
+        key = (float(radius), float(lookup_pad))
         cached = self._inflated_cache.get(key)
         if cached is not None:
             return cached
@@ -285,23 +279,16 @@ class Map2D5:
         padded = np.full((self.rows + 2 * pad, self.cols + 2 * pad), -np.inf)
         padded[pad:pad + self.rows, pad:pad + self.cols] = filled
 
+        # Loop over the ~50 neighbour OFFSETS, shifting the whole grid each
+        # time, rather than over the 2500 cells and their neighbours: same
+        # arithmetic, but vectorised into a handful of numpy ops.
         out = np.full(self.grid.shape, -np.inf)
         for dr in range(-r_cells, r_cells + 1):
             for dc in range(-r_cells, r_cells + 1):
-                d = math.hypot(dr, dc) * self.resolution
-                if d >= reach:
+                if math.hypot(dr, dc) * self.resolution >= reach:
                     continue  # too far to matter, however tall
-                if taper:
-                    # Distance is charged against the body radius only after the
-                    # lookup pad is deducted, so a query point anywhere in the
-                    # cell is still covered.
-                    d_eff = max(0.0, d - lookup_pad)
-                    lift = math.sqrt(max(0.0, radius * radius - d_eff * d_eff))
-                else:
-                    lift = 0.0
-                h = padded[pad + dr:pad + dr + self.rows,
-                           pad + dc:pad + dc + self.cols]
-                out = np.maximum(out, h + lift)
+                out = np.maximum(out, padded[pad + dr:pad + dr + self.rows,
+                                             pad + dc:pad + dc + self.cols])
 
         self._inflated_cache[key] = out
         return out

@@ -289,7 +289,6 @@ def draw_ring_panels(
         return
 
     path_cells = path_cells_of(planner_ball, path_ball)
-    obs_fill   = planner_ball._obstacle_fill
     NCOLS      = 4
 
     # Build a list of (header_label, cell, cands, chosen_next) rows
@@ -343,10 +342,8 @@ def draw_ring_panels(
             else:
                 draw_arc_side_view(
                     ax, cand["c_s"], cand["c_g"], cand["alpha_s"],
-                    m, planner_ball.robot_radius, planner_ball.leg_length,
-                    obs_fill, planner_ball.arc_max_step,
+                    m, planner_ball.robot_radius, planner_ball.leg_length, planner_ball.arc_max_step,
                     min_clearance_gate=planner_ball.min_clearance_gate,
-                    n_lateral=planner_ball.n_lateral,
                 )
                 ax.set_ylim(-0.1, ymax_arc)
                 # Step reference lines
@@ -401,7 +398,6 @@ def draw_arc_strip(
     ncols  = max(n_base, n_ball)
     fig, axes = plt.subplots(2, ncols, figsize=(3.8 * ncols, 6.0), squeeze=False)
 
-    obs_fill = planner_ball._obstacle_fill
     ymax     = TOP_Z + 0.45
 
     for row_idx, (row_label, path, diags) in enumerate([
@@ -424,10 +420,9 @@ def draw_arc_strip(
                     ax,
                     (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                     d["alpha_s"], m,
-                    config.ROBOT_RADIUS, config.LEG_LENGTH, obs_fill,
+                    config.ROBOT_RADIUS, config.LEG_LENGTH,
                     config.ARC_SAMPLE_MAX_STEP,
                     min_clearance_gate=config.MIN_CLEARANCE,
-                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.1, ymax)
                 # Step reference lines

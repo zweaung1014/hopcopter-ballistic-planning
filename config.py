@@ -204,9 +204,9 @@ V_MAX = math.sqrt(ETA_HOP * V_G_MAX**2 + 2.0 * E_INJECT_MAX / ROBOT_MASS)
         #
         # NOT a per-hop cap. Each individual hop is capped by its own parent:
         # `sqrt(v_s_min^2 + 2 E_INJECT_MAX / MASS)`, which on flat ground settles
-        # near 5.4 m/s. V_MAX exists to size MAX_APEX_HEIGHT (and hence
-        # OBSTACLE_WALL_EXTRA) for the platform-drop worst case, and as a
-        # never-binding backstop on Campana's takeoff-speed constraint.
+        # near 5.4 m/s. V_MAX exists to size MAX_APEX_HEIGHT for the
+        # platform-drop worst case, and as a never-binding backstop on
+        # Campana's takeoff-speed constraint.
         #
         # The longest flat hop it affords is V_MAX^2 / g = 5.50 m, and a flat hop
         # of distance X needs v_s >= sqrt(g*X) -- this is what caps
@@ -216,7 +216,7 @@ V_MAX = math.sqrt(ETA_HOP * V_G_MAX**2 + 2.0 * E_INJECT_MAX / ROBOT_MASS)
 
 MAX_APEX_HEIGHT = V_MAX**2 / (2.0 * G_ACCEL)  # 2.750 m
         # Derived, not tuned: the CoM rise above the takeoff CoM on a vertical
-        # in-place hop at V_MAX. Read only by OBSTACLE_WALL_EXTRA's assert.
+        # in-place hop at V_MAX. Documentation only now — nothing reads it.
 
 SPEED_BIN = 0.25  # m/s; quantisation of landing speed in the A* state. Energy
                   # now depends on the path taken, so the search state is
@@ -266,67 +266,21 @@ MIN_CLEARANCE = 0.15  # m; HARD gate — an arc whose body-to-terrain clearance 
                       # drops below this is rejected outright. Clearance does NOT
                       # enter the edge cost; it is purely a feasibility test.
 ARC_SAMPLE_MAX_STEP = 0.05  # m; upper bound on sampling step along the arc's XY
-                            # line, clamped to CELL_RESOLUTION/3 by both
-                            # `terrain_profile` and `clearance_floor_alpha`.
+                            # line, clamped to CELL_RESOLUTION/3 by
+                            # `hopping_astar_planner._arc_samples`.
                             #
                             # DO NOT COARSEN THIS. It looks like it should be
-                            # safe to, since the planner now reads inflated
-                            # fields whose features are at least a dilation
-                            # radius (0.24 m) wide. It is not: the closed form
-                            # in `clearance_floor_alpha` has a POLE at each end
-                            # of the hop (its `u*(X-u)` denominator), so the
+                            # safe to, since the planner reads an inflated field
+                            # whose features are at least a dilation radius
+                            # (0.30 m) wide. It is not: the closed form in
+                            # `clearance_floor_alpha` has a POLE at each end of
+                            # the hop (its `u*(X-u)` denominator), so the
                             # required takeoff angle is far more sensitive to
-                            # sample spacing near the endpoints than the fields
-                            # are. Measured across the whole map deck, marching
-                            # at CELL_RESOLUTION lets 333 hops through that the
-                            # reference capsule check rejects, CELL_RESOLUTION/2
-                            # lets 20 through, and CELL_RESOLUTION/3 lets none.
-ARC_LATERAL_SAMPLES = 5  # NO LONGER READ BY THE PLANNER. The planner samples the
-                         # CENTRELINE only, against `Map2D5.inflated_field`,
-                         # which has already spread each obstacle's influence
-                         # sideways by the body radius — so the body's width
-                         # lives in the map rather than in the sampling pattern,
-                         # and there are no inter-sample gaps left to tune. This
-                         # value now configures only `terrain_profile` /
-                         # `clearance_for_alpha`, which survive as the reference
-                         # implementation that `test/test_inflated_field.py`
-                         # validates the planner against.
-                         #
-                         # Two consequences of that switch, both improvements:
-                         #   * the ~20 cm obstacle that could slip between two
-                         #     lateral samples (see the note below) can no
-                         #     longer do so at any width;
-                         #   * OBSTACLES NO LONGER HAVE TO BE TWO CELLS THICK.
-                         #     That rule existed because bilinear sampling
-                         #     averaged a one-cell obstacle 50/50 with its
-                         #     neighbour and halved its effective height. An
-                         #     inflated field is a MAX, so it never under-reports.
-                         #
-                         # terrain samples across the body's width, spanning
-                         # [-(ROBOT_RADIUS + MIN_CLEARANCE), +(ROBOT_RADIUS +
-                         # MIN_CLEARANCE)] perpendicular to travel. The corridor
-                         # half-width includes MIN_CLEARANCE because the
-                         # safety margin extends past the body radius. 1
-                         # collapses to a centreline-only check.
-                         #
-                         # Bumped from 3 to 5 when the corridor widened
-                         # (R_max → R_max + MIN_CLEARANCE) so the inter-sample
-                         # gap stays ≤ 0.2 m: with 3 samples across a 0.7 m
-                         # corridor the gap is 0.35 m, wide enough for a
-                         # narrow (~20 cm) obstacle to slip through undetected.
-OBSTACLE_WALL_EXTRA = 3.1  # m; added on top of map_max_z to treat OBSTACLE cells as
-                           # tall walls. Must exceed the tallest arc the robot can
-                           # fly over a cell, else OBSTACLEs become jumpable. The
-                           # binding case is the cylinder's bottom (the foot, the
-                           # lowest point of the body, closest to terrain):
-                           #   LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE
-                           #   = 0.4 + 2.75 - 0.15 - 0.15 = 2.85 m
-                           #
-                           # Was 1.5 m. It rose with MAX_APEX_HEIGHT (1.2 -> 2.75)
-                           # when V_MAX became a derived worst case of the energy
-                           # chain: a robot fresh off a MAX_LANDING_APEX platform
-                           # drop can fly far higher than one limited to a tuned
-                           # 4.85 m/s, and obstacles must stay un-flyable for it.
+                            # sample spacing near the endpoints than the field
+                            # is. Measured across the whole map deck, marching at
+                            # CELL_RESOLUTION let 333 hops through that a
+                            # sample-by-sample check rejects, CELL_RESOLUTION/2
+                            # let 20 through, and CELL_RESOLUTION/3 let none.
 
 # NOTE: the old sphere model had a `LEG_LENGTH - ROBOT_RADIUS > MIN_CLEARANCE`
 # assert here, guarding against the CoM sphere's rounded underside clipping its
@@ -335,9 +289,12 @@ OBSTACLE_WALL_EXTRA = 3.1  # m; added on top of map_max_z to treat OBSTACLE cell
 # contributing zero self-lift regardless of ROBOT_RADIUS (verified: a flat map
 # is standable under the new model for any ROBOT_RADIUS, even ROBOT_RADIUS >
 # LEG_LENGTH) — so there is nothing left for that assert to protect against.
-assert OBSTACLE_WALL_EXTRA >= (
-    LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE
-), "OBSTACLE_WALL_EXTRA too small — obstacle cells would be jumpable."
+#
+# There is likewise no OBSTACLE_WALL_EXTRA any more. It was a "tall wall" height
+# substituted for OBSTACLE cells when terrain was sampled BILINEARLY, and it had
+# to be calibrated against MAX_APEX_HEIGHT or obstacles became jumpable.
+# `Map2D5.inflated_field` gives OBSTACLE cells `+inf` outright, which is strictly
+# stronger and needs no calibration at all.
 
 # Reference "first hop" ballistic reach, used only to sanity-check that the
 # shipped ENERGY/FRICTION/APEX parameters leave a non-empty takeoff-angle

@@ -49,10 +49,10 @@ python test/test_hop_energy_chain.py    # energy chain: closed forms, alpha boun
 python test/test_edge_cost_energy.py    # energy-based edge cost: the momentum term,
                                         # non-negativity, and the over-a-wall case
 python test/test_inflated_field.py      # the planner's inflated-field clearance check
-                                        # vs. the reference sample-by-sample check it
-                                        # replaced: asserts it is never MORE PERMISSIVE,
-                                        # plus the lookup-pad guarantee and the
-                                        # standable_mask equivalence
+                                        # vs. a brute-force ground truth written inside
+                                        # the test: asserts it never ACCEPTS A COLLISION,
+                                        # plus the lookup-pad guarantee, the no-taper
+                                        # invariant, and standable_mask equivalence
 
 # Timing/scaling benchmark (ballistic vs. baseline planner on the same scenario)
 python test/benchmark_tall_stairs.py
@@ -90,7 +90,7 @@ hopping_astar_planner.py ← HoppingAStarPlanner: the active planner (ballistic 
 visualizer.py            ← Visualizer: matplotlib rendering (grid, arcs, path)
 main.py                  ← entry point: load_map(name) → plan() → visualize
 test/                     ← demo scripts (produce PNGs), a benchmark, a timing
-                            harness, and three assertion-based numeric tests (no pytest)
+                            harness, and assertion-based numeric tests (no pytest)
 results/                  ← generated figures + timing tables, one dir per run
 ```
 
@@ -111,29 +111,41 @@ model has a plain closed form, `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)`
 old sphere-based check it replaced, so it is *less* restrictive at a fixed
 radius, not more),
 `surface_normals` (per-cell outward unit normals for the friction cone; memoised),
-`inflated_field` (terrain inflated by a sphere or column of a given radius, in
-absolute heights — the planner's flight-clearance primitive; memoised).
+`inflated_field` (terrain dilated SIDEWAYS by `radius`: per cell, the tallest
+terrain within reach, and nothing added — the planner's flight-clearance
+primitive; memoised. There is no taper and no shape argument, because the body
+is square-edged; see below).
 
 **`inflated_field` is what makes the robot a POINT.** It answers, per cell, "how
-high must a body of this radius be when passing over here" — so the whole
-clearance test becomes one scalar comparison, and the body's width lives in the
-map rather than in a lateral sampling pattern. Two properties are load-bearing
-and both are regression-tested in `test/test_inflated_field.py`: the `lookup_pad`
-(`resolution*sqrt(2)/2`, without which a nearest-cell lookup can read a cell
-whose value does not bound the query point), and the choice between `taper=True`
-and `taper=False` at the SAME radius, which are NOT interchangeable even though
-there is only one radius in the model now: `taper=False` (untapered) is the
-exact "is there a real obstacle here at all" detector — it reports the raw
-terrain height with no lift added, so flat ground reads back as flat ground,
-which is what `standable_mask` needs and what `clearance_floor_alpha` uses to
-decide a sample is even worth considering; `taper=True` (tapered) is what
-actually prices a genuine obstacle once found, because the untapered form
-alone does not enforce any minimum standoff near the ground (it only asks "is
-the foot below this terrain," not "below by the gate margin"). Building both
-from the robot's one radius, rather than from two different radii the way the
-old capsule model did, is still a real simplification — it just isn't a
-single array. See `hopping_astar_planner.clearance_floor_alpha`'s docstring
-for the full derivation.
+tall is the tallest terrain within reach of here" — so the whole clearance test
+becomes one scalar comparison, and the body's width lives in the map rather than
+in a lateral sampling pattern. A caller checks
+
+    foot_height >= inflated_field(ROBOT_RADIUS + MIN_CLEARANCE) + MIN_CLEARANCE
+
+**There is deliberately NO TAPER, and only ONE field.** A tapered field —
+`h + sqrt(R^2 - d^2)`, lift falling off with lateral distance — is the
+configuration-space form of a SPHERE. It is the ROBOT's roundness smeared onto
+the obstacle's corner (a Minkowski sum), not anything about the obstacle's own
+edges, which stay sharp either way. This robot is a flat-bottomed cylinder, so
+sharp column ⊕ flat-bottomed cylinder = a sharp column, just fatter. Inflating
+by a sphere of `ROBOT_RADIUS + MIN_CLEARANCE` was briefly the implementation and
+is wrong: it charges the body's WIDTH as VERTICAL clearance underneath a body
+that has no underside, demanding 0.30 m of headroom over flat ground where only
+`MIN_CLEARANCE` = 0.15 m is called for. Two fields existed only because the
+taper did — one tapered to price obstacles, one untapered to detect them. With
+no taper they are the same array.
+
+Note the margin is measured as a BOX, not a ball: `MIN_CLEARANCE` vertically and
+`MIN_CLEARANCE` laterally, each on its own axis, rather than as a straight-line
+distance around the body's bottom corner (which would fillet it with a
+`MIN_CLEARANCE`-radius quarter-round). The box is slightly more conservative near
+corners, can never accept something unsafe, and is what lets the margin be a
+plain constant instead of a shape baked into the terrain.
+
+The `lookup_pad` (`resolution*sqrt(2)/2`) is load-bearing and regression-tested
+in `test/test_inflated_field.py`: without it a nearest-cell lookup can read a
+cell whose value does not bound the query point.
 
 **`surface_normals` uses min-|slope| one-sided differences, not a central
 difference,** and that is a correctness requirement, not a refinement. A central
@@ -242,16 +254,11 @@ generation and edge validation are non-trivial:
   cache compensated at a 17-34% hit rate, and the search still made **155M grid
   reads over a 2,500-cell map, ~62,000 per cell of terrain that never changes**.
   `Map2D5.inflated_field` is keyed on a **cell** instead, so all 2,500 answers
-  are computed once in 0.26 ms. Two fields are built (`_inflated_foot`,
-  `_inflated_com`), both from the robot's one radius now, because they answer
-  different questions, not because of a multi-radius capsule: `_inflated_foot`
-  is tapered (a sphere) so it correctly enforces the safety-margin gate near
-  the ground, while `_inflated_com` is untapered (a full-height column) so it
-  reads back as exactly the raw terrain height, with no artificial lift, which
-  is what makes it usable as an exact "is there a real obstacle here at all"
-  detector. **Do not add a taper to the `_inflated_com` field** — it silently
-  over-rejects (a tapered field shows *some* lift even over flat ground). The
-  terrain-pair cache is gone; nothing per-hop is derived any more.
+  are computed once in 0.26 ms. **One field** (`self._inflated`), built at
+  `ROBOT_RADIUS + MIN_CLEARANCE`, with the margin added as a constant at the
+  comparison. The per-hop terrain sampler is gone entirely — there is no
+  reference implementation in the tree any more; `test/test_inflated_field.py`
+  checks the field against a brute-force assertion written inside the test.
 - `disable_clearance=True` skips the stance and clearance gates but keeps the
   physics feasibility gate — used only for A/B baseline comparisons (e.g. in
   `test/benchmark_tall_stairs.py`), never for real planning. Note this is now a
@@ -354,33 +361,26 @@ above.
   Linearity is the stronger statement, and it is what `clearance_floor_alpha`
   uses: `arc_z` is not merely monotone in `T = tan(alpha)`, it is **affine** in
   it, so `alpha_c` inverts outright —
-  `T_req(u) = (H(u) - t_s - Z*u^2/X^2) * X / (u*(X-u))`, maximised over `u`. The
-  reference `alpha_for_clearance` still bisects (monotonicity is all a bisection
-  needs); the planner does not. **The `u*(X-u)` denominator is a pole at each
+  `T_req(u) = (inflated(u) + gate - t_s - Z*u^2/X^2) * X / (u*(X-u))`, maximised
+  over `u`. No bisection anywhere. **The `u*(X-u)` denominator is a pole at each
   end,** which is why `ARC_SAMPLE_MAX_STEP` cannot be coarsened even though the
-  inflated fields are smooth — see its note in `config.py`.
+  inflated field is smooth — see its note in `config.py`.
 - **Collision geometry is a single uniform vertical cylinder, radius
-  `ROBOT_RADIUS` (0.15 m), spanning the foot to the top of the body
-  (`LEG_LENGTH + ROBOT_RADIUS` above the foot) — not a multi-region capsule.**
-  There used to be three independently-sized regions (CoM sphere, thin
-  leg-cylinder sides, foot-tip hemisphere); collapsing them to one radius is a
-  deliberate simplification, not an approximation of the old geometry.
-  Terrain is always a solid column rising from the ground in this codebase, so
-  a flat-capped cylinder's clearance only ever depends on its BOTTOM (the
-  foot) — its own height never enters the math. `standable_mask` (stance) and
-  `clearance_for_alpha`/`clearance_floor_alpha` (flight) both reduce to the
-  same two-case test at the foot: terrain at or above the foot's height needs
-  `|r| - ROBOT_RADIUS >= MIN_CLEARANCE` (a cylinder side-wall, no vertical
-  term); terrain below the foot needs `hypot(r, foot_h - h_terr) -
-  ROBOT_RADIUS >= MIN_CLEARANCE` (a hemisphere centred at the foot point,
-  matching what `Map2D5.inflated_field(ROBOT_RADIUS + MIN_CLEARANCE,
-  taper=True)` computes exactly when read at the foot's own height — this
-  point-hemisphere convention, not a more literal "flat cap + rounded rim"
-  shape, is what keeps the closed-form fast path in EXACT correspondence with
-  the sample-by-sample reference rather than merely close). Near-endpoint
-  samples where the arc has barely lifted are masked (the rigid-vertical-leg
-  model would spuriously report the foot grazing endpoint terrain there);
-  `standable_mask` handles those.
+  `ROBOT_RADIUS` (0.15 m), with a FLAT BOTTOM at the foot and SQUARE EDGES** —
+  not a multi-region capsule, and not a sphere. Terrain is always a solid column
+  rising from the ground in this codebase, so a flat-capped cylinder's clearance
+  only ever depends on its BOTTOM (the foot); its own height never enters the
+  math. `standable_mask` (stance) and `clearance_floor_alpha` / `arc_clearance`
+  (flight) both reduce to the same one-line test:
+
+      foot_height >= inflated_field(ROBOT_RADIUS + MIN_CLEARANCE) + MIN_CLEARANCE
+
+  The body radius does NOT appear in the vertical term, because a cylinder has
+  no extent below its own flat base. **Do not inflate by a SPHERE of
+  `ROBOT_RADIUS + MIN_CLEARANCE` here** — see the `inflated_field` note above.
+  Near-endpoint samples where the arc has barely lifted are masked (the
+  rigid-vertical-leg model would spuriously report the foot grazing endpoint
+  terrain there); `standable_mask` handles those.
 - **Max standable grade** under this model is a plain closed form,
   `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` ≈ 1.33 — a flat cylinder has
   no lateral taper the way the old CoM sphere did, so at the same radius it is
@@ -423,8 +423,8 @@ Notable non-obvious parameters:
   `MAX_APEX_HEIGHT = V_MAX^2/(2g)` = 2.75 m.
   **`V_MAX` is NOT a per-hop cap** — each hop is capped by its own parent
   (`sqrt(v_s_min^2 + 2*E_INJECT_MAX/m)`, ~5.4 m/s in the flat steady state). `V_MAX`
-  is the arithmetic worst case, reached only right after a max-height drop; its jobs
-  are sizing `OBSTACLE_WALL_EXTRA` and acting as a never-binding backstop on
+  is the arithmetic worst case, reached only right after a max-height drop; its job
+  is acting as a never-binding backstop on
   Campana's constraint (3). To change the robot, change `MAX_LANDING_APEX`,
   `E_INJECT_MAX` or `ETA_HOP` — never `V_MAX` or `MAX_APEX_HEIGHT` directly.
   The longest feasible flat hop is `V_MAX^2 / G_ACCEL` = 5.50 m, and a flat hop of
@@ -455,18 +455,13 @@ Notable non-obvious parameters:
   construction, contributing zero self-lift regardless of `ROBOT_RADIUS`
   (verified: a flat map is standable under this model for any `ROBOT_RADIUS`,
   even one exceeding `LEG_LENGTH`), so that failure mode does not exist here.
-- `OBSTACLE_WALL_EXTRA` **no longer gates the planner** — `inflated_field` gives
-  OBSTACLE cells `+inf`, which is strictly stronger and needs no calibration
-  against `MAX_APEX_HEIGHT`. It still governs the reference implementation
-  (`terrain_profile`) and every `test/demo_*.py` that reads
-  `planner._obstacle_fill`, so the assert below is still live. It is added on top
-  of the map's max real elevation to get the
-  height used for obstacle cells in the clearance check — obstacles aren't just
-  "tall," they're "taller than anything else on the map," so bilinear interpolation
-  near an obstacle edge doesn't accidentally produce a below-wall reading. It must
-  exceed `LEG_LENGTH + MAX_APEX_HEIGHT - ROBOT_RADIUS - MIN_CLEARANCE` or
-  obstacles become jumpable — this is a bottom-cap concern, since the foot is
-  the lowest point of the flight cylinder; `config.py` asserts this.
+- `OBSTACLE_WALL_EXTRA` and `ARC_LATERAL_SAMPLES` **are gone.** Both existed only
+  for bilinear corridor sampling: the first a "tall wall" height substituted for
+  OBSTACLE cells, needing calibration against `MAX_APEX_HEIGHT` or obstacles
+  became jumpable; the second the number of points raked across the body's width.
+  `inflated_field` gives OBSTACLE cells `+inf` outright, which is strictly
+  stronger and needs no calibration, and the body's width lives in the field, so
+  there is no sampling pattern left to tune.
 - `HOP_SCAN_STEP` is a separate parameter from `CELL_RESOLUTION` so it can be
   tuned for speed — branching factor is proportional to `1/step`, making it the
   cheapest lever on planning time. But it also quantizes how far a hop can go:
@@ -483,11 +478,10 @@ Notable non-obvious parameters:
 
 Obstacles **no longer have to be two cells thick.** That rule existed because the
 old flight check read terrain bilinearly, which averaged a one-cell obstacle
-50/50 with its neighbour and halved its effective height. The planner now reads
-`Map2D5.inflated_field`, which is a `max` and so never under-reports. The rule
-still applies to anything going through `sample_bilinear` directly — including
-`terrain_profile` / `clearance_for_alpha`, retained as the reference
-implementation.
+50/50 with its neighbour and halved its effective height. The planner reads
+`Map2D5.inflated_field`, which is a `max` and so never under-reports, and
+`test/test_clearance_rejection.py` pins a one-cell obstacle as un-flyable. The
+rule still applies to anything calling `sample_bilinear` directly.
 
 ### Visualizer (`visualizer.py`)
 
@@ -505,8 +499,9 @@ they need more specialized plots than the generic `Visualizer` provides.
   `demo_common.out_path()` (`results/energy_aware_planning/` by default, override with
   `$PLANNER_OUT_DIR`).
 - **Diagnostics that re-score an edge outside the planner must go through
-  `demo_common.planner_alpha_interval`,** never a bare `feasible_alpha_interval(X, Z,
-  V_max, g)`. Two things are invisible in `X` and `Z` alone: the friction cone needs
+  `demo_common.planner_alpha_interval` and
+  `demo_common.planner_angle_and_clearance`,** never a bare
+  `feasible_alpha_interval(X, Z, V_max, g)` or a hand-rolled clearance check. Two things are invisible in `X` and `Z` alone: the friction cone needs
   both surface normals and the heading (the bare call silently assumes level ground,
   so on sloped terrain the diagnostic disagrees with the planner it is explaining),
   and the energy band needs the speed the robot *arrived* at.
@@ -519,7 +514,8 @@ they need more specialized plots than the generic `Visualizer` provides.
 - `CHANGELOG.md` (Keep a Changelog format) is actively maintained — update it under
   `[Unreleased]` when making a notable change to the planner or its parameters.
 - Pure, unit-testable physics functions (`feasible_alpha_interval`, `predict_trajectory`,
-  `min_clearance`, `min_apex_tan`, `min_energy_tan`, `takeoff_speed`, `landing_speed`,
+  `clearance_floor_alpha`, `arc_clearance`, `min_apex_tan`, `min_energy_tan`,
+  `takeoff_speed`, `landing_speed`,
   `injection_energy`) are kept as free functions in `hopping_astar_planner.py`, separate
   from the `HoppingAStarPlanner` class, specifically so they can be imported and tested
   in isolation (see `test/test_clearance_rejection.py`,

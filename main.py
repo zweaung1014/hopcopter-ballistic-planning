@@ -50,8 +50,6 @@ def main():
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
-        n_lateral=config.ARC_LATERAL_SAMPLES,
-        obstacle_wall_extra=config.OBSTACLE_WALL_EXTRA,
         hop_scan_step=config.HOP_SCAN_STEP,
         hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
     )

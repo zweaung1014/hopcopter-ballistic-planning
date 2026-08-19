@@ -134,7 +134,6 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
                    save_path):
     ncols = max(len(path_base), len(path_ball)) - 1
     fig, axes = plt.subplots(2, ncols, figsize=(3.9 * ncols, 6.0), squeeze=False)
-    obs_fill = planner_ball._obstacle_fill
     ymax = CREST_Z + 0.55
 
     for row, (row_label, path, diags) in enumerate([
@@ -156,10 +155,8 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
                 p0, p1 = path[i], path[i + 1]
                 draw_arc_side_view(
                     ax, (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
-                    d["alpha_s"], m, config.ROBOT_RADIUS, config.LEG_LENGTH,
-                    obs_fill, config.ARC_SAMPLE_MAX_STEP,
+                    d["alpha_s"], m, config.ROBOT_RADIUS, config.LEG_LENGTH, config.ARC_SAMPLE_MAX_STEP,
                     min_clearance_gate=config.MIN_CLEARANCE,
-                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.1, ymax)
                 ax.axhline(CREST_Z, color="#bf360c", linewidth=1.0,

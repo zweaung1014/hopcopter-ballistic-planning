@@ -200,7 +200,6 @@ def draw_arc_strip(
     ncols  = max(n_base, n_ball)
     fig, axes = plt.subplots(2, ncols, figsize=arcs_figsize(ncols), squeeze=False)
 
-    obs_fill = ballistic_planner._obstacle_fill
     ymax     = max(WALL_HEIGHT + 0.35, 0.55)
 
     for row, (row_label, path, diags) in enumerate([
@@ -225,10 +224,9 @@ def draw_arc_strip(
                     ax,
                     (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                     d["alpha_s"], m,
-                    config.ROBOT_RADIUS, config.LEG_LENGTH, obs_fill,
+                    config.ROBOT_RADIUS, config.LEG_LENGTH,
                     config.ARC_SAMPLE_MAX_STEP,
                     min_clearance_gate=config.MIN_CLEARANCE,
-                    n_lateral=config.ARC_LATERAL_SAMPLES,
                 )
                 ax.set_ylim(-0.05, ymax)
 
@@ -305,11 +303,10 @@ def draw_crossing_comparison(
         # Core arc + terrain plot
         draw_arc_side_view(
             ax, c_s, c_g, d["alpha_s"], m,
-            config.ROBOT_RADIUS, config.LEG_LENGTH, planner._obstacle_fill,
+            config.ROBOT_RADIUS, config.LEG_LENGTH,
             config.ARC_SAMPLE_MAX_STEP,
             label=f"Parabolic arc   mc = {d['mc']:+.4f} m",
             min_clearance_gate=config.MIN_CLEARANCE,
-            n_lateral=config.ARC_LATERAL_SAMPLES,
         )
 
         # Wall-top line and clearance-threshold line

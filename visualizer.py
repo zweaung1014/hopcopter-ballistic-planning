@@ -19,35 +19,32 @@ def draw_arc_side_view(
     height_map: Map2D5,
     robot_radius: float,
     leg_length: float,
-    obstacle_fill: float,
     max_step: float,
     label: str | None = None,
     *,
     min_clearance_gate: float = 0.15,
-    n_lateral: int = 3,
 ) -> float:
     """Plot the side view (u vs z) of a ballistic hop over the terrain profile.
 
-    Mirrors the sampling semantics of `hopping_astar_planner.terrain_profile`
-    so what you see matches what the planner decided. Returns the same
-    clearance value the planner would have computed (for numerical assertions
-    in demo scripts).
+    Reads the same inflated height field the planner's gate reads, so what you
+    see is what the planner decided. Returns the same clearance value the
+    planner would have computed (for numerical assertions in demo scripts).
 
     `c_s`/`c_g` carry *terrain* heights; the plotted arc is the CoM
     trajectory, running between `terrain + leg_length` at each end. The foot
-    tip trajectory (`arc - leg_length`) and the bottom-cap envelope
-    (`arc - leg_length - min_clearance_gate`) are also drawn — the bottom
-    envelope is the surface the gate is really testing against.
+    tip trajectory (`arc - leg_length`) and the clearance envelope
+    (`arc - leg_length - min_clearance_gate`) are also drawn — the envelope is
+    the surface the gate is really testing against.
 
     Drawing:
-      * terrain profile filled in brown along `u in [0, X]` — this is the
-        max-across-corridor profile (an upper bound on what the gate sees);
-      * CoM arc as a line, green when the whole capsule clears the gate,
+      * INFLATED terrain filled in brown along `u in [0, X]` — the field the
+        gate actually reads, i.e. real terrain already widened by the body's
+        lateral reach, so the plot and the verdict cannot disagree;
+      * CoM arc as a line, green when the whole body clears the gate,
         red when any sample falls below it;
-      * foot-tip line = `arc - leg_length` (the axis-segment bottom);
-      * bottom-cap envelope = `arc - leg_length - min_clearance_gate` (dashed):
-        the envelope terrain must stay below to satisfy the gate directly
-        under the foot;
+      * foot line = `arc - leg_length` (the cylinder's flat bottom);
+      * clearance envelope = `arc - leg_length - min_clearance_gate` (dashed):
+        the inflated terrain must stay below this to satisfy the gate;
       * marker at the min-clearance sample and an α / clearance annotation.
     """
     x_s, y_s, t_s = c_s
@@ -62,9 +59,7 @@ def draw_arc_side_view(
     sin_t = dy / X
 
     # Delayed import to avoid a circular dependency at module load time.
-    from hopping_astar_planner import (
-        _arc_z, clearance_for_alpha, terrain_profile,
-    )
+    from hopping_astar_planner import _arc_z, arc_clearance
 
     z_s = t_s + leg_length
     Z = t_g - t_s
@@ -76,43 +71,39 @@ def draw_arc_side_view(
     us = np.linspace(0.0, X, n)
     z_arc = _arc_z(us, X, Z, z_s, alpha_s)
 
-    if n_lateral <= 1:
-        offsets = np.zeros(1)
-    else:
-        corridor = robot_radius + min_clearance_gate
-        offsets = np.linspace(-corridor, corridor, n_lateral)
+    # The gate's own view of the terrain: dilated sideways by the body's full
+    # lateral reach, read along the centreline with a nearest-cell lookup.
+    # `inflated_field` memoises, so this IS the planner's array.
+    inflated = height_map.inflated_field(robot_radius + min_clearance_gate)
     cx = x_s + us * cos_t
     cy = y_s + us * sin_t
-    px = cx[:, None] - offsets[None, :] * sin_t
-    py = cy[:, None] + offsets[None, :] * cos_t
-    z_terr = height_map.sample_bilinear(
-        px, py, obstacle_fill=obstacle_fill
-    ).max(axis=1)
-    # Off-map samples read as blocked (the planner rejects such hops outright).
+    res = height_map.resolution
+    ci = np.clip((cx / res).astype(np.int64), 0, height_map.cols - 1)
+    ri = np.clip((cy / res).astype(np.int64), 0, height_map.rows - 1)
+    z_terr = inflated[ri, ci]
+    # Off-map samples read as blocked (the planner rejects such hops outright),
+    # and OBSTACLE columns inflate to +inf, which no axis can scale. Both are
+    # clamped to something tall but finite for drawing only.
     off_map = (cx < 0.0) | (cx >= height_map.size_x) | \
               (cy < 0.0) | (cy >= height_map.size_y)
-    z_terr = np.where(off_map, obstacle_fill, z_terr)
+    finite = z_terr[np.isfinite(z_terr)]
+    wall_z = (float(finite.max()) if finite.size else 0.0) + 10.0
+    z_terr = np.where(off_map | ~np.isfinite(z_terr), wall_z, z_terr)
 
-    # Foot tip and bottom-cap envelope. The gate directly under the foot is
-    # `robot_radius + min_clearance_gate` below the foot tip, since the
-    # robot's single collision cylinder has radius `robot_radius`. Terrain
-    # touching the bottom envelope is the tightest thing this dense
-    # (max-collapsed) plot can flag.
+    # The cylinder has a flat bottom at the foot and square edges, so the gate
+    # under it is exactly `min_clearance_gate` — the body radius is already in
+    # the inflated field, laterally, and contributes nothing downward.
     z_foot = z_arc - leg_length
     z_bottom_env = z_foot - min_clearance_gate
 
     # Authoritative value from the planner's own function, so the displayed
     # number matches exactly what the A* gate would evaluate.
-    profile = terrain_profile(
-        c_s, c_g, height_map, robot_radius, leg_length,
-        max_step, obstacle_fill, n_lateral,
-        min_clearance_gate=min_clearance_gate,
+    min_c = arc_clearance(
+        c_s, c_g, height_map, inflated, leg_length, max_step, alpha_s,
     )
-    min_c = math.inf if profile is None else clearance_for_alpha(profile, alpha_s)
 
-    # Sample where the bottom-envelope hits the closest to terrain in the
-    # side view — this marker is a visual proxy for the tightest bottom-cap
-    # sample the capsule check would report.
+    # Where the envelope comes closest to the inflated terrain in the side
+    # view. Same quantity `arc_clearance` minimises, at drawing density.
     display_clear = z_bottom_env - z_terr
     if display_clear.size >= 2:
         display_clear = display_clear.copy()
@@ -125,7 +116,7 @@ def draw_arc_side_view(
     # --- draw ---
     ax.fill_between(
         us, z_terr, min(z_terr.min(), z_bottom_env.min()) - 0.1,
-        color="#8d6e63", alpha=0.55, linewidth=0, label="Terrain (max in corridor)",
+        color="#8d6e63", alpha=0.55, linewidth=0, label="Terrain (inflated by body)",
     )
     ax.plot(
         us, z_arc,
