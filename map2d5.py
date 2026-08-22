@@ -274,19 +274,19 @@ class Map2D5:
         reach = radius + lookup_pad
         r_cells = int(math.ceil(reach / self.resolution))
 
-        filled = np.where(self.grid == self.OBSTACLE, np.inf, self.grid)
+        filled = np.where(self.grid == self.OBSTACLE, np.inf, self.grid) # turn obstacles into infinity
         pad = max(r_cells, 1)
-        padded = np.full((self.rows + 2 * pad, self.cols + 2 * pad), -np.inf)
-        padded[pad:pad + self.rows, pad:pad + self.cols] = filled
+        padded = np.full((self.rows + 2 * pad, self.cols + 2 * pad), -np.inf) # now you have inf array
+        padded[pad:pad + self.rows, pad:pad + self.cols] = filled # fill in your grid in the middle
 
         # Loop over the ~50 neighbour OFFSETS, shifting the whole grid each
         # time, rather than over the 2500 cells and their neighbours: same
         # arithmetic, but vectorised into a handful of numpy ops.
         out = np.full(self.grid.shape, -np.inf)
-        for dr in range(-r_cells, r_cells + 1):
+        for dr in range(-r_cells, r_cells + 1): # +1 is just Python range behavior
             for dc in range(-r_cells, r_cells + 1):
                 if math.hypot(dr, dc) * self.resolution >= reach:
-                    continue  # too far to matter, however tall
+                    continue  # too far to matter, however tall. For regions of square outside of radius
                 out = np.maximum(out, padded[pad + dr:pad + dr + self.rows,
                                              pad + dc:pad + dc + self.cols])
 
@@ -313,7 +313,7 @@ class Map2D5:
         bwd = np.full(z.shape, np.nan)
 
         if axis == 1:
-            d = (z[:, 1:] - z[:, :-1]) / res
+            d = (z[:, 1:] - z[:, :-1]) / res # compute all adjacent-pair slopes along x-axis
             pair_ok = ok[:, 1:] & ok[:, :-1]
             d = np.where(pair_ok, d, np.nan)
             fwd[:, :-1] = d   # slope looking forward from column c
@@ -373,11 +373,11 @@ class Map2D5:
         if self._normal_cache is not None:
             return self._normal_cache
 
-        s_x = self._min_abs_slope(axis=1)
-        s_y = self._min_abs_slope(axis=0)
+        s_x = self._min_abs_slope(axis=1) # contains slope map of slopes along x-axis
+        s_y = self._min_abs_slope(axis=0) # contains slope map of slopes along y-axis
 
-        n = np.stack([-s_x, -s_y, np.ones_like(s_x)], axis=-1)
-        n /= np.linalg.norm(n, axis=-1, keepdims=True)
+        n = np.stack([-s_x, -s_y, np.ones_like(s_x)], axis=-1) # build the unnormalized normal vector
+        n /= np.linalg.norm(n, axis=-1, keepdims=True) # normalize to unit length
         n[self.grid == self.OBSTACLE] = (0.0, 0.0, 1.0)
 
         self._normal_cache = n
