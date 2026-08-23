@@ -50,9 +50,11 @@ python test/test_edge_cost_energy.py    # energy-based edge cost: the momentum t
                                         # non-negativity, and the over-a-wall case
 python test/test_inflated_field.py      # the planner's inflated-field clearance check
                                         # vs. a brute-force ground truth written inside
-                                        # the test: asserts it never ACCEPTS A COLLISION,
-                                        # plus the lookup-pad guarantee, the no-taper
-                                        # invariant, and standable_mask equivalence
+                                        # the test (including an independent cell-by-cell
+                                        # steep_mask): asserts it never ACCEPTS A
+                                        # COLLISION, plus the lookup-pad guarantee, the
+                                        # no-taper invariant, and standable_mask
+                                        # equivalence
 
 # Timing/scaling benchmark (ballistic vs. baseline planner on the same scenario)
 python test/benchmark_tall_stairs.py
@@ -105,23 +107,61 @@ they block arcs instead of producing bilinear artifacts — the substituted grid
 memoised), `get_elevation_bilinear` (scalar wrapper over it), `set_obstacle_region`,
 `paint_region`, `standable_mask` (is the foot's own cell clear of everything
 within `ROBOT_RADIUS + MIN_CLEARANCE` at standing height — a thin wrapper
-around `inflated_field`, see below, so the max standable grade under this
-model has a plain closed form, `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)`
-≈ 1.33 at shipped values — a flat cylinder has no lateral taper, unlike the
-old sphere-based check it replaced, so it is *less* restrictive at a fixed
-radius, not more),
+around `inflated_field`, see below, so the max standable grade under this model
+is exactly `STEEP_INFLATE_GRADE` = tan(60°) = 1.73, as a STEP: below the
+threshold a ramp has no edges to inflate, so every cell stands however steep;
+one hair above, every cell inflates at once and the field jumps past
+`LEG_LENGTH`),
+`steep_mask` (which cells are terrain EDGES; the source set for
+`inflated_field`; memoised),
 `surface_normals` (per-cell outward unit normals for the friction cone; memoised),
-`inflated_field` (terrain dilated SIDEWAYS by `radius`: per cell, the tallest
-terrain within reach, and nothing added — the planner's flight-clearance
-primitive; memoised. There is no taper and no shape argument, because the body
-is square-edged; see below).
+`inflated_field` (terrain EDGES dilated SIDEWAYS by `radius`, maxed against
+local ground, and nothing added — the planner's flight-clearance primitive;
+memoised. There is no taper and no shape argument, because the body is
+square-edged; see below).
 
 **`inflated_field` is what makes the robot a POINT.** It answers, per cell, "how
-tall is the tallest terrain within reach of here" — so the whole clearance test
-becomes one scalar comparison, and the body's width lives in the map rather than
-in a lateral sampling pattern. A caller checks
+tall is the tallest EDGE terrain within reach of here" — so the whole clearance
+test becomes one scalar comparison, and the body's width lives in the map rather
+than in a lateral sampling pattern. A caller checks
 
-    foot_height >= inflated_field(ROBOT_RADIUS + MIN_CLEARANCE) + MIN_CLEARANCE
+    foot_height >= inflated_field(ROBOT_RADIUS + MIN_CLEARANCE, grade) + MIN_CLEARANCE
+
+**ONLY EDGES ARE SOURCES, and that is the whole point of the dilation.**
+`steep_grade` (a required argument, not an optional one — see below) selects
+them: a cell counts iff some 8-neighbour differs from it by more than that grade
+over the distance to it, orthogonal neighbours at `resolution` and diagonal ones
+at `resolution*sqrt(2)`, so the threshold is an ANGLE and survives a change of
+resolution. OBSTACLE cells are edges outright, and so is anything beside one.
+
+Dilation exists to keep the body off the RIM of a wall or a step, so terrain
+with no rim contributes nothing: a sub-threshold ramp inflates to itself
+exactly. Dilating every cell instead — the earlier behaviour — read `z + 0.32*g`
+at every cell of a grade-`g` ramp, and since `clearance_floor_alpha` activates a
+sample whenever `field > max(t_s, t_g)`, that charged a takeoff-angle floor to
+hops along a ramp that came nowhere near anything.
+
+**The `max(z[c], ...)` floor against local ground is load-bearing**, not
+tidiness: with every neighbour silenced the dilation alone yields `-inf`, and
+`standable_mask` compares `field <= grid + leg_length`. A cell must always bound
+the ground it is standing on.
+
+**What steep-only inflation gives up, deliberately.** In flight this field is
+the ONLY representation of the body's width — `_arc_samples` reads one
+nearest-cell value along a bare centreline. Sub-threshold terrain can still rise
+at grade 1.73, so terrain `ROBOT_RADIUS + MIN_CLEARANCE` to the side of the
+centreline may sit up to 0.43 m above what the field reports, against a
+`MIN_CLEARANCE` of 0.15 m. A hop down a 55° gully, or along a staircase of
+sub-threshold risers, flies clean on paper and could clip laterally. Nothing in
+the shipped deck triggers it (every step and wall is ≥ 0.2 m over one cell), so
+the tests will not catch a regression here. Lower `STEEP_INFLATE_ANGLE_DEG` to
+buy the protection back at the price of re-inflating slopes.
+
+**`steep_grade` is a REQUIRED argument** to `inflated_field` and
+`standable_mask`, for the same reason `v_s_min`/`e_inject_max`/`mass` are
+required on `feasible_alpha_interval`: a default would let a forgotten call site
+silently score a different robot than the planner. A `TypeError` is the
+intended failure.
 
 **There is deliberately NO TAPER, and only ONE field.** A tapered field —
 `h + sqrt(R^2 - d^2)`, lift falling off with lateral distance — is the
@@ -373,7 +413,8 @@ above.
   math. `standable_mask` (stance) and `clearance_floor_alpha` / `arc_clearance`
   (flight) both reduce to the same one-line test:
 
-      foot_height >= inflated_field(ROBOT_RADIUS + MIN_CLEARANCE) + MIN_CLEARANCE
+      foot_height >= inflated_field(ROBOT_RADIUS + MIN_CLEARANCE, grade)
+                     + MIN_CLEARANCE
 
   The body radius does NOT appear in the vertical term, because a cylinder has
   no extent below its own flat base. **Do not inflate by a SPHERE of
@@ -381,14 +422,21 @@ above.
   Near-endpoint samples where the arc has barely lifted are masked (the
   rigid-vertical-leg model would spuriously report the foot grazing endpoint
   terrain there); `standable_mask` handles those.
-- **Max standable grade** under this model is a plain closed form,
-  `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` ≈ 1.33 — a flat cylinder has
-  no lateral taper the way the old CoM sphere did, so at the same radius it is
-  LESS restrictive (~1.33 vs. the old model's ~0.88, verified numerically
-  against `standable_mask`, not just by formula). This is far steeper than any
-  map grade in this repo (`maps/slope_crest.py` ships at 0.35), so it only
-  actually binds against near-vertical walls, not graded slopes — but it is a
-  real, intentional widening of what counts as standable, not a no-op.
+- **Max standable grade** under this model is exactly `STEEP_INFLATE_GRADE`
+  (tan 60° = 1.73), and the transition is a **STEP, not a smooth limit**: below
+  the threshold a uniform ramp contains no edges at all, so the field equals the
+  terrain and every cell is standable however steep; one hair above it every
+  cell becomes a source at once and the field jumps by `0.30 * grade` ≥ 0.52 m,
+  past `LEG_LENGTH`. Verified numerically by bisection against `standable_mask`
+  in `test/test_clearance_rejection.py`, pinned to 1e-3.
+
+  The geometric bound `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` ≈ 1.33 that
+  held while the field inflated everything **no longer binds** — the threshold
+  reaches it first. (Before the capsule→cylinder change it was ~0.88.) Far
+  steeper than any map grade in this repo (`maps/slope_crest.py` ships at 0.35,
+  `maps/cross_slope.py` at 0.9), so it only binds against near-vertical walls.
+  `MU` = 1.2 remains the binding standability limit, now with more headroom;
+  `config.py` asserts that ordering.
 - Instrumentation counters (`n_expansions`, `n_edge_checks`, `n_edges_accepted`) are
   reset at the top of `plan()` and read by the benchmark script.
 
@@ -405,13 +453,22 @@ ballistic/clearance parameter, add it to `config.py` and thread it through both
 `main.py` and any test/demo script that constructs a `HoppingAStarPlanner`.
 
 Notable non-obvious parameters:
+- `STEEP_INFLATE_ANGLE_DEG` (60.0) and the derived `STEEP_INFLATE_GRADE` (1.732)
+  decide **which terrain feeds `Map2D5.inflated_field` at all** — only cells with
+  an 8-neighbour steeper than this. It is an angle rather than a height so it
+  stays meaningful when `CELL_RESOLUTION` changes (0.173 m orthogonally at
+  0.1 m cells). It is *also* the max standable grade, exactly, as a step — see
+  the `Map2D5` section. Lower it to re-inflate slopes and recover lateral
+  protection in flight; raise it to treat more terrain as traversable.
+  `config.py` asserts `STEEP_INFLATE_GRADE > MU`, because below that the field
+  rather than friction becomes the binding standability limit, silently.
 - `MU` (Coulomb friction, 1.2) is a **hard physical constraint**, not a safety
   factor. On flat ground the cone alone forces `alpha >= atan(1/MU)` = 39.8°, well
   above the 12.3° the pre-cone interval allowed for a 1 m hop, so it changes the
   chosen angle on essentially every edge. It also caps the steepest contactable
-  cross-slope at `MU` itself — which at 1.2 sits comfortably under
-  `standable_mask`'s geometric ceiling (~1.33), making friction the binding
-  standability limit. `config.py` asserts the flat-ground cone floor stays below the leg-energy
+  cross-slope at `MU` itself — which at 1.2 sits comfortably under the
+  standability ceiling set by `STEEP_INFLATE_GRADE` (1.73), making friction the
+  binding standability limit; `config.py` asserts that ordering. `config.py` asserts the flat-ground cone floor stays below the leg-energy
   ceiling at `HOP_RADIUS`; violating it empties the interval for *every* flat hop
   and `plan()` returns None everywhere with no other symptom.
 - **`V_G_MAX` is the cap that matters; `V_MAX` and `MAX_APEX_HEIGHT` are derived from

@@ -9,7 +9,7 @@ The robot's body is a CYLINDER of `ROBOT_RADIUS` with a FLAT BOTTOM and SQUARE
 EDGES, standing on the foot, carrying a uniform `MIN_CLEARANCE` safety margin.
 There is ONE field, and the whole model is that field plus one constant:
 
-  * **terrain max** (`inflated_field(ROBOT_RADIUS + MIN_CLEARANCE)`) — "how tall
+  * **terrain max** (`inflated_field(ROBOT_RADIUS + MIN_CLEARANCE, STEEP_INFLATE_GRADE)`) — "how tall
     is the tallest terrain within reach of me?" Nothing is added: flat ground
     reads 0.00, a wall reads its true height. A flat-topped plateau with sharp
     edges, widened sideways by the body's reach.
@@ -114,7 +114,7 @@ def main(argv: list[str]) -> int:
     body_r = config.ROBOT_RADIUS
     margin = config.MIN_CLEARANCE
     R = body_r + margin
-    terrain_max = m.inflated_field(R)
+    terrain_max = m.inflated_field(R, config.STEEP_INFLATE_GRADE)
     clearance = terrain_max + margin   # the same numbers, shifted by the gate
 
     row = m.rows // 2

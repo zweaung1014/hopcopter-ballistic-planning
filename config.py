@@ -126,19 +126,44 @@ W_ENERGY = 0.84  # m per J; the exchange rate between energy and distance in the
 ROBOT_RADIUS = 0.15  # m; the robot's single collision-cylinder radius.
 LEG_LENGTH = 0.4     # m; CoM height above the foot. Hop arcs start and end at
                      # `terrain_z + LEG_LENGTH`, not at terrain level.
-# Max standable constant grade under this model: since a cylinder's clearance
-# test has no lateral taper (unlike a sphere), the ceiling is the plain linear
-# bound `g_max = LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` = 0.4 / 0.30 ≈
-# 1.33 (verified numerically against `Map2D5.inflated_field`/`standable_mask`,
-# not just this formula) — steeper than any realistic map grade in this repo
-# (the steepest, `maps/slope_crest.py`, ships at 0.35), so this only actually
-# binds against near-vertical walls, not graded slopes. This is HIGHER than
-# the old two-component capsule's ceiling (~0.88): a flat cylinder doesn't
-# taper away laterally the way a rounded CoM sphere does, so at a fixed radius
-# it is less restrictive in this stance comparison. No shipped map is affected
-# either way, but standing near steep terrain is now judged more permissively
-# than under the old model — a deliberate tradeoff for a single unified field,
-# not an oversight.
+
+# What counts as an EDGE — the only terrain that feeds the inflated field
+# -----------------------------------------------------------------------------
+# `Map2D5.inflated_field` dilates terrain sideways so the robot can be treated as
+# a point. The purpose of that dilation is EDGE AVOIDANCE: keep the body off the
+# rim of a wall or a step. It is not "charge uphill height everywhere", and when
+# it was applied to every cell that is what it did — on a grade-`g` ramp the
+# field read `z + 0.32*g` at every cell, so `clearance_floor_alpha`'s
+# `field > max(t_s, t_g)` test lifted the takeoff angle for hops along a ramp
+# that never came near anything. (The same over-reach already forced the
+# endpoint exemption documented in `clearance_floor_alpha`.)
+#
+# So only cells that are part of a genuine edge are dilation sources: cells with
+# an 8-neighbour whose elevation differs by more than this grade over the
+# distance to it. At CELL_RESOLUTION = 0.1 m that is a 0.173 m step to an
+# orthogonal neighbour, 0.245 m to a diagonal one.
+STEEP_INFLATE_ANGLE_DEG = 60.0
+STEEP_INFLATE_GRADE = math.tan(math.radians(STEEP_INFLATE_ANGLE_DEG))  # 1.732
+# Max standable constant grade under this model is exactly STEEP_INFLATE_GRADE
+# = 1.73, and the transition is a STEP, not a smooth limit. Below the threshold
+# no cell is a dilation source, so `inflated_field == grid` and every cell is
+# standable however steep; one hair above it every cell is a source at once and
+# the field jumps to `z + 0.30*g` ≥ 0.52 m, well past LEG_LENGTH. The old
+# geometric bound `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` = 1.33 therefore
+# never binds any more — the threshold reaches it first. (Before steep-only
+# inflation that geometric bound WAS the ceiling; before the capsule→cylinder
+# change it was ~0.88.) MU = 1.2 remains the binding standability limit, now
+# with more headroom than it had.
+#
+# THE TRADE THIS BUYS AND WHAT IT COSTS: in flight the inflated field is the
+# only thing representing the body's ROBOT_RADIUS of width — `_arc_samples`
+# reads one nearest-cell value along a bare centreline. Sub-threshold terrain
+# may still rise at grade 1.73, so terrain (ROBOT_RADIUS + MIN_CLEARANCE) to the
+# side of the centreline can sit up to 0.43 m above what the field reports. A
+# hop down a 55° gully, or along a staircase of sub-threshold risers, flies
+# clean on paper and could clip laterally. Deliberate, not an oversight: lower
+# STEEP_INFLATE_ANGLE_DEG to buy that protection back at the price of
+# re-inflating slopes.
 
 # Ballistic (parabolic hop) physics + clearance parameters
 # Based on Campana & Laumond (2016), "Ballistic motion planning."
@@ -259,8 +284,9 @@ MU = 1.2  # Coulomb friction coefficient, uniform over the environment (as in
           # cross-slope of grade > MU makes the cone-plane intersection
           # degenerate (see `hopping_astar_planner.inplane_friction_cone`), so
           # no hop can start or land there. At MU = 1.2 that limit sits well
-          # below `standable_mask`'s geometric ceiling (~1.33, see ROBOT_RADIUS
-          # above), so friction is the binding standability limit, not geometry.
+          # below the standability ceiling set by STEEP_INFLATE_GRADE (1.73, see
+          # ROBOT_RADIUS above), so friction is the binding standability limit,
+          # not geometry. The assert below pins that ordering.
 
 MIN_CLEARANCE = 0.15  # m; HARD gate — an arc whose body-to-terrain clearance ever
                       # drops below this is rejected outright. Clearance does NOT
@@ -320,6 +346,14 @@ _HOP_RADIUS_FIRST_HOP = _V_S_MAX_FIRST_HOP**2 / G_ACCEL
 # as exactly the distance that needs the full injection budget at 45 deg, so
 # every hop's own ring edge sits at this same tight margin.
 assert MU > 0.0, "MU must be positive."
+assert STEEP_INFLATE_GRADE > MU, (
+    f"STEEP_INFLATE_ANGLE_DEG = {STEEP_INFLATE_ANGLE_DEG} puts the inflation "
+    f"threshold at grade {STEEP_INFLATE_GRADE:.3f}, at or below MU = {MU}. "
+    f"That silently makes the inflated field, rather than friction, the binding "
+    f"standability limit: slopes the friction cone accepts would be rejected by "
+    f"`standable_mask` instead, and the failure looks like `plan()` returning "
+    f"None on graded maps with no other symptom."
+)
 _FLAT_DISC = V_MAX**4 - G_ACCEL**2 * _HOP_RADIUS_FIRST_HOP**2
 # Structurally >= 0 now (no assert needed): _HOP_RADIUS_FIRST_HOP is capped so
 # V_MAX can always reach it (the `min(..., V_MAX**2)` above), so this can no

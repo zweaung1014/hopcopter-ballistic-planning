@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — only terrain EDGES feed the inflated field
+
+`Map2D5.inflated_field` dilated **every** cell sideways: per cell, the tallest
+terrain within reach, whatever that terrain looked like. Correct but blunt. The
+purpose of that dilation is EDGE AVOIDANCE — keep the body off the rim of a wall
+or a step — and applied to every cell it instead charged uphill height
+everywhere. On a grade-`g` ramp the field read `z + 0.32*g` at every cell, so
+`clearance_floor_alpha`'s `field > max(t_s, t_g)` test handed a takeoff-angle
+floor to hops that came nowhere near anything. (The same over-reach already
+forced the endpoint exemption documented in `clearance_floor_alpha`: an endpoint
+test on `maps/slope_crest.py` rejected every hop off every ramp cell.)
+
+Now a cell is a dilation source only if it is part of an edge:
+
+    steep(n) := n is OBSTACLE, or |z[n] - z[m]| > grade * dist(n, m)
+                for some 8-neighbour m (a pair touching an OBSTACLE counts)
+    field[c]  = max( z[c], max{ z[n] : steep(n), dist(n, c) < radius } )
+
+- **`Map2D5.steep_mask(min_grade)`** (new, memoised). Four slice-pair
+  comparisons cover all eight neighbours, each pair marking **both** ends — the
+  low side's own elevation is dominated by the local-ground floor anyway, and
+  marking it avoids a "which side of the riser owns the edge" special case with
+  no good answer at a corner. Orthogonal neighbours are compared over
+  `resolution`, diagonal ones over `resolution * sqrt(2)`, so the threshold is
+  an ANGLE and survives a change of grid resolution.
+- **`config.STEEP_INFLATE_ANGLE_DEG` = 60.0** and the derived
+  `STEEP_INFLATE_GRADE` = 1.732. At `CELL_RESOLUTION` = 0.1 m that is a 0.173 m
+  step to an orthogonal neighbour. New assert: `STEEP_INFLATE_GRADE > MU`,
+  because below that the field rather than friction becomes the binding
+  standability limit, silently.
+- **`inflated_field` and `standable_mask` take `steep_grade` as a REQUIRED
+  argument.** Not optional with a compatible default: this repo already learned
+  that lesson with `feasible_alpha_interval`'s `v_s_min`/`e_inject_max`/`mass`.
+  A default would let a forgotten call site score a different robot than the
+  planner with no symptom; a required argument makes it a `TypeError`. Threaded
+  through `HoppingAStarPlanner.__init__`, `visualizer.draw_arc_side_view`, and
+  every `test/` script that builds a planner or reads the field.
+- **`inflated_field` now maxes against local terrain** (`max(z[c], ...)`). With
+  every neighbour silenced the dilation alone yields `-inf`, and
+  `standable_mask` compares `field <= grid + leg_length` — a cell must always
+  bound the ground it stands on.
+
+**Max standable constant grade changes from 1.33 to exactly 1.732, as a STEP.**
+Below the threshold a uniform ramp contains no edges, so `field == grid` and
+every cell is standable however steep; one hair above, every cell is a source at
+once and the field jumps to `z + 0.30*g` >= 0.52 m, past `LEG_LENGTH`. The old
+geometric bound `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` never binds any
+more — the threshold reaches it first. `MU` = 1.2 remains the binding
+standability limit, now with more headroom.
+
+**What this gives up, deliberately.** In flight the inflated field is the only
+representation of the body's width — `_arc_samples` reads one nearest-cell value
+along a bare centreline. Sub-threshold terrain may still rise at grade 1.73, so
+terrain `ROBOT_RADIUS + MIN_CLEARANCE` to the side can sit up to 0.43 m above
+what the field reports, against a `MIN_CLEARANCE` of 0.15 m. A hop down a 55
+degree gully, or along a staircase of sub-threshold risers, flies clean on paper
+and could clip laterally. Lower `STEEP_INFLATE_ANGLE_DEG` to buy that back at
+the price of re-inflating slopes.
+
+No shipped map loses a feature: every step and wall in the deck is >= 0.2 m over
+one cell (grade >= 2.0), and OBSTACLE cells are steep by definition. Measured by
+differencing the field against itself at `steep_grade = -1.0` (which makes every
+cell a source and so reproduces the old behaviour exactly), **8 of the 10 shipped
+maps come out bit-identical** — max difference 0.000 m — so their plans are
+unchanged by construction. Only the two graded maps move: `slope_crest` (0.35)
+drops by up to 0.106 m over 1650 cells, `cross_slope` (0.9) by up to 0.270 m over
+1150 cells.
+
+On those two the plans improve markedly, because the spurious ramp lift was
+being paid for with near-vertical stutter-hops:
+
+| map | | hops | injected | expansions | time |
+|---|---|---|---|---|---|
+| `slope_crest` | before | 4 | 15.66 J | 4,627 | 42 s |
+| | after | 3 | 9.43 J | 13,012 | 138 s |
+| `cross_slope` | before | 7 | 32.17 J | 14,805 | 104 s |
+| | after | 4 | 19.24 J | 24,569 | 170 s |
+
+`slope_crest` shed two 0.63 m hops at 83 deg; `cross_slope` shed four 0.40 m hops
+at 86-87 deg. **The cost is planning time**: de-inflating makes more edges pass
+the clearance gate, so the branching factor grows — roughly 3x the expansions on
+`slope_crest` and 1.7x on `cross_slope`. Since `_heuristic` estimates distance
+only, A* was already near-Dijkstra with `W_ENERGY` on, so it absorbs the extra
+edges badly. Unchanged on every other map.
+
+- **`test/test_inflated_field.py`** grows an independent brute-force
+  `_steep_truth`, cell by cell over all eight neighbours, so the vectorised
+  slice trick is checked rather than assumed; `_disc_max` filters to edge cells
+  with the query point's own cell exempt; and a fifth check,
+  `check_steep_mask_matches_brute_force`, pins the two against each other
+  directly (a slice off-by-one would otherwise surface only where it happened
+  to flip a verdict) along with the threshold's step behaviour — a uniform
+  grade 1% under it must produce NO edges, 1% over it must make every cell
+  one. Measured effect: `slope_crest`'s
+  tolerated spurious rejections fall 20 -> 15 and its unpadded-lookup violations
+  1002 -> 127, while every wall map is bit-identical. The pad stays
+  load-bearing (434 unbounded query points without it).
+- **`test/test_clearance_rejection.py`**'s max-standable-grade bisection is
+  retargeted from `LEG/(ROBOT_R+GATE)` to `STEEP_INFLATE_GRADE`, and pinned to
+  1e-3 rather than 0.02 since the transition is now a step. The pillar sweep,
+  one-cell obstacles, stance sanity, the 0.30 m bump and the 1.90 m wall are all
+  unchanged.
+- **`test/test_edge_cost_energy.py`**'s ridge moves from 0.10 m to 0.15 m
+  (0.87 of the threshold). Above the threshold a one-cell ridge gets full
+  lateral standoff and no steady-state hop clears it — already true before this
+  change, 0.18 m was rejected then too. Below it the ridge is priced through the
+  centreline alone, which at 0.10 m the steady-state arc clears for free.
+
+
 ### Changed — collision geometry is a single uniform cylinder, not a 3-radius capsule
 
 The robot's collision volume was a capsule with three independently-sized

@@ -23,6 +23,7 @@ def draw_arc_side_view(
     label: str | None = None,
     *,
     min_clearance_gate: float = 0.15,
+    steep_grade: float = 1.7320508075688767,  # tan(60 deg); see config
 ) -> float:
     """Plot the side view (u vs z) of a ballistic hop over the terrain profile.
 
@@ -74,7 +75,9 @@ def draw_arc_side_view(
     # The gate's own view of the terrain: dilated sideways by the body's full
     # lateral reach, read along the centreline with a nearest-cell lookup.
     # `inflated_field` memoises, so this IS the planner's array.
-    inflated = height_map.inflated_field(robot_radius + min_clearance_gate)
+    inflated = height_map.inflated_field(
+        robot_radius + min_clearance_gate, steep_grade,
+    )
     cx = x_s + us * cos_t
     cy = y_s + us * sin_t
     res = height_map.resolution

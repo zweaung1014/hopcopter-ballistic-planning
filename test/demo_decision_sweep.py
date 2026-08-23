@@ -231,6 +231,7 @@ def main() -> int:
                 axb, (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                 d["alpha_s"], m, config.ROBOT_RADIUS, config.LEG_LENGTH, config.ARC_SAMPLE_MAX_STEP,
                 min_clearance_gate=config.MIN_CLEARANCE,
+                steep_grade=config.STEEP_INFLATE_GRADE,
             )
             axb.set_ylim(-0.1, max(HEIGHTS) + 0.5)
             axb.axhline(h, color="#e65100", linewidth=1.4, linestyle="--",

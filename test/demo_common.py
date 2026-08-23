@@ -199,6 +199,7 @@ def make_planner(
         speed_bin=config.SPEED_BIN,
         leg_length=config.LEG_LENGTH,
         min_clearance_gate=config.MIN_CLEARANCE,
+        steep_grade=config.STEEP_INFLATE_GRADE,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         hop_scan_step=config.HOP_SCAN_STEP,
         hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,

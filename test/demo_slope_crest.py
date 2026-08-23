@@ -157,6 +157,7 @@ def draw_arc_strip(m, planner_ball, path_base, diags_base, path_ball, diags_ball
                     ax, (p0[0], p0[1], d["z0"]), (p1[0], p1[1], d["z1"]),
                     d["alpha_s"], m, config.ROBOT_RADIUS, config.LEG_LENGTH, config.ARC_SAMPLE_MAX_STEP,
                     min_clearance_gate=config.MIN_CLEARANCE,
+                    steep_grade=config.STEEP_INFLATE_GRADE,
                 )
                 ax.set_ylim(-0.1, ymax)
                 ax.axhline(CREST_Z, color="#bf360c", linewidth=1.0,

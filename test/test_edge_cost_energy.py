@@ -68,6 +68,7 @@ def make_planner(m: Map2D5, **overrides) -> HoppingAStarPlanner:
         h_initial=H_STEADY, V_g_max=config.V_G_MAX, speed_bin=config.SPEED_BIN,
         mu=config.MU, robot_radius=config.ROBOT_RADIUS,
         leg_length=config.LEG_LENGTH, min_clearance_gate=config.MIN_CLEARANCE,
+        steep_grade=config.STEEP_INFLATE_GRADE,
         arc_max_step=config.ARC_SAMPLE_MAX_STEP,
         hop_scan_step=config.HOP_SCAN_STEP,
         hop_scan_step_ref_radius=config.HOP_SCAN_STEP_REF_RADIUS,
@@ -221,25 +222,38 @@ def case_wall_costs_more_than_flat() -> None:
     assert r_flat is not None
     flat_cost, flat_hop = r_flat
 
-    # 0.1 m, down from 0.4 m. NOT a bottom-cap effect — the cylinder demands
-    # exactly MIN_CLEARANCE (0.15 m) directly under the foot, slightly LESS
-    # than the old capsule's foot tip did (0.02 + 0.15 = 0.17 m). What changed
-    # is LATERAL: the body went from a 0.01 m leg to a 0.15 m cylinder, so with
-    # the margin it sweeps 0.30 m either side and has to clear the ridge from
-    # 0.30 m out — the foot must already be high well BEFORE reaching it, where
-    # the arc has barely risen. The angle that needs (83.3 deg at a 0.4 m
-    # ridge) is past the steady-state energy ceiling (79.2 deg), so the hop is
-    # rejected by the ENERGY budget, not by the clearance shape. 0.1 m needs
-    # 74.7 deg, inside the ceiling, and still costs visibly more than flat.
+    # The ridge has to sit just UNDER the edge threshold, and the window is
+    # narrow in both directions.
+    #
+    # ABOVE it (0.174 m at shipped config) a one-cell ridge becomes a dilation
+    # source in `Map2D5.inflated_field`, so the body's full 0.30 m of lateral
+    # reach applies and the foot must already be high 0.30 m BEFORE the ridge,
+    # where the arc has barely risen. The angle that demands is past the
+    # steady-state energy ceiling (79.2 deg), so the hop is rejected by the
+    # ENERGY budget rather than priced. That was true before steep-only
+    # inflation too — 0.18 m was already rejected — so it is not a new limit.
+    #
+    # BELOW it the ridge is no longer an edge, so it is priced through the
+    # CENTRELINE alone: the foot must clear `ridge + MIN_CLEARANCE` at the
+    # ridge itself, and nowhere else. That is a smaller effect than the old
+    # lateral sweep (which is exactly what steep-only inflation gave up) but a
+    # real one, and it is still the thing this case is about: a dz = 0 hop that
+    # costs more than flat ground, which the old elevation-based penalty
+    # charged nothing for. It does have to be near the top of the band — at
+    # 0.10 m the steady-state arc clears the ridge on its own and the hop is
+    # genuinely free.
+    ridge_h = 0.87 * config.STEEP_INFLATE_GRADE * config.CELL_RESOLUTION  # 0.15 m
     m = flat_map()
-    m.paint_region(0.1, x_min=1.95, x_max=2.05)   # thin ridge at the midpoint
+    m.paint_region(ridge_h, x_min=1.95, x_max=2.05)   # thin ridge at the midpoint
     p_wall = make_planner(m)
     r_wall = score_hop(p_wall, 1.5, 2.5, 2.5, 2.5, V_STEADY)
-    assert r_wall is not None, "the robot should still be able to clear a 0.1 m ridge"
+    assert r_wall is not None, (
+        f"the robot should still be able to clear a {ridge_h:.2f} m ridge"
+    )
     wall_cost, wall_hop = r_wall
 
     check(
-        "hopping over a 0.1 m ridge costs more than the same flat hop",
+        f"hopping over a {ridge_h:.2f} m ridge costs more than the same flat hop",
         wall_cost > flat_cost,
         f"{wall_cost:.3f} vs {flat_cost:.3f}",
     )

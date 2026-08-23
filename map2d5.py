@@ -29,8 +29,11 @@ class Map2D5:
         # Memo for the per-cell surface normals (see `surface_normals`).
         self._normal_cache: np.ndarray | None = None
         # Memo for the inflated height fields, keyed on their arguments (see
-        # `inflated_field`). A planner builds two and reads them every edge.
-        self._inflated_cache: dict[tuple[float, bool, float], np.ndarray] = {}
+        # `inflated_field`). The planner builds one and reads it every edge.
+        self._inflated_cache: dict[tuple[float, float, float], np.ndarray] = {}
+        # Memo for the steep-edge masks, keyed on the grade threshold (see
+        # `steep_mask`). `inflated_field` asks for one every time it builds.
+        self._steep_cache: dict[float, np.ndarray] = {}
 
     def _invalidate_caches(self) -> None:
         """Drop every grid-derived memo. Call after any write to `self.grid`."""
@@ -38,6 +41,7 @@ class Map2D5:
         self._fill_cache_grid = None
         self._normal_cache = None
         self._inflated_cache = {}
+        self._steep_cache = {}
 
     def _filled_grid(self, obstacle_fill: float | None) -> np.ndarray:
         """`self.grid` with OBSTACLE cells replaced by `obstacle_fill`.
@@ -188,6 +192,7 @@ class Map2D5:
         radius: float,
         clearance: float,
         leg_length: float,
+        steep_grade: float,
     ) -> np.ndarray:
         """Boolean grid of cells where the robot can stand without clipping terrain.
 
@@ -197,26 +202,119 @@ class Map2D5:
         clearance` — exactly the same test `clearance_floor_alpha` runs during
         flight, evaluated at standing height. So this is just
         `inflated_field` read at `grid + leg_length`, not a bespoke geometry
-        calculation: `inflated_field` memoises on `(radius, lookup_pad)`, so
-        calling it with the same `radius + clearance` the planner already built
-        for flight clearance hits that cache rather than recomputing anything.
+        calculation: `inflated_field` memoises on
+        `(radius, lookup_pad, steep_grade)`, so calling it with the same
+        `radius + clearance` and `steep_grade` the planner already built for
+        flight clearance hits that cache rather than recomputing anything.
+
+        Because only terrain EDGES feed that field (see `steep_mask`), the max
+        standable constant grade is exactly `steep_grade` — a ramp below the
+        threshold has no edges, so the field equals the terrain and every cell
+        is standable however steep. The old geometric ceiling,
+        `leg_length / (radius + clearance)`, no longer binds; the threshold
+        reaches it first.
 
         Computed once per planner. Screening landing cells against this is far
         cheaper than discovering the same collision by marching an arc.
         """
-        field = self.inflated_field(radius + clearance)
+        field = self.inflated_field(radius + clearance, steep_grade)
         return (field <= self.grid + leg_length) & (self.grid != self.OBSTACLE)
+
+    def steep_mask(self, min_grade: float) -> np.ndarray:
+        """Boolean grid: which cells are part of a terrain EDGE.
+
+        A cell is steep iff some 8-neighbour's elevation differs from its own by
+        more than `min_grade` times the distance to that neighbour — orthogonal
+        neighbours are `resolution` away, diagonal ones `resolution * sqrt(2)`,
+        so the test is an ANGLE and stays meaningful when the grid is refined.
+        At `min_grade = tan(60 deg)` and 0.1 m cells that is a 0.173 m step
+        orthogonally, 0.245 m diagonally.
+
+        This is the source set for `inflated_field`, and it is the whole reason
+        that field no longer smears uphill terrain across graded ground: a ramp
+        below the threshold contains no edges at all, so it inflates to itself.
+
+        **Both cells of a steep pair are marked**, not just the taller one. The
+        low side's own (low) elevation is dominated by the `max` against local
+        terrain that `inflated_field` applies anyway, at every cell it can
+        reach, so marking it costs nothing — and it saves a "which side of the
+        riser owns the edge" special case that has no good answer at a corner.
+
+        OBSTACLE cells are steep unconditionally (their column is infinitely
+        tall), and so is any cell adjacent to one: `-1.0` is a sentinel, not an
+        elevation, so it cannot be differenced, and the neighbour of an
+        infinitely tall column is an edge cell by inspection.
+
+        Memoised on `min_grade`, dropped by `_invalidate_caches`, like
+        `surface_normals` and `inflated_field`.
+        """
+        cached = self._steep_cache.get(float(min_grade))
+        if cached is not None:
+            return cached
+
+        z = self.grid
+        obs = z == self.OBSTACLE
+        mask = obs.copy()
+
+        res = self.resolution
+        diag = res * math.sqrt(2.0)
+        # Four offsets cover all eight neighbours: each pair is tested once and
+        # marks both ends, so (0, -1) is (0, +1) seen from the other side. Slice
+        # pairs rather than per-cell loops, the same idiom as `_min_abs_slope`.
+        full = slice(None)
+        lo, hi = slice(0, -1), slice(1, None)
+        for a_sl, b_sl, dist in (
+            ((full, lo), (full, hi), res),    # east
+            ((lo, full), (hi, full), res),    # north
+            ((lo, lo), (hi, hi), diag),       # north-east
+            ((lo, hi), (hi, lo), diag),       # north-west
+        ):
+            steep = np.abs(z[b_sl] - z[a_sl]) > min_grade * dist
+            steep |= obs[a_sl] | obs[b_sl]
+            mask[a_sl] |= steep
+            mask[b_sl] |= steep
+
+        self._steep_cache[float(min_grade)] = mask
+        return mask
 
     def inflated_field(
         self,
         radius: float,
+        steep_grade: float,
         lookup_pad: float | None = None,
     ) -> np.ndarray:
-        """Terrain dilated sideways by `radius`: the tallest terrain in reach.
+        """Terrain EDGES dilated sideways by `radius`, plus local ground height.
 
-        Per cell, the height of the tallest terrain within `radius` of it. That
-        is all — nothing is added, so flat ground reads back as flat ground and
-        a wall reads its own true height.
+        Per cell:
+
+            field[c] = max( grid[c],
+                            max{ grid[n] : steep(n), dist(n, c) < radius } )
+
+        — the tallest EDGE terrain within `radius`, but never below the cell's
+        own ground. Nothing is added on top, so flat ground reads back as flat
+        ground and a wall reads its own true height.
+
+        **Only edges are sources, and that is the point.** `steep_grade` selects
+        them via `steep_mask`: a cell counts only if some 8-neighbour differs
+        from it by more than that grade. Dilation exists to keep the body off
+        the RIM of a wall or step, so terrain with no rim contributes nothing —
+        a ramp below the threshold inflates to itself exactly. Dilating every
+        cell instead (the earlier behaviour) read `z + 0.32*g` at every cell of
+        a grade-`g` ramp, which `clearance_floor_alpha`'s
+        `field > max(t_s, t_g)` test then charged as a takeoff-angle floor on
+        hops that came nowhere near it.
+
+        The `max(grid[c], ...)` floor is load-bearing, not tidiness: with every
+        neighbour silenced the dilation alone yields `-inf`, and `standable_mask`
+        compares `field <= grid + leg_length`. A cell must always bound the
+        ground it is standing on.
+
+        **What this gives up.** In flight this field is the only representation
+        of the body's width — the arc check itself samples a bare centreline —
+        so terrain below the threshold is now laterally invisible, by up to
+        `radius * steep_grade` of height. See the note in `config.py` under
+        STEEP_INFLATE_ANGLE_DEG. In stance it makes the max standable constant
+        grade exactly `steep_grade`, as a step discontinuity.
 
         This is the configuration-space form of a SHARP-EDGED body. The robot
         is a cylinder with a flat bottom and square edges, and the safety margin
@@ -224,7 +322,7 @@ class Map2D5:
         in, sharp result out. A caller checks clearance by comparing against
         this field plus its margin as a constant —
 
-            foot_height >= inflated_field(body_radius + margin) + margin
+            foot_height >= inflated_field(body_radius + margin, grade) + margin
 
         — which keeps the margin an explicit number at the comparison rather
         than baking a shape into the terrain.
@@ -255,8 +353,8 @@ class Map2D5:
         OBSTACLE columns are infinitely tall and off-map neighbours impose no
         constraint, matching `standable_mask`.
 
-        Memoised on `(radius, lookup_pad)` and dropped by `_invalidate_caches`,
-        like `surface_normals`.
+        Memoised on `(radius, lookup_pad, steep_grade)` and dropped by
+        `_invalidate_caches`, like `surface_normals`.
 
         Note `standable_mask` is a thin wrapper over this method, evaluated at
         standing height; `test/test_inflated_field.py` pins the two together so
@@ -265,7 +363,7 @@ class Map2D5:
         if lookup_pad is None:
             lookup_pad = self.resolution * math.sqrt(2.0) / 2.0
 
-        key = (float(radius), float(lookup_pad))
+        key = (float(radius), float(lookup_pad), float(steep_grade))
         cached = self._inflated_cache.get(key)
         if cached is not None:
             return cached
@@ -274,10 +372,16 @@ class Map2D5:
         reach = radius + lookup_pad
         r_cells = int(math.ceil(reach / self.resolution))
 
-        filled = np.where(self.grid == self.OBSTACLE, np.inf, self.grid) # turn obstacles into infinity
+        filled = np.where(self.grid == self.OBSTACLE, np.inf, self.grid) # turn obstacles from -1 into infinity
+        # Only edge cells get to shout their height outward. Silencing the rest
+        # with -inf is all it takes: -inf is the identity for `max`, so the
+        # dilation loop below needs no change at all.
+        # So later, when we take the max, those cells labeled -infinity will not impact
+        # their neighboring cells' inflations even though their grids may have some elevation.
+        src = np.where(self.steep_mask(steep_grade), filled, -np.inf)
         pad = max(r_cells, 1)
         padded = np.full((self.rows + 2 * pad, self.cols + 2 * pad), -np.inf) # now you have inf array
-        padded[pad:pad + self.rows, pad:pad + self.cols] = filled # fill in your grid in the middle
+        padded[pad:pad + self.rows, pad:pad + self.cols] = src # fill in your grid in the middle
 
         # Loop over the ~50 neighbour OFFSETS, shifting the whole grid each
         # time, rather than over the 2500 cells and their neighbours: same
@@ -289,6 +393,10 @@ class Map2D5:
                     continue  # too far to matter, however tall. For regions of square outside of radius
                 out = np.maximum(out, padded[pad + dr:pad + dr + self.rows,
                                              pad + dc:pad + dc + self.cols])
+
+        # A cell always bounds its own ground, even with every neighbour
+        # silenced — see the docstring. Also restores +inf on OBSTACLE cells.
+        out = np.maximum(out, filled)
 
         self._inflated_cache[key] = out
         return out

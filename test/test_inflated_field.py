@@ -50,6 +50,9 @@ MAX_STEP = config.ARC_SAMPLE_MAX_STEP
 #: The body's total lateral reach — the radius the terrain is dilated by.
 REACH = ROBOT_R + GATE
 
+#: The edge threshold: only terrain steeper than this feeds the field at all.
+GRADE = config.STEEP_INFLATE_GRADE
+
 #: Hops per map in the agreement sweep.
 N_SAMPLES = 1500
 
@@ -73,19 +76,68 @@ def _deck() -> list[tuple[str, Map2D5]]:
     return maps
 
 
-def _disc_max(m: Map2D5, px: float, py: float) -> float:
-    """Tallest terrain cell whose CENTRE lies within `REACH` of `(px, py)`.
+def _steep_truth(m: Map2D5) -> np.ndarray:
+    """Which cells are terrain EDGES, by definition and cell by cell.
+
+    Brute force on purpose — `Map2D5.steep_mask` is a vectorised slice trick and
+    this must not share any code with it, so the four-offset slicing is checked
+    too, not assumed.
+
+    A cell is an edge iff some 8-neighbour's elevation differs by more than
+    `GRADE` times the distance to it. OBSTACLE cells are edges outright and so
+    is anything beside one: `-1.0` is a sentinel, not an elevation.
+    """
+    steep = np.zeros(m.grid.shape, dtype=bool)
+    for r in range(m.rows):
+        for c in range(m.cols):
+            h = m.grid[r, c]
+            if h == Map2D5.OBSTACLE:
+                steep[r, c] = True
+                continue
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    rr, cc = r + dr, c + dc
+                    if not (0 <= rr < m.rows and 0 <= cc < m.cols):
+                        continue
+                    hn = m.grid[rr, cc]
+                    if hn == Map2D5.OBSTACLE:
+                        steep[r, c] = True
+                        break
+                    dist = math.hypot(dr, dc) * RES
+                    if abs(float(hn) - float(h)) > GRADE * dist:
+                        steep[r, c] = True
+                        break
+                if steep[r, c]:
+                    break
+    return steep
+
+
+def _disc_max(m: Map2D5, steep: np.ndarray, px: float, py: float) -> float:
+    """Tallest EDGE cell whose CENTRE lies within `REACH` of `(px, py)`, or the
+    ground under `(px, py)` itself — whichever is higher.
 
     Brute force on purpose — this is the definition the field is an
     optimisation of, so it must not share any code with it.
+
+    Only edge cells count, because only edges are dilation sources (see
+    `Map2D5.steep_mask`). The cell containing the query point is exempt from
+    that filter: `inflated_field` always maxes against local ground, so a cell
+    bounds the terrain it sits on whether or not it is an edge.
     """
     rc = int(math.ceil(REACH / RES)) + 1
     qc, qr = int(px / RES), int(py / RES)
     best = -math.inf
+    if 0 <= qr < m.rows and 0 <= qc < m.cols:
+        h = m.grid[qr, qc]
+        best = math.inf if h == Map2D5.OBSTACLE else float(h)
     for dr in range(-rc, rc + 1):
         for dc in range(-rc, rc + 1):
             rr, cc = qr + dr, qc + dc
             if not (0 <= rr < m.rows and 0 <= cc < m.cols):
+                continue
+            if not steep[rr, cc]:
                 continue
             if math.hypot((cc + 0.5) * RES - px, (rr + 0.5) * RES - py) >= REACH:
                 continue
@@ -94,7 +146,8 @@ def _disc_max(m: Map2D5, px: float, py: float) -> float:
     return best
 
 
-def _collides(m: Map2D5, c_s, c_g, alpha: float) -> bool:
+def _collides(m: Map2D5, steep: np.ndarray, c_s, c_g,
+              alpha: float) -> bool:
     """Ground truth: does the body hit anything on this arc, at this angle?
 
     The model spelled out with no shortcuts. The body is a cylinder with a flat
@@ -124,7 +177,7 @@ def _collides(m: Map2D5, c_s, c_g, alpha: float) -> bool:
         px, py = x_s + ui * (dx / X), y_s + ui * (dy / X)
         if not (0.0 <= px < m.size_x and 0.0 <= py < m.size_y):
             return True
-        h_max = _disc_max(m, px, py)
+        h_max = _disc_max(m, steep, px, py)
         if h_max <= endpoint_max:
             continue
         foot_h = t_s + Z * ui * ui / (X * X) + T * ui * (X - ui) / X
@@ -133,7 +186,8 @@ def _collides(m: Map2D5, c_s, c_g, alpha: float) -> bool:
     return False
 
 
-def _sweep(m: Map2D5, field, seed: int = 7) -> tuple[int, int, int]:
+def _sweep(m: Map2D5, field, steep: np.ndarray,
+           seed: int = 7) -> tuple[int, int, int]:
     """Compare the field check against `_collides` over random (hop, alpha).
 
     Returns `(n, strict, LOOSE)` — hops compared, hops the field rejects that
@@ -173,7 +227,7 @@ def _sweep(m: Map2D5, field, seed: int = 7) -> tuple[int, int, int]:
         n += 1
 
         field_ok = alpha >= alpha_c
-        truth_ok = not _collides(m, c_s, c_g, alpha)
+        truth_ok = not _collides(m, steep, c_s, c_g, alpha)
 
         if truth_ok and not field_ok:
             strict += 1
@@ -189,7 +243,9 @@ def check_never_accepts_a_collision() -> bool:
     print(f"  {'map':<22}{'compared':>9}{'stricter':>10}{'LOOSER':>9}")
     all_ok = True
     for name, m in _deck():
-        n, strict, loose = _sweep(m, m.inflated_field(REACH))
+        n, strict, loose = _sweep(
+            m, m.inflated_field(REACH, GRADE), _steep_truth(m),
+        )
         ok = loose == 0
         all_ok &= ok
         print(f"  [{'PASS' if ok else 'FAIL'}] {name:<16}{n:>9}{strict:>10}"
@@ -218,8 +274,9 @@ def check_lookup_pad_guarantee() -> bool:
     total_unpadded = 0
 
     for name, m in _deck():
-        padded = m.inflated_field(REACH)
-        unpadded = m.inflated_field(REACH, lookup_pad=0.0)
+        padded = m.inflated_field(REACH, GRADE)
+        unpadded = m.inflated_field(REACH, GRADE, lookup_pad=0.0)
+        steep = _steep_truth(m)
         rng = np.random.default_rng(11)
         bad_padded = bad_unpadded = 0
 
@@ -229,7 +286,7 @@ def check_lookup_pad_guarantee() -> bool:
             py = float(rng.uniform(0.0, m.size_y))
             qc, qr = int(px / RES), int(py / RES)
 
-            required = _disc_max(m, px, py)
+            required = _disc_max(m, steep, px, py)
             if required == -math.inf:
                 continue
             if padded[qr, qc] < required - 1e-9:
@@ -264,11 +321,11 @@ def check_field_is_untapered() -> bool:
     print("\nno taper — the field adds nothing to the terrain it reports\n")
     all_ok = True
     for name, m in _deck():
-        field = m.inflated_field(REACH)
+        field = m.inflated_field(REACH, GRADE)
         finite = np.isfinite(field)
         ok = bool(np.all(field[finite] <= m.grid.max() + 1e-12))
         flat = Map2D5(2.0, 2.0, RES)
-        flat_field = flat.inflated_field(REACH)
+        flat_field = flat.inflated_field(REACH, GRADE)
         ok &= bool(np.allclose(flat_field, 0.0))
         all_ok &= ok
         print(f"  [{'PASS' if ok else 'FAIL'}] {name:<22}"
@@ -281,7 +338,7 @@ def check_standable_mask_wraps_inflated_field() -> bool:
     """`standable_mask` must be exactly `inflated_field` read at standing height.
 
     There is no independent geometry left in `standable_mask` to regress against
-    — it IS `inflated_field(radius + clearance) <= grid + leg_length`, ANDed
+    — it IS `inflated_field(radius + clearance, grade) <= grid + leg_length`, ANDed
     with not-OBSTACLE — so this pins the wrapper against a hand-built version of
     that same expression. A future edit that quietly reintroduces bespoke
     geometry there will show up here as the two diverging.
@@ -289,8 +346,8 @@ def check_standable_mask_wraps_inflated_field() -> bool:
     print("\nstandable_mask == inflated_field at standing height\n")
     all_ok = True
     for name, m in _deck():
-        truth = m.standable_mask(ROBOT_R, GATE, LEG)
-        derived = (m.inflated_field(REACH) <= m.grid + LEG) \
+        truth = m.standable_mask(ROBOT_R, GATE, LEG, GRADE)
+        derived = (m.inflated_field(REACH, GRADE) <= m.grid + LEG) \
             & (m.grid != Map2D5.OBSTACLE)
         n_diff = int((truth != derived).sum())
         ok = n_diff == 0
@@ -300,11 +357,49 @@ def check_standable_mask_wraps_inflated_field() -> bool:
     return all_ok
 
 
+def check_steep_mask_matches_brute_force() -> bool:
+    """`Map2D5.steep_mask` must equal the cell-by-cell definition, exactly.
+
+    Half the field's definition now lives in this mask, and it is computed by
+    four whole-array slice comparisons rather than by visiting neighbours. That
+    is fast but easy to get subtly wrong — an off-by-one in a slice pair, a
+    diagonal compared over `resolution` instead of `resolution * sqrt(2)`, a
+    border cell wrapping. A mismatch would otherwise only surface downstream,
+    and only where it happened to change an accept/reject verdict.
+
+    Also pinned here: the threshold really is an ANGLE. A uniform grade just
+    under it must produce NO edges at all and one just over it must make EVERY
+    cell an edge — that step is what sets the max standable grade.
+    """
+    print("\nsteep_mask == the cell-by-cell definition\n")
+    all_ok = True
+    for name, m in _deck():
+        truth = _steep_truth(m)
+        n_diff = int((m.steep_mask(GRADE) != truth).sum())
+        ok = n_diff == 0
+        all_ok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name:<22}"
+              f"{int(truth.sum()):>5} edge cells, {n_diff} disagreements")
+
+    for grade, expect_any in ((GRADE * 0.99, False), (GRADE * 1.01, True)):
+        ramp = Map2D5(2.0, 2.0, RES)
+        for col in range(ramp.cols):
+            ramp.grid[:, col] = grade * ((col + 0.5) * RES)
+        got_any = bool(ramp.steep_mask(GRADE).any())
+        ok = got_any == expect_any
+        all_ok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] uniform grade {grade:.3f} "
+              f"({'above' if expect_any else 'below'} the threshold) has "
+              f"{'some' if got_any else 'no'} edges")
+    return all_ok
+
+
 def main() -> int:
     all_ok = check_never_accepts_a_collision()
     all_ok &= check_lookup_pad_guarantee()
     all_ok &= check_field_is_untapered()
     all_ok &= check_standable_mask_wraps_inflated_field()
+    all_ok &= check_steep_mask_matches_brute_force()
 
     print("\n" + ("ALL PASSED" if all_ok else "SOME FAILED"))
     return 0 if all_ok else 1

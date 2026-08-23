@@ -242,9 +242,12 @@ gets worse from adding either.
    attained only in the limit of a straight-down hop; at `X = 1.0` the cap is already
    2.63 m under the *derived* `V_MAX`, because horizontal speed competes for the same
    budget. Constraint (3) inherited the leftover role of a never-binding backstop.
-3. **Friction is now (just barely) the binding standability limit.** A cross-slope steeper
-   than `μ` = 1.2 gives a degenerate cone, against `standable_mask`'s geometric ceiling of
-   ~1.21. No separate stance-friction check was added: BEAM already rejects every hop into
+3. **Friction is the binding standability limit.** A cross-slope steeper
+   than `μ` = 1.2 gives a degenerate cone, against `standable_mask`'s ceiling of 1.73
+   (`config.STEEP_INFLATE_GRADE` — only terrain steeper than that inflates at all, so it
+   is also the steepest standable grade). It used to be "just barely": the ceiling was the
+   geometric bound ~1.21–1.33 while the inflated field dilated every cell. `config.py`
+   now asserts the ordering. No separate stance-friction check was added: BEAM already rejects every hop into
    or out of such a cell, from both the degeneracy branch (cross-slope headings) and the
    `π/2` clip (fall-line headings, where `A = 1` so the wedge never degenerates).
 

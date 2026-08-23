@@ -24,6 +24,7 @@ LEG = config.LEG_LENGTH
 GATE = config.MIN_CLEARANCE
 MU = config.MU
 MAX_STEP = config.ARC_SAMPLE_MAX_STEP
+GRADE = config.STEEP_INFLATE_GRADE
 
 # Spans here are 2.1/1.8/1.3/0.8 m, well inside the flat-hop reach
 # V_MAX^2 / g = 5.50 m, so the reach never fires and every verdict below is
@@ -87,7 +88,8 @@ def _mc(m: Map2D5, c_s, c_g, iv) -> float:
     least-injection angle rule.
     """
     _alpha, mc = angle_and_clearance(
-        c_s, c_g, m, m.inflated_field(ROBOT_R + GATE), GATE, LEG, MAX_STEP,
+        c_s, c_g, m, m.inflated_field(ROBOT_R + GATE, GRADE), GATE, LEG,
+        MAX_STEP,
         iv[0], iv[1],
     )
     return mc
@@ -271,7 +273,7 @@ def main() -> int:
     # A flat cell must be standable; a cell alongside a tall step must not be.
     mm = Map2D5(2.0, 2.0, 0.1)
     mm.paint_region(0.8, x_min=1.0)
-    sm = mm.standable_mask(ROBOT_R, GATE, LEG)
+    sm = mm.standable_mask(ROBOT_R, GATE, LEG, GRADE)
     row = mm.rows // 2
     ok = bool(sm[row, 2]) and not bool(sm[row, 9])
     print(f"  [{'PASS' if ok else 'FAIL'}] flat ground standable, "
@@ -284,12 +286,17 @@ def main() -> int:
     # if the pillar sweep in case (1) still happens to pass.
     print("\n(6) Single-cylinder stance + flight geometry:")
 
-    # (6a) Max standable constant grade. Unlike the old two-component
-    # (sphere + exempt leg-cylinder) model, a flat cylinder has no lateral
-    # taper, so the ceiling is the plain linear bound
-    # `g_max = LEG / (ROBOT_R + GATE)` — found here by bisection against the
-    # actual `standable_mask`, not hand-derived, so a formula/implementation
-    # mismatch shows up as a FAIL rather than silently passing.
+    # (6a) Max standable constant grade. Since only terrain EDGES feed the
+    # inflated field, the ceiling is the edge threshold itself,
+    # `STEEP_INFLATE_GRADE` — a uniform ramp below it contains no edges at all,
+    # so the field equals the terrain and every cell stands; one hair above it
+    # every cell is a source at once and the field jumps by `0.30 * grade`,
+    # well past LEG. So the transition is a STEP, not the smooth geometric
+    # limit `LEG / (ROBOT_R + GATE)` = 1.33 that bounded the old
+    # inflate-everything field — that bound no longer binds, the threshold
+    # reaches it first. Found by bisection against the actual
+    # `standable_mask`, not hand-derived, so a formula/implementation mismatch
+    # shows up as a FAIL rather than silently passing.
     def _max_grade(grid_half: int = 40) -> float:
         lo, hi = 0.0, 3.0
         for _ in range(40):
@@ -298,7 +305,7 @@ def main() -> int:
             mm = Map2D5(n * 0.1, n * 0.1, 0.1)
             for col in range(mm.cols):
                 mm.grid[:, col] = mid * ((col + 0.5) * mm.resolution)
-            sm = mm.standable_mask(ROBOT_R, GATE, LEG)
+            sm = mm.standable_mask(ROBOT_R, GATE, LEG, GRADE)
             if bool(sm[grid_half, grid_half]):
                 lo = mid
             else:
@@ -306,17 +313,20 @@ def main() -> int:
         return lo
 
     g_max = _max_grade()
-    g_max_formula = LEG / (ROBOT_R + GATE)
-    ok = abs(g_max - g_max_formula) < 0.02
+    # A step, not a smooth limit, so this is pinned much tighter than the 0.02
+    # the old geometric bound needed — bisection should land on it exactly.
+    ok = abs(g_max - GRADE) < 1e-3
     print(f"  [{'PASS' if ok else 'FAIL'}] max standable grade ≈ {g_max:.3f} "
-          f"(closed form LEG/(ROBOT_R+GATE) = {g_max_formula:.3f})")
+          f"(the edge threshold STEEP_INFLATE_GRADE = {GRADE:.3f}; the old "
+          f"geometric bound LEG/(ROBOT_R+GATE) = {LEG / (ROBOT_R + GATE):.3f} "
+          f"no longer binds)")
     all_ok &= ok
     slope_ok = True
     for grade, expect in [(g_max - 0.05, True), (g_max + 0.05, False)]:
         mm = Map2D5(3.0, 2.0, 0.1)
         for col in range(mm.cols):
             mm.grid[:, col] = grade * ((col + 0.5) * mm.resolution)
-        sm = mm.standable_mask(ROBOT_R, GATE, LEG)
+        sm = mm.standable_mask(ROBOT_R, GATE, LEG, GRADE)
         # Interior cell, avoiding boundary effects.
         stands_somewhere = bool(sm[mm.rows // 2, mm.cols // 2])
         row_ok = (stands_somewhere == expect)

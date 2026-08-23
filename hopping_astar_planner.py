@@ -47,9 +47,16 @@ Collision geometry is a single uniform vertical cylinder of `robot_radius` with
 a FLAT BOTTOM at the foot and SQUARE EDGES, carrying a uniform
 `min_clearance_gate` safety margin. Because the margin around a square-edged
 body is square-edged too, the whole model is one precomputed array plus one
-constant: `Map2D5.inflated_field(robot_radius + min_clearance_gate)` dilates the
-terrain sideways by the body's lateral reach, and the margin is added at the
-comparison.
+constant: `Map2D5.inflated_field(robot_radius + min_clearance_gate, steep_grade)`
+dilates the terrain sideways by the body's lateral reach, and the margin is
+added at the comparison.
+
+Only terrain EDGES feed that field — cells with an 8-neighbour steeper than
+`steep_grade` (see `Map2D5.steep_mask`). Dilation models keeping the body off
+the RIM of a wall or step, so terrain with no rim contributes nothing and a
+sub-threshold ramp inflates to itself. The cost is that such terrain is
+laterally invisible in flight, since the arc check samples a bare centreline;
+`config.STEEP_INFLATE_ANGLE_DEG` documents that trade.
 
   * **Stance** (`Map2D5.standable_mask`): is the foot's own cell clear of
     everything within `robot_radius + min_clearance_gate`? The same field, read
@@ -769,6 +776,15 @@ def clearance_floor_alpha(
 
         foot_h(u) >= inflated(u) + gate
 
+    **Only terrain EDGES were dilated** (see `Map2D5.steep_mask`), so `inflated`
+    equals the bare terrain wherever the ground has no rim steeper than the
+    threshold. Two consequences: a hop along a ramp is no longer given a takeoff
+    floor by ground it never approaches — which is what the field used to do,
+    reading `z + 0.32*g` at every cell of a grade-`g` ramp — and, on the other
+    side of the trade, sub-threshold terrain is laterally invisible here, since
+    this samples a bare centreline and the field is the only thing that knew the
+    body had width. `config.STEEP_INFLATE_ANGLE_DEG` carries the full note.
+
     That is the sharp-edged model in full: the body is a cylinder with a flat
     bottom and square edges, its safety margin is the same shape grown outward,
     and the margin is therefore a plain constant — `gate` of headroom under the
@@ -807,11 +823,14 @@ def clearance_floor_alpha(
     `u = 0` and `u = X` are excluded outright (zero denominator). They are
     stance configurations, and `Map2D5.standable_mask` gates them. **Do not try
     to check them here with the field instead.** An inflated field is a DISC, so
-    at `u = 0` it also sees terrain *behind* the takeoff; on a graded map that is
-    fatal rather than merely conservative. On `maps/slope_crest.py`'s 0.35 ramp
-    the ground 0.24 m uphill sits 0.084 m above the foot, so an endpoint test
-    rejected every hop off every ramp cell and `plan()` returned `None` straight
-    from the start state.
+    at `u = 0` it also sees terrain *behind* the takeoff. Steep-only inflation
+    defuses the specific historical case (on `maps/slope_crest.py`'s 0.35 ramp
+    the ground 0.24 m uphill used to sit 0.084 m above the foot, so an endpoint
+    test rejected every hop off every ramp cell and `plan()` returned `None`
+    straight from the start state — that ramp is no longer a source, so the
+    field there is now flat). It does NOT make the endpoint test safe: beside
+    any genuine edge the disc still reads terrain behind the foot, which is
+    exactly where a takeoff cell legitimately sits.
     """
     sampled = _arc_samples(c_s, c_g, height_map, inflated, max_step)
     if sampled is None:
@@ -950,6 +969,7 @@ class HoppingAStarPlanner:
         robot_radius: float = 0.15,
         leg_length: float = 0.4,
         min_clearance_gate: float = 0.15,
+        steep_grade: float = 1.7320508075688767,  # tan(60 deg); see config
         arc_max_step: float = 0.05,
         # Lattice spacing of the scanline circle-fill that generates candidate
         # landing cells, in world metres, AT the reference radius
@@ -1018,6 +1038,7 @@ class HoppingAStarPlanner:
         self.robot_radius = robot_radius
         self.leg_length = leg_length
         self.min_clearance_gate = min_clearance_gate
+        self.steep_grade = steep_grade
         self.arc_max_step = arc_max_step
         self.hop_scan_step = hop_scan_step
         self.hop_scan_step_ref_radius = hop_scan_step_ref_radius
@@ -1042,7 +1063,7 @@ class HoppingAStarPlanner:
         # against this catches body-vs-terrain overlap for ~1us instead of
         # discovering the same collision by marching a whole arc.
         self._standable = map_env.standable_mask(
-            robot_radius, min_clearance_gate, leg_length,
+            robot_radius, min_clearance_gate, leg_length, steep_grade,
         )
 
         # Per-cell outward surface normals, for the friction cone at both
@@ -1064,7 +1085,7 @@ class HoppingAStarPlanner:
         # keyed on a cell, so all 2500 answers are computed here, once, in well
         # under a millisecond.
         self._inflated = map_env.inflated_field(
-            robot_radius + min_clearance_gate,
+            robot_radius + min_clearance_gate, steep_grade,
         )
 
         # Convert start/goal to grid coordinates

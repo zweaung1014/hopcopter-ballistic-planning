@@ -101,7 +101,7 @@ def main() -> int:
     m = build_map()
     # The terrain the clearance gate actually reads: dilated sideways by the
     # body's full lateral reach. Memoised, so this is the planner's own array.
-    inflated = m.inflated_field(ROBOT_R + GATE)
+    inflated = m.inflated_field(ROBOT_R + GATE, config.STEEP_INFLATE_GRADE)
 
     n = len(TAKEOFF_XS)
     fig = plt.figure(figsize=(4.2 * n, 8.0))

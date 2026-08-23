@@ -181,6 +181,7 @@ def draw_arc_strip(
                     config.ROBOT_RADIUS, config.LEG_LENGTH,
                     config.ARC_SAMPLE_MAX_STEP,
                     min_clearance_gate=config.MIN_CLEARANCE,
+                    steep_grade=config.STEEP_INFLATE_GRADE,
                 )
                 ax.set_ylim(-0.05, ymax)
             if i == 0:
