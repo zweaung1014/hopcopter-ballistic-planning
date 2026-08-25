@@ -1063,7 +1063,7 @@ class HoppingAStarPlanner:
         # against this catches body-vs-terrain overlap for ~1us instead of
         # discovering the same collision by marching a whole arc.
         self._standable = map_env.standable_mask(
-            robot_radius, min_clearance_gate, leg_length, steep_grade,
+            robot_radius, min_clearance_gate, steep_grade,
         )
 
         # Per-cell outward surface normals, for the friction cone at both

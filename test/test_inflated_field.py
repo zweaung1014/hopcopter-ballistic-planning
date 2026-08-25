@@ -346,7 +346,7 @@ def check_standable_mask_wraps_inflated_field() -> bool:
     print("\nstandable_mask == inflated_field at standing height\n")
     all_ok = True
     for name, m in _deck():
-        truth = m.standable_mask(ROBOT_R, GATE, LEG, GRADE)
+        truth = m.standable_mask(ROBOT_R, GATE, GRADE)
         derived = (m.inflated_field(REACH, GRADE) <= m.grid + LEG) \
             & (m.grid != Map2D5.OBSTACLE)
         n_diff = int((truth != derived).sum())

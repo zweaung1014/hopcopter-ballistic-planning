@@ -273,7 +273,7 @@ def main() -> int:
     # A flat cell must be standable; a cell alongside a tall step must not be.
     mm = Map2D5(2.0, 2.0, 0.1)
     mm.paint_region(0.8, x_min=1.0)
-    sm = mm.standable_mask(ROBOT_R, GATE, LEG, GRADE)
+    sm = mm.standable_mask(ROBOT_R, GATE, GRADE)
     row = mm.rows // 2
     ok = bool(sm[row, 2]) and not bool(sm[row, 9])
     print(f"  [{'PASS' if ok else 'FAIL'}] flat ground standable, "
@@ -305,7 +305,7 @@ def main() -> int:
             mm = Map2D5(n * 0.1, n * 0.1, 0.1)
             for col in range(mm.cols):
                 mm.grid[:, col] = mid * ((col + 0.5) * mm.resolution)
-            sm = mm.standable_mask(ROBOT_R, GATE, LEG, GRADE)
+            sm = mm.standable_mask(ROBOT_R, GATE, GRADE)
             if bool(sm[grid_half, grid_half]):
                 lo = mid
             else:
@@ -326,7 +326,7 @@ def main() -> int:
         mm = Map2D5(3.0, 2.0, 0.1)
         for col in range(mm.cols):
             mm.grid[:, col] = grade * ((col + 0.5) * mm.resolution)
-        sm = mm.standable_mask(ROBOT_R, GATE, LEG, GRADE)
+        sm = mm.standable_mask(ROBOT_R, GATE, GRADE)
         # Interior cell, avoiding boundary effects.
         stands_somewhere = bool(sm[mm.rows // 2, mm.cols // 2])
         row_ok = (stands_somewhere == expect)

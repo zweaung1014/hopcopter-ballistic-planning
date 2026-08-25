@@ -31,9 +31,9 @@ class Map2D5:
         # Memo for the inflated height fields, keyed on their arguments (see
         # `inflated_field`). The planner builds one and reads it every edge.
         self._inflated_cache: dict[tuple[float, float, float], np.ndarray] = {}
-        # Memo for the steep-edge masks, keyed on the grade threshold (see
-        # `steep_mask`). `inflated_field` asks for one every time it builds.
-        self._steep_cache: dict[float, np.ndarray] = {}
+        # Memo for the steep-edge masks, keyed on (grade threshold, finite_only)
+        # (see `steep_mask`). `inflated_field` asks for one every time it builds.
+        self._steep_cache: dict[tuple[float, bool], np.ndarray] = {}
 
     def _invalidate_caches(self) -> None:
         """Drop every grid-derived memo. Call after any write to `self.grid`."""
@@ -191,36 +191,75 @@ class Map2D5:
         self,
         radius: float,
         clearance: float,
-        leg_length: float,
         steep_grade: float,
     ) -> np.ndarray:
         """Boolean grid of cells where the robot can stand without clipping terrain.
 
-        The robot's single collision cylinder (radius `radius`, foot to top of
-        body) is standable at a cell iff its bottom (the foot, at the cell's own
-        terrain height) clears every nearby terrain column within `radius +
-        clearance` — exactly the same test `clearance_floor_alpha` runs during
-        flight, evaluated at standing height. So this is just
-        `inflated_field` read at `grid + leg_length`, not a bespoke geometry
-        calculation: `inflated_field` memoises on
-        `(radius, lookup_pad, steep_grade)`, so calling it with the same
-        `radius + clearance` and `steep_grade` the planner already built for
-        flight clearance hits that cache rather than recomputing anything.
+        Standable iff the cell is NOT within `radius + clearance` of an
+        OBSTACLE column AND NOT within `radius + clearance` of a finite-height
+        steep edge (a real riser or wall, as opposed to an infinitely tall
+        OBSTACLE column) — two independent boolean dilations, via
+        `_dilate_bool`, of two independent source sets. There is no height
+        comparison here at all, unlike `inflated_field`/`clearance_floor_alpha`:
+        an OBSTACLE's height is irrelevant once it's known to be an OBSTACLE
+        (its column is infinitely tall by construction), and a finite steep
+        edge is treated as unconditionally blocking within reach rather than
+        weighed against how tall the robot's own body is — the "smear a few
+        cells thick" model the terrain categories call for, not a clearance
+        calculation.
 
-        Because only terrain EDGES feed that field (see `steep_mask`), the max
-        standable constant grade is exactly `steep_grade` — a ramp below the
-        threshold has no edges, so the field equals the terrain and every cell
-        is standable however steep. The old geometric ceiling,
-        `leg_length / (radius + clearance)`, no longer binds; the threshold
-        reaches it first.
+        Because only terrain EDGES feed `steep_mask` (see its docstring), the
+        max standable constant grade is exactly `steep_grade` — a ramp below
+        the threshold has no edges, so `finite_only` dilation has no source
+        cells there and every cell on it is standable however steep. A ramp
+        AT or above the threshold has every adjacent pair exceeding it, so
+        every cell on it becomes a dilation source and the whole ramp goes
+        non-standable at once — a step discontinuity, not a smooth limit.
+
+        Dilating from both sides of a standable strip narrower than
+        `2 * (radius + clearance)` closes it off entirely — intended: a gap
+        too narrow for the body plus its margin on both sides isn't standable
+        anywhere in it, and this falls out of plain dilation with no extra
+        "is the interior big enough" logic needed.
 
         Computed once per planner. Screening landing cells against this is far
         cheaper than discovering the same collision by marching an arc.
         """
-        field = self.inflated_field(radius + clearance, steep_grade)
-        return (field <= self.grid + leg_length) & (self.grid != self.OBSTACLE)
+        reach = radius + clearance
+        obstacle_blocked = self._dilate_bool(self.grid == self.OBSTACLE, reach)
+        edge_blocked = self._dilate_bool(
+            self.steep_mask(steep_grade, finite_only=True), reach
+        )
+        return ~obstacle_blocked & ~edge_blocked
 
-    def steep_mask(self, min_grade: float) -> np.ndarray:
+    def _dilate_bool(self, source: np.ndarray, reach: float) -> np.ndarray:
+        """Boolean sideways dilation: True within `reach` of a True source cell.
+
+        Same offset-enumeration idiom as `inflated_field`'s loop (shift a
+        padded array over every integer cell offset within `reach`, skip
+        anything the circle doesn't actually reach), specialised to booleans:
+        OR instead of max, False-padding instead of -inf-padding. No
+        `lookup_pad` here — unlike `inflated_field`, this isn't read by a
+        nearest-cell lookup at an arbitrary continuous query point, it's a
+        plain "is this grid cell within `reach` of a source cell" test used to
+        classify other grid cells, so there's no query-point-vs-cell-center
+        slop to guard against.
+        """
+        r_cells = int(math.ceil(reach / self.resolution))
+        pad = max(r_cells, 1)
+        padded = np.zeros((self.rows + 2 * pad, self.cols + 2 * pad), dtype=bool)
+        padded[pad:pad + self.rows, pad:pad + self.cols] = source
+
+        out = np.zeros(self.grid.shape, dtype=bool)
+        for dr in range(-r_cells, r_cells + 1):
+            for dc in range(-r_cells, r_cells + 1):
+                if math.hypot(dr, dc) * self.resolution >= reach:
+                    continue
+                out |= padded[pad + dr:pad + dr + self.rows,
+                              pad + dc:pad + dc + self.cols]
+        return out
+
+    def steep_mask(self, min_grade: float, finite_only: bool = False) -> np.ndarray:
         """Boolean grid: which cells are part of a terrain EDGE.
 
         A cell is steep iff some 8-neighbour's elevation differs from its own by
@@ -245,16 +284,25 @@ class Map2D5:
         elevation, so it cannot be differenced, and the neighbour of an
         infinitely tall column is an edge cell by inspection.
 
-        Memoised on `min_grade`, dropped by `_invalidate_caches`, like
-        `surface_normals` and `inflated_field`.
+        **`finite_only=True`** drops all of that: OBSTACLE cells and any edge
+        caused merely by obstacle adjacency are excluded, leaving only genuine
+        height discontinuities between two real (non-obstacle) elevations —
+        e.g. a stair riser or a finite wall, as opposed to an infinitely tall
+        column. `Map2D5.standable_mask` uses this to keep "near an obstacle"
+        and "near a finite steep edge" as two independent source sets, each
+        dilated on its own.
+
+        Memoised on `(min_grade, finite_only)`, dropped by `_invalidate_caches`,
+        like `surface_normals` and `inflated_field`.
         """
-        cached = self._steep_cache.get(float(min_grade))
+        key = (float(min_grade), bool(finite_only))
+        cached = self._steep_cache.get(key)
         if cached is not None:
             return cached
 
         z = self.grid
         obs = z == self.OBSTACLE
-        mask = obs.copy()
+        mask = np.zeros_like(obs) if finite_only else obs.copy()
 
         res = self.resolution
         diag = res * math.sqrt(2.0)
@@ -270,11 +318,19 @@ class Map2D5:
             ((lo, hi), (hi, lo), diag),       # north-west
         ):
             steep = np.abs(z[b_sl] - z[a_sl]) > min_grade * dist
-            steep |= obs[a_sl] | obs[b_sl]
+            if finite_only:
+                # A pair touching OBSTACLE's `-1.0` sentinel differenced no real
+                # elevation, so it cannot count as a genuine height edge.
+                steep &= ~(obs[a_sl] | obs[b_sl])
+            else:
+                steep |= obs[a_sl] | obs[b_sl]
             mask[a_sl] |= steep
             mask[b_sl] |= steep
 
-        self._steep_cache[float(min_grade)] = mask
+        if finite_only:
+            mask &= ~obs
+
+        self._steep_cache[key] = mask
         return mask
 
     def inflated_field(
