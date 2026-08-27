@@ -390,7 +390,7 @@ class Map2D5:
         version inflated by a sphere of `body + margin`, which additionally
         charged the body radius as vertical clearance underneath the foot,
         where a cylinder has no extent at all.
-
+`
         Because this is a `max` and never an average, it can never under-report,
         which is why one-cell-thick obstacles are safe here (unlike bilinear
         sampling, which halves them).
