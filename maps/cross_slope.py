@@ -60,6 +60,9 @@ The cone caps hop *length* by heading; it does not gate reachability.
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.5)
+GOAL  = (4.5, 2.5)
+
 # --- profile constants (exported so demos can draw reference lines) ---------
 BENCH_X1 = 1.0    # m; toe of the hillside / end of the low bench
 SLOPE_X1 = 3.0    # m; brow of the hillside / start of the high bench

@@ -38,6 +38,9 @@ takeoff distance that puts the obstruction under the useful part of the parabola
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.5)
+GOAL  = (4.5, 2.5)
+
 # --- elevation constants ---------------------------------------------------
 TREAD1_Z = 0.40
 TREAD2_Z = 0.80

@@ -16,6 +16,9 @@ import math
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.5)
+GOAL  = (4.5, 2.5)
+
 
 # --- profile constants (exported so demos can draw reference lines) --------
 RAMP_ANGLE_DEG = 30.0

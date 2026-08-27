@@ -69,6 +69,9 @@ is trivially satisfied everywhere. Convexity is what makes the check bite.
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.5)
+GOAL  = (4.5, 2.5)
+
 # --- profile constants (exported so demos can draw reference lines) ---------
 RAMP_X0  = 0.0    # m; ramp toe (starts at the map's left edge)
 RAMP_X1  = 3.0    # m; ramp shoulder / start of crest

@@ -22,18 +22,20 @@ def load_map(name: str):
         ]
         print(f"Unknown map: '{name}'. Available maps: {', '.join(sorted(available))}")
         sys.exit(1)
-    return module.build()
+    return module, module.build()
 
 
 def main():
     map_name = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MAP
-    env_map = load_map(map_name)
+    map_module, env_map = load_map(map_name)
+    start = map_module.START
+    goal = map_module.GOAL
 
     # Plan path
     planner = HoppingAStarPlanner(
         map_env=env_map,
-        start=config.START,
-        goal=config.GOAL,
+        start=start,
+        goal=goal,
         max_jump_height=config.MAX_JUMP_HEIGHT,
         w_energy=config.W_ENERGY,
         g=config.G_ACCEL,
@@ -85,9 +87,9 @@ def main():
         )] + [h["hop_radius"] for h in planner.path_hops]
         vis.draw_hop_circles(path, hop_radii)
         vis.draw_path(path)
-    vis.draw_start_goal(config.START, config.GOAL)
-    vis.draw_robot_pose(config.START, config.ROBOT_RADIUS, config.MIN_CLEARANCE)
-    vis.draw_robot_pose(config.GOAL, config.ROBOT_RADIUS, config.MIN_CLEARANCE)
+    vis.draw_start_goal(start, goal)
+    vis.draw_robot_pose(start, config.ROBOT_RADIUS, config.MIN_CLEARANCE)
+    vis.draw_robot_pose(goal, config.ROBOT_RADIUS, config.MIN_CLEARANCE)
     vis.show()
 
 

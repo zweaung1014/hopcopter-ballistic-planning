@@ -10,6 +10,9 @@ option alongside routing around it in y.
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.5)
+GOAL  = (4.5, 2.5)
+
 
 PLATFORM_HEIGHT = 0.4    # m
 PLATFORM_XMIN   = 2.0    # m

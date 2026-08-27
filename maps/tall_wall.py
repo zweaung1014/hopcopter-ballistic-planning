@@ -7,6 +7,9 @@ so this is the "go around" scenario rather than a "hop over" one.
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.4)
+GOAL  = (4.5, 2.4)
+
 WALL_HEIGHT = 1.0    # m
 WALL_XMIN   = 2.0    # m
 WALL_XMAX   = 3.0    # m

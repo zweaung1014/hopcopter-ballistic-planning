@@ -39,6 +39,9 @@ y = 2.4, the nearest wall edges (y = 0.8 and y = 4.2) are 1.6 m and 1.8 m away.
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.4)
+GOAL  = (4.5, 2.4)
+
 WALL_HEIGHT = 0.70   # m (lowered by 0.3 m so the robot can hop over it)
 WALL_XMIN   = 2.3    # m
 WALL_XMAX   = 2.7    # m

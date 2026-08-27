@@ -30,6 +30,9 @@ initialises its grid to zeros.
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.5)
+GOAL  = (4.5, 2.5)
+
 
 def build() -> Map2D5:
     return Map2D5(

@@ -177,12 +177,11 @@ class Visualizer:
 
         # Compute elevation range (excluding obstacles) for colormap normalization
         non_obstacle = self.map_env.grid[self.map_env.grid != Map2D5.OBSTACLE]
-        z_min = float(non_obstacle.min()) if non_obstacle.size else 0.0
         z_max = float(non_obstacle.max()) if non_obstacle.size else 1.0
-        if z_min == z_max:
-            z_max = z_min + 1.0  # avoid degenerate normalization
-        norm = mcolors.Normalize(vmin=z_min, vmax=z_max)
-        cmap = cm.get_cmap("YlOrBr")
+        if z_max == 0.0:
+            z_max = 1.0  # avoid degenerate normalization
+        norm = mcolors.Normalize(vmin=0.0, vmax=z_max)
+        cmap = cm.get_cmap("Greys")
 
         # On a fine grid the per-cell chrome stops being legible and starts
         # costing real time (2500 rectangles + 2500 text objects), so drop it.

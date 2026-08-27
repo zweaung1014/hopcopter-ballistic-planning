@@ -12,6 +12,8 @@ infinite vs. finite 0.50 m.
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.5)
+GOAL  = (4.5, 2.5)
 
 WALL_XMIN = 2.0    # m
 WALL_XMAX = 2.3    # m — 0.3 m thick

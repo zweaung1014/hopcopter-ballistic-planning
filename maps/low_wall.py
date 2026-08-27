@@ -37,6 +37,9 @@ physical wall is the same at any resolution.
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.5)
+GOAL  = (4.5, 2.5)
+
 
 WALL_HEIGHT = 0.4    # m — terrain elevation of the ridge
 WALL_XMIN   = 1.7    # m

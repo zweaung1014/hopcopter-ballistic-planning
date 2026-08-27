@@ -44,6 +44,9 @@ The wall y-span prevents a single-hop bypass: at y = 2.4 the nearest wall edges
 import config
 from map2d5 import Map2D5
 
+START = (0.5, 2.4)
+GOAL  = (4.5, 2.4)
+
 
 WALL_HEIGHT = 0.50   # m — terrain elevation of the narrow ridge (calibrated; see above)
 WALL_XMIN   = 2.3    # m
