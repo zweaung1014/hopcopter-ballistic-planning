@@ -282,7 +282,7 @@ MU = 1.2  # Coulomb friction coefficient, uniform over the environment (as in
           # ROBOT_RADIUS above), so friction is the binding standability limit,
           # not geometry. The assert below pins that ordering.
 
-MIN_CLEARANCE = 0.15  # m; HARD gate — an arc whose body-to-terrain clearance ever
+MIN_CLEARANCE = 0.05  # m; HARD gate — an arc whose body-to-terrain clearance ever
                       # drops below this is rejected outright. Clearance does NOT
                       # enter the edge cost; it is purely a feasibility test.
 ARC_SAMPLE_MAX_STEP = 0.05  # m; upper bound on sampling step along the arc's XY
