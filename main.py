@@ -2,11 +2,12 @@
 
 import importlib
 import math
+import os
 import sys
 
 import config
 from hopping_astar_planner import HoppingAStarPlanner, max_hop_radius
-from visualizer import Visualizer
+from visualizer import Visualizer, draw_map_analysis
 
 DEFAULT_MAP = "stairs"
 
@@ -74,6 +75,12 @@ def main():
                   f"{h['apex_drop']:5.2f}  {h['e_inject']:6.2f} J")
 
     # Visualize
+    fig_analysis = draw_map_analysis(env_map, config.ROBOT_RADIUS, config.MIN_CLEARANCE, config.STEEP_INFLATE_GRADE)
+    _out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "demonstration_scenarios")
+    os.makedirs(_out_dir, exist_ok=True)
+    _save_path = os.path.join(_out_dir, f"{map_name}_map_analysis.png")
+    fig_analysis.savefig(_save_path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {_save_path}")
     vis = Visualizer(env_map)
     vis.draw_map()
     if path:

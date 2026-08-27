@@ -308,3 +308,66 @@ class Visualizer:
         self.ax.legend(handles, labels, loc="upper left")
         plt.tight_layout()
         plt.show()
+
+
+def draw_map_analysis(
+    env_map: Map2D5,
+    robot_radius: float,
+    clearance: float,
+    steep_grade: float,
+) -> "plt.Figure":
+    """Three-panel figure showing the map's planning-relevant layers.
+
+    Panels (left to right):
+      1. Raw elevation grid — obstacle cells shown as black.
+      2. Standable mask — green = standable, red = blocked.
+      3. Inflated field — the height bound the planner's clearance gate reads;
+         obstacle cells (inflated to +inf) shown as black.
+
+    Intended for use in ``main.py``: call before ``vis.show()`` so matplotlib's
+    single ``plt.show()`` flushes both this figure and the path-plan figure.
+    """
+    res = env_map.resolution
+    extent = [0, env_map.cols * res, 0, env_map.rows * res]
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.5))
+    fig.suptitle("Map analysis", fontsize=13)
+
+    # --- Panel 1: raw elevation ---
+    raw = np.where(env_map.grid == Map2D5.OBSTACLE, np.nan, env_map.grid)
+    cmap1 = cm.get_cmap("terrain").copy()
+    cmap1.set_bad("black")
+    im1 = ax1.imshow(raw, origin="lower", extent=extent, cmap=cmap1, aspect="equal")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04).set_label("elevation (m)")
+    ax1.set_title("Raw elevation")
+    ax1.set_xlabel("x (m)")
+    ax1.set_ylabel("y (m)")
+
+    # --- Panel 2: standable mask ---
+    mask = env_map.standable_mask(robot_radius, clearance, steep_grade)
+    cmap2 = mcolors.ListedColormap(["#c62828", "#66bb6a"])
+    im2 = ax2.imshow(
+        mask.astype(np.float32), origin="lower", extent=extent,
+        cmap=cmap2, vmin=0, vmax=1, aspect="equal",
+    )
+    cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04, ticks=[0.25, 0.75])
+    cbar2.ax.set_yticklabels(["blocked", "standable"])
+    ax2.set_title(f"Standable mask  (r\u202f=\u202f{robot_radius + clearance:.2f}\u202fm)")
+    ax2.set_xlabel("x (m)")
+    ax2.set_ylabel("y (m)")
+
+    # --- Panel 3: inflated field ---
+    field = env_map.inflated_field(robot_radius + clearance, steep_grade)
+    display_field = np.where(np.isinf(field), np.nan, field)
+    cmap3 = cm.get_cmap("plasma").copy()
+    cmap3.set_bad("black")
+    im3 = ax3.imshow(
+        display_field, origin="lower", extent=extent, cmap=cmap3, aspect="equal",
+    )
+    fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04).set_label("inflated height (m)")
+    ax3.set_title(f"Inflated field  (r\u202f=\u202f{robot_radius + clearance:.2f}\u202fm)")
+    ax3.set_xlabel("x (m)")
+    ax3.set_ylabel("y (m)")
+
+    plt.tight_layout()
+    return fig
