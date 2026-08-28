@@ -319,7 +319,7 @@ def draw_map_analysis(
     """Three-panel figure showing the map's planning-relevant layers.
 
     Panels (left to right):
-      1. Raw elevation grid — obstacle cells shown as black.
+      1. Steep mask — orange = terrain edge (source for inflated field), gray = flat.
       2. Standable mask — green = standable, red = blocked.
       3. Inflated field — the height bound the planner's clearance gate reads;
          obstacle cells (inflated to +inf) shown as black.
@@ -333,13 +333,16 @@ def draw_map_analysis(
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.5))
     fig.suptitle("Map analysis", fontsize=13)
 
-    # --- Panel 1: raw elevation ---
-    raw = np.where(env_map.grid == Map2D5.OBSTACLE, np.nan, env_map.grid)
-    cmap1 = cm.get_cmap("Greys").copy()
-    cmap1.set_bad("black")
-    im1 = ax1.imshow(raw, origin="lower", extent=extent, cmap=cmap1, aspect="equal")
-    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04).set_label("elevation (m)")
-    ax1.set_title("Raw elevation")
+    # --- Panel 1: steep mask (terrain edge sources for inflated_field) ---
+    steep = env_map.steep_mask(steep_grade)
+    cmap1 = mcolors.ListedColormap(["#eeeeee", "#e65100"])
+    im1 = ax1.imshow(
+        steep.astype(np.float32), origin="lower", extent=extent,
+        cmap=cmap1, vmin=0, vmax=1, aspect="equal",
+    )
+    cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, ticks=[0.25, 0.75])
+    cbar1.ax.set_yticklabels(["flat", "edge"])
+    ax1.set_title(f"Steep mask  (grade\u202f\u2265\u202f{steep_grade:.2f})")
     ax1.set_xlabel("x (m)")
     ax1.set_ylabel("y (m)")
 
