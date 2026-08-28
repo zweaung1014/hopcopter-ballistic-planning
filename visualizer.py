@@ -335,7 +335,7 @@ def draw_map_analysis(
 
     # --- Panel 1: raw elevation ---
     raw = np.where(env_map.grid == Map2D5.OBSTACLE, np.nan, env_map.grid)
-    cmap1 = cm.get_cmap("terrain").copy()
+    cmap1 = cm.get_cmap("Greys").copy()
     cmap1.set_bad("black")
     im1 = ax1.imshow(raw, origin="lower", extent=extent, cmap=cmap1, aspect="equal")
     fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04).set_label("elevation (m)")
@@ -359,7 +359,7 @@ def draw_map_analysis(
     # --- Panel 3: inflated field ---
     field = env_map.inflated_field(robot_radius + clearance, steep_grade)
     display_field = np.where(np.isinf(field), np.nan, field)
-    cmap3 = cm.get_cmap("plasma").copy()
+    cmap3 = cm.get_cmap("Blues").copy()
     cmap3.set_bad("black")
     im3 = ax3.imshow(
         display_field, origin="lower", extent=extent, cmap=cmap3, aspect="equal",
