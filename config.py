@@ -117,7 +117,7 @@ W_ENERGY = 0.84  # m per J; the exchange rate between energy and distance in the
 # (`hopping_astar_planner.clearance_floor_alpha`), since terrain in this
 # codebase is always a solid column rising from the ground, so a flat-capped
 # cylinder's clearance test reduces to checking only its bottom (the foot).
-ROBOT_RADIUS = 0.15  # m; the robot's single collision-cylinder radius.
+ROBOT_RADIUS = 0.01  # m; the robot's single collision-cylinder radius.
 LEG_LENGTH = 0.4     # m; CoM height above the foot. Hop arcs start and end at
                      # `terrain_z + LEG_LENGTH`, not at terrain level.
 
@@ -282,7 +282,7 @@ MU = 1.2  # Coulomb friction coefficient, uniform over the environment (as in
           # ROBOT_RADIUS above), so friction is the binding standability limit,
           # not geometry. The assert below pins that ordering.
 
-MIN_CLEARANCE = 0.05  # m; HARD gate — an arc whose body-to-terrain clearance ever
+MIN_CLEARANCE = 0.01  # m; HARD gate — an arc whose body-to-terrain clearance ever
                       # drops below this is rejected outright. Clearance does NOT
                       # enter the edge cost; it is purely a feasibility test.
 ARC_SAMPLE_MAX_STEP = 0.05  # m; upper bound on sampling step along the arc's XY

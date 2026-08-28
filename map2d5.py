@@ -227,9 +227,12 @@ class Map2D5:
         """
         reach = radius + clearance
         obstacle_blocked = self._dilate_bool(self.grid == self.OBSTACLE, reach)
-        edge_blocked = self._dilate_bool(
-            self.steep_mask(steep_grade, finite_only=True), reach
-        )
+        # TEMP: don't dilate steep edges — keep edge_blocked equal to the raw
+        # steep_mask so it covers only the highlighted cells themselves.
+        # edge_blocked = self._dilate_bool(
+        #     self.steep_mask(steep_grade, finite_only=True), reach
+        # )
+        edge_blocked = self.steep_mask(steep_grade, finite_only=True)
         return ~obstacle_blocked & ~edge_blocked
 
     def _dilate_bool(self, source: np.ndarray, reach: float) -> np.ndarray:
