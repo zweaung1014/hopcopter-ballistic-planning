@@ -16,7 +16,7 @@ south of the staircase provide a lateral bypass route.
 import config
 from map2d5 import Map2D5
 
-START = (0.5, 1.0)
+START = (0.5, 4.5)
 GOAL  = (4.5, 2.5)
 
 STEP_WIDTH = 0.3   # m, x extent of each tread
