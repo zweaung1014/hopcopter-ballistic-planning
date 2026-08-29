@@ -1,0 +1,1131 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed — only terrain EDGES feed the inflated field
+
+`Map2D5.inflated_field` dilated **every** cell sideways: per cell, the tallest
+terrain within reach, whatever that terrain looked like. Correct but blunt. The
+purpose of that dilation is EDGE AVOIDANCE — keep the body off the rim of a wall
+or a step — and applied to every cell it instead charged uphill height
+everywhere. On a grade-`g` ramp the field read `z + 0.32*g` at every cell, so
+`clearance_floor_alpha`'s `field > max(t_s, t_g)` test handed a takeoff-angle
+floor to hops that came nowhere near anything. (The same over-reach already
+forced the endpoint exemption documented in `clearance_floor_alpha`: an endpoint
+test on `maps/slope_crest.py` rejected every hop off every ramp cell.)
+
+Now a cell is a dilation source only if it is part of an edge:
+
+    steep(n) := n is OBSTACLE, or |z[n] - z[m]| > grade * dist(n, m)
+                for some 8-neighbour m (a pair touching an OBSTACLE counts)
+    field[c]  = max( z[c], max{ z[n] : steep(n), dist(n, c) < radius } )
+
+- **`Map2D5.steep_mask(min_grade)`** (new, memoised). Four slice-pair
+  comparisons cover all eight neighbours, each pair marking **both** ends — the
+  low side's own elevation is dominated by the local-ground floor anyway, and
+  marking it avoids a "which side of the riser owns the edge" special case with
+  no good answer at a corner. Orthogonal neighbours are compared over
+  `resolution`, diagonal ones over `resolution * sqrt(2)`, so the threshold is
+  an ANGLE and survives a change of grid resolution.
+- **`config.STEEP_INFLATE_ANGLE_DEG` = 60.0** and the derived
+  `STEEP_INFLATE_GRADE` = 1.732. At `CELL_RESOLUTION` = 0.1 m that is a 0.173 m
+  step to an orthogonal neighbour. New assert: `STEEP_INFLATE_GRADE > MU`,
+  because below that the field rather than friction becomes the binding
+  standability limit, silently.
+- **`inflated_field` and `standable_mask` take `steep_grade` as a REQUIRED
+  argument.** Not optional with a compatible default: this repo already learned
+  that lesson with `feasible_alpha_interval`'s `v_s_min`/`e_inject_max`/`mass`.
+  A default would let a forgotten call site score a different robot than the
+  planner with no symptom; a required argument makes it a `TypeError`. Threaded
+  through `HoppingAStarPlanner.__init__`, `visualizer.draw_arc_side_view`, and
+  every `test/` script that builds a planner or reads the field.
+- **`inflated_field` now maxes against local terrain** (`max(z[c], ...)`). With
+  every neighbour silenced the dilation alone yields `-inf`, and
+  `standable_mask` compares `field <= grid + leg_length` — a cell must always
+  bound the ground it stands on.
+
+**Max standable constant grade changes from 1.33 to exactly 1.732, as a STEP.**
+Below the threshold a uniform ramp contains no edges, so `field == grid` and
+every cell is standable however steep; one hair above, every cell is a source at
+once and the field jumps to `z + 0.30*g` >= 0.52 m, past `LEG_LENGTH`. The old
+geometric bound `LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE)` never binds any
+more — the threshold reaches it first. `MU` = 1.2 remains the binding
+standability limit, now with more headroom.
+
+**What this gives up, deliberately.** In flight the inflated field is the only
+representation of the body's width — `_arc_samples` reads one nearest-cell value
+along a bare centreline. Sub-threshold terrain may still rise at grade 1.73, so
+terrain `ROBOT_RADIUS + MIN_CLEARANCE` to the side can sit up to 0.43 m above
+what the field reports, against a `MIN_CLEARANCE` of 0.15 m. A hop down a 55
+degree gully, or along a staircase of sub-threshold risers, flies clean on paper
+and could clip laterally. Lower `STEEP_INFLATE_ANGLE_DEG` to buy that back at
+the price of re-inflating slopes.
+
+No shipped map loses a feature: every step and wall in the deck is >= 0.2 m over
+one cell (grade >= 2.0), and OBSTACLE cells are steep by definition. Measured by
+differencing the field against itself at `steep_grade = -1.0` (which makes every
+cell a source and so reproduces the old behaviour exactly), **8 of the 10 shipped
+maps come out bit-identical** — max difference 0.000 m — so their plans are
+unchanged by construction. Only the two graded maps move: `slope_crest` (0.35)
+drops by up to 0.106 m over 1650 cells, `cross_slope` (0.9) by up to 0.270 m over
+1150 cells.
+
+On those two the plans improve markedly, because the spurious ramp lift was
+being paid for with near-vertical stutter-hops:
+
+| map | | hops | injected | expansions | time |
+|---|---|---|---|---|---|
+| `slope_crest` | before | 4 | 15.66 J | 4,627 | 42 s |
+| | after | 3 | 9.43 J | 13,012 | 138 s |
+| `cross_slope` | before | 7 | 32.17 J | 14,805 | 104 s |
+| | after | 4 | 19.24 J | 24,569 | 170 s |
+
+`slope_crest` shed two 0.63 m hops at 83 deg; `cross_slope` shed four 0.40 m hops
+at 86-87 deg. **The cost is planning time**: de-inflating makes more edges pass
+the clearance gate, so the branching factor grows — roughly 3x the expansions on
+`slope_crest` and 1.7x on `cross_slope`. Since `_heuristic` estimates distance
+only, A* was already near-Dijkstra with `W_ENERGY` on, so it absorbs the extra
+edges badly. Unchanged on every other map.
+
+- **`test/test_inflated_field.py`** grows an independent brute-force
+  `_steep_truth`, cell by cell over all eight neighbours, so the vectorised
+  slice trick is checked rather than assumed; `_disc_max` filters to edge cells
+  with the query point's own cell exempt; and a fifth check,
+  `check_steep_mask_matches_brute_force`, pins the two against each other
+  directly (a slice off-by-one would otherwise surface only where it happened
+  to flip a verdict) along with the threshold's step behaviour — a uniform
+  grade 1% under it must produce NO edges, 1% over it must make every cell
+  one. Measured effect: `slope_crest`'s
+  tolerated spurious rejections fall 20 -> 15 and its unpadded-lookup violations
+  1002 -> 127, while every wall map is bit-identical. The pad stays
+  load-bearing (434 unbounded query points without it).
+- **`test/test_clearance_rejection.py`**'s max-standable-grade bisection is
+  retargeted from `LEG/(ROBOT_R+GATE)` to `STEEP_INFLATE_GRADE`, and pinned to
+  1e-3 rather than 0.02 since the transition is now a step. The pillar sweep,
+  one-cell obstacles, stance sanity, the 0.30 m bump and the 1.90 m wall are all
+  unchanged.
+- **`test/test_edge_cost_energy.py`**'s ridge moves from 0.10 m to 0.15 m
+  (0.87 of the threshold). Above the threshold a one-cell ridge gets full
+  lateral standoff and no steady-state hop clears it — already true before this
+  change, 0.18 m was rejected then too. Below it the ridge is priced through the
+  centreline alone, which at 0.10 m the steady-state arc clears for free.
+
+
+### Changed — collision geometry is a single uniform cylinder, not a 3-radius capsule
+
+The robot's collision volume was a capsule with three independently-sized
+regions (a CoM sphere `ROBOT_RADIUS`=0.15 m, a thin leg cylinder
+`LEG_CYLINDER_RADIUS`=0.01 m, a foot-tip hemisphere `FOOT_TIP_RADIUS`=0.02 m),
+a bespoke two-component stance check (`Map2D5.standable_mask`, with a
+`LEG_CLEARANCE_START_FRAC` exemption for the thin leg near the ground), and
+three-way height-banded logic in the flight reference check
+(`terrain_profile`/`clearance_for_alpha`). Judged over-engineered relative to
+what it bought; replaced with one uniform vertical cylinder, radius
+`ROBOT_RADIUS` alone, spanning the foot to the top of the body.
+
+- **`LEG_CYLINDER_RADIUS`, `FOOT_TIP_RADIUS`, `LEG_CLEARANCE_START_FRAC`
+  removed from `config.py`** and from every function signature that took them
+  (`HoppingAStarPlanner.__init__`, `Map2D5.standable_mask`, `ArcProfile`,
+  `terrain_profile`, `clearance_for_alpha`, `min_clearance`).
+- **`Map2D5.standable_mask` collapses from a ~90-line two-component margin
+  computation to a two-line wrapper around `Map2D5.inflated_field`** — stance
+  is now just "is the foot's own cell clear of everything within
+  `ROBOT_RADIUS + MIN_CLEARANCE`," reusing the exact field flight clearance
+  already builds (same memoisation key), rather than a separate geometry
+  calculation.
+- **The taper is gone, and with it the second field.** A tapered inflated
+  field (`h + sqrt(R^2 - d^2)`, lift falling off with lateral distance) is the
+  configuration-space form of a SPHERE — it is the ROBOT's roundness smeared
+  onto the obstacle's corner, not anything about the obstacle's own edges,
+  which stay sharp either way. This robot is a flat-bottomed cylinder with
+  square edges, so the correct inflation is a plain sideways dilation with
+  nothing added, and the safety margin around a square-edged body is
+  square-edged too: a constant, applied at the comparison.
+
+      foot_height >= inflated_field(ROBOT_RADIUS + MIN_CLEARANCE) + MIN_CLEARANCE
+
+  `Map2D5.inflated_field` therefore lost its `taper` argument entirely (a
+  `flat_radius` argument was drafted for a quarter-round margin and never
+  implemented), and the planner's `_inflated_foot` / `_inflated_com` collapse
+  to a single `_inflated`. The two fields only ever existed *because* of the
+  taper — one tapered to price obstacles, one untapered to detect them.
+
+  This corrects a real over-rejection. An intermediate version inflated by a
+  SPHERE of `ROBOT_RADIUS + MIN_CLEARANCE`, which charges the body's WIDTH as
+  VERTICAL clearance underneath a body that has no underside: it demanded
+  0.30 m of headroom over flat ground where only `MIN_CLEARANCE` = 0.15 m is
+  called for. `test/visualize_inflated_map.py` now reports 0.150 m over flat
+  ground.
+
+  Note the margin is a BOX, not a ball — `MIN_CLEARANCE` vertically and
+  laterally on each axis separately, rather than a straight-line distance
+  around the body's bottom corner. That is marginally more conservative near
+  corners, can never accept something unsafe, and is what lets the margin be a
+  constant instead of a shape.
+
+### Removed — the second clearance implementation
+
+`terrain_profile`, `clearance_for_alpha`, `alpha_for_clearance`,
+`min_clearance` and `ArcProfile` are deleted. They were a slower,
+bisection-based second answer to the question `Map2D5.inflated_field` +
+`clearance_floor_alpha` already answer in closed form, unused by the planner
+since the field landed, and kept only as a reference for
+`test/test_inflated_field.py` and as a terrain sampler for figures.
+
+They were also wrong at the margin: the corridor read terrain BILINEARLY at
+the outer edge of the body's width, which drags in cells up to a full cell
+beyond the body's true reach, so it reported collisions with walls the robot
+misses — 51 of 18592 sampled hops across the deck once the taper was removed.
+
+- **`arc_clearance` added** beside `clearance_floor_alpha`: the min gap between
+  the foot and the inflated terrain at a given angle, i.e. the `mc` number
+  every figure annotates arcs with. Both share `_arc_samples`, so the inverse
+  (which angle clears?) and the forward evaluation (by how much?) cannot drift.
+- **`demo_common.angle_and_clearance` / `planner_angle_and_clearance` added**
+  as the one supported way for a diagnostic to re-score an edge. Every
+  `test/demo_*.py`, `visualizer.draw_arc_side_view` and
+  `test/test_clearance_rejection.py` route through them.
+- **`visualizer.draw_arc_side_view` now PLOTS the inflated field** rather than
+  a max-collapsed bilinear corridor, so the picture and the verdict cannot
+  disagree. It lost its `obstacle_fill` and `n_lateral` parameters.
+- **`test/test_inflated_field.py` no longer compares two implementations.** Its
+  bar is a brute-force assertion written inside the test — for every point
+  along the arc, look at every real map cell within the body's reach and
+  require the foot to be `MIN_CLEARANCE` above all of them. 0 violations across
+  the deck, with the field 20-50 cases stricter (the `lookup_pad`'s
+  conservatism, as designed). A `check_field_is_untapered` case pins the taper
+  shut.
+- **`ARC_LATERAL_SAMPLES` and `OBSTACLE_WALL_EXTRA` removed from `config.py`**
+  (and `n_lateral` / `obstacle_wall_extra` from `HoppingAStarPlanner`), along
+  with `OBSTACLE_WALL_EXTRA`'s assert. Both existed only for bilinear corridor
+  sampling; `inflated_field` gives OBSTACLE cells `+inf`, which is strictly
+  stronger and needs no calibration against `MAX_APEX_HEIGHT`.
+- **`test/test_clearance_rejection.py`'s `PILLAR_H` recalibrated 1.6 -> 0.4**,
+  and for the first time against what the planner actually flies. Every earlier
+  value was calibrated against `terrain_profile`, which rakes samples
+  PERPENDICULAR to travel and so never sees an obstacle ahead of or behind the
+  arc. An inflated field is a DISC: against a 0.30 m-square post that is the
+  difference between "the arc must clear it" and "the arc must clear it, and
+  the landing must stand clear of it too."
+
+### Changed — the rest of the single-cylinder collapse
+
+- **Max standable grade rises from ~0.88 to ~1.33** (`LEG_LENGTH /
+  (ROBOT_RADIUS + MIN_CLEARANCE)`, verified numerically against
+  `standable_mask`, not just by formula) — a flat cylinder has no lateral
+  taper the way the old CoM sphere did, so at a fixed radius it is *less*
+  restrictive in this comparison, not more. No shipped map is affected (the
+  steepest, `maps/slope_crest.py`, ships at grade 0.35), but it is a real,
+  intentional widening of what counts as standable.
+- **The `LEG_LENGTH - ROBOT_RADIUS > MIN_CLEARANCE` assert is gone.** It
+  guarded a sphere-specific failure mode (the CoM sphere's rounded underside
+  clipping its own foot's ground contact); a flat-capped cylinder's bottom
+  sits exactly at the foot's height by construction, contributing zero
+  self-lift regardless of `ROBOT_RADIUS`, so that failure mode no longer
+  exists.
+- **`test/test_edge_cost_energy.py`'s ridge lowered 0.4 m → 0.1 m.** Not a
+  bottom-cap effect: the cylinder demands exactly `MIN_CLEARANCE` under the
+  foot, slightly LESS than the old capsule's foot tip did. What changed is
+  LATERAL — the body went from a 0.01 m leg to a 0.15 m cylinder, so with the
+  margin it sweeps 0.30 m either side and must clear a ridge from 0.30 m out,
+  while the arc has barely risen. The angle that needs (83.3° for a 0.4 m
+  ridge) is past the steady-state energy ceiling (79.2°), so the hop is
+  rejected by the ENERGY budget rather than by the clearance shape.
+
+### Changed — candidate landing cells now come from a scanline circle fill, not a ray-search
+
+`_generate_hop_neighbors` sampled candidates with a **polar ray-search**: 16
+fixed directions (`n_angles`), each walked radially from the state's dynamic
+`hop_radius` down to `min_hop_radius` in `hop_scan_step` steps. That sampling
+is spatially non-uniform by construction — candidate spacing along a ray is
+`hop_scan_step` (0.1 m), but spacing *between* adjacent rays at the outer
+radius is `hop_radius * 2*pi / 16` (~0.78 m at a 2 m hop radius). Candidates
+piled up near the current cell, where all 16 rays converge, and thinned out
+toward the rim.
+
+- **Mechanism**: candidates are now generated by a **scanline circle fill** — a
+  `hop_scan_step`-spaced lattice centred on the current cell, walked one row
+  (`y`) at a time, where each row's column span is bounded in closed form by
+  the circle equation (`x_max = sqrt(reach^2 - y^2)`) rather than by a
+  per-point distance test. Every point produced is inside the disk by
+  construction, so — unlike a "walk the bounding square, discard the
+  corners" approach — nothing is generated only to be thrown away, and
+  spacing is uniform everywhere in the disk instead of dense near the centre
+  and coarse at the rim.
+- **Padding**: both bounds are padded by `hop_scan_step * sqrt(2) / 2` (half a
+  lattice cell's diagonal) — the same role `Map2D5.inflated_field`'s
+  `lookup_pad` plays — so a cell the true circle merely *touches* isn't
+  excluded on a rounding technicality. The outer bound (`hop_radius`) widens
+  and the inner bound (`min_hop_radius`, an annulus floor, 0 by default)
+  shrinks; both moves make the swept region strictly larger, never smaller,
+  so an over-included candidate only ever costs one extra (cheap-to-reject)
+  `_validate_and_cost` call, never a correctness problem.
+- **Dedup simplified**: the old ray-search needed two dedup sets (`attempted`,
+  `in_results`) specifically so a cell one ray *failed* on wouldn't block a
+  *different* ray from later reaching it at a shorter radius. A flat lattice
+  sweep has no such concept — every grid cell is visited via one loop, not
+  several rays that can converge on the same cell — so a single `attempted`
+  set is sufficient: `_validate_and_cost(current, current_z, neighbor,
+  v_g_in)` is a pure function of those three arguments (all fixed for the
+  expansion), so a cell's validity never depends on which lattice point
+  reached it first.
+- **Removed**: the `n_angles` constructor parameter and `self._hop_dirs`
+  (both planner-internal state, no longer meaningful once there's no notion
+  of "direction"). Two demo-only diagnostics
+  (`test/demo_common.py::enumerate_ring_candidates`,
+  `test/demo_planner_reroute.py::enumerate_ring_candidates`) read
+  `planner._hop_dirs` for a deliberately simplified single-ring
+  visualization; they now generate their own angles locally instead, and
+  `config.HOP_N_ANGLES` is re-annotated as diagnostic-only (same pattern as
+  `ARC_LATERAL_SAMPLES`).
+- **Behavior note**: at `hop_radius < hop_scan_step` (a very slow-arriving
+  state), the padding still produces a small ring of candidates around the
+  current cell rather than the ray-search's true dead end (`r` starts and
+  stays at 0, which snaps to the current cell and is filtered out) — a
+  narrow, deliberate improvement, not an accidental side effect.
+  `_validate_and_cost` remains the real gate on whether any of them are
+  reachable.
+- **Scaling changed shape, and needed a second fix**: the ray-search's
+  candidate count was linear in `1/hop_scan_step`; a flat-spacing lattice
+  fill's is quadratic (`~pi * hop_radius^2 / hop_scan_step^2`), since it
+  covers an area rather than walking a fixed number of rays. Measured on
+  stairs/tall_stairs/slope_crest, that made the fill run **5.4-6.4x slower**
+  than the old ray-search (up to 572.8s vs 94.1s per plan, 22.2M vs 3.49M
+  edge checks on stairs alone) — `hop_radius` reaches ~5.5 m right after a
+  big drop, and at that radius a flat 0.1 m spacing visits ~9500 lattice
+  points per expansion against the old ray-search's ~880.
+  - **Fix**: a new `hop_scan_step_ref_radius` parameter (`config.py`'s
+    `HOP_SCAN_STEP_REF_RADIUS`, 1.0 m — the flat steady-state hop length
+    referenced throughout this codebase, e.g. `W_ENERGY`'s derivation).
+    Below this radius the spacing is exactly `hop_scan_step`, unchanged; above
+    it, the spacing widens as `hop_scan_step * sqrt(hop_radius /
+    hop_scan_step_ref_radius)`, which brings candidate count growth back down
+    to ~linear in `hop_radius` instead of quadratic — matching the old
+    ray-search's scaling shape without sacrificing density at the common,
+    small-radius case.
+  - **Result**: with the fix, the same three maps ran **1.3-1.7x slower**
+    than the old ray-search (down from 5.4-6.4x), with identical path shapes,
+    waypoint counts, and hop counts throughout. The residual 1.3-1.7x is the
+    scanline fill's inherently higher candidate density even at/below the
+    reference radius (a disk fill visits more points than 16 rays do), not
+    further large-radius blowup.
+
+### Changed — flight clearance now reads precomputed inflated height fields
+
+The planner spent **71%** of its time re-measuring static terrain:
+`terrain_profile` (42%) plus `clearance_for_alpha` (29%). Measured on one
+`plan()` call on the flat map, that came to **155,358,320 grid reads over a
+2,500-cell map — ~62,000 reads per cell of terrain that never changes**, plus
+100,689,430 arc-vs-terrain distance comparisons.
+
+The cause was structural rather than a tuning failure. A terrain profile is
+keyed on a **cell pair** (~7M of them on a 50x50 map), so it can never be
+precomputed; the 60k FIFO cache that compensated ran at a 17-34% hit rate, and
+uncapping it entirely bought only 14%.
+
+Terrain is now inflated by the robot's collision geometry **once**, per cell, at
+planner construction — the standard configuration-space move, so the robot
+becomes a POINT everywhere downstream:
+
+- **`Map2D5.inflated_field(radius, taper=?)`** (new, memoised). Per cell, the
+  absolute height a body of `radius` must be at to touch nothing, taking the max
+  over neighbours of `terrain + sqrt(radius^2 - d^2)`. 0.26 ms for the whole map
+  against 155M reads during the search.
+- **`clearance_floor_alpha`** (new free function) replaces `terrain_profile` +
+  `alpha_for_clearance` in the planner. It samples the **centreline only** — the
+  body's width is in the field now, not in the sampling pattern — and solves for
+  the clearance floor in closed form, since `_arc_z` is linear in `tan(alpha)`:
+  `T_req(u) = (H(u) - t_s - Z*u^2/X^2) * X / (u*(X-u))`. That replaces the
+  1.5-2.3 `clearance_for_alpha` calls and 8-step bisection per edge with one
+  vectorized pass, and yields the exact crossover rather than a bracket.
+- **`_profile_cache`, `_terrain_profile_cached` and the `profile_cache_size`
+  constructor parameter are gone.** Nothing per-hop is derived any more.
+
+`terrain_profile`, `clearance_for_alpha`, `alpha_for_clearance` and
+`min_clearance` remain as the **reference implementation**, which the demos and
+`visualizer.py` still use and which `test/test_inflated_field.py` validates the
+planner against.
+
+**The feasible takeoff-angle interval is untouched.** `feasible_alpha_interval`
+— the energy band, `min_apex`, both friction cones, the landing-speed cap — is
+unchanged, as is the least-injection rule for picking the flown angle. Only the
+clearance floor inside that interval changed how it is found.
+
+Measured across the deck (same start/goal, same energy seed):
+
+| scenario | before | after | speedup | path |
+|---|---|---|---|---|
+| flat | 15.7 s | 6.6 s | 2.4x | identical |
+| low_wall | 38.6 s | 18.6 s | 2.1x | changed |
+| bypass | 157.5 s | 45.8 s | 3.4x | changed |
+| stairs | 241.6 s | 75.5 s | 3.2x | changed |
+| tall_stairs | 196.6 s | 96.0 s | 2.0x | changed |
+| slope_crest | 63.1 s | 41.8 s | 1.5x | changed |
+| **total** | **713 s** | **284 s** | **2.5x** | |
+
+`flat` is identical down to the expansion and edge-check counts. Everywhere else
+the path moves because the check is stricter — see below.
+
+### Fixed — flight clearance no longer has lateral sampling gaps or bilinear under-reads
+
+Two approximations in the old check are gone, and with them a documented
+restriction on map authoring:
+
+- It raked only `ARC_LATERAL_SAMPLES` points across the body, **0.15 m apart** at
+  shipped values, so a ~20 cm obstacle could pass between two of them undetected.
+  The inflated field has no gaps at any obstacle width.
+- It read terrain **bilinearly**, which averages a one-cell obstacle 50/50 with
+  its neighbour and halves its effective height. An inflated field is a `max`, so
+  it never under-reports — **obstacles no longer need to be two cells thick.**
+
+Consequence: the new check is **strictly stricter**, rejecting ~5-10% more hops
+on featured maps, and **paths on those maps change**. `flat` is unaffected.
+`test/test_inflated_field.py` asserts the one-sided property that matters —
+there is **no** case where the field check accepts a hop `clearance_for_alpha`
+rejects — across seven maps and ~2,700 hops each.
+
+Two things that look optional and are not, both regression-tested:
+
+- **`lookup_pad`** (default `resolution*sqrt(2)/2`). The planner reads the field
+  with a nearest-cell lookup, so a query point can sit half a cell diagonal from
+  the centre of the cell it reads; without the pad, 1,390 of 21,000 sampled query
+  points are not bounded by the field.
+- **The CoM field must not taper.** `clearance_for_alpha`'s above-the-CoM branch
+  treats such terrain as a full-height column, so a sphere there over-rejects
+  (13,344 extra rejections across the deck).
+- **`ARC_SAMPLE_MAX_STEP` must not be coarsened**, despite the fields being
+  smooth at the scale of their own dilation radius. `T_req` has a pole at each
+  end of the hop (its `u*(X-u)` denominator), so the answer is far more
+  sensitive to sample spacing near the endpoints than the fields are: marching
+  at `CELL_RESOLUTION` lets 333 hops through that the reference rejects,
+  `CELL_RESOLUTION/2` lets 20 through, `CELL_RESOLUTION/3` none. The saving over
+  the old check is the lateral rake and the bisection, not a coarser march.
+- **The two arc endpoints stay out of scope**, exactly as `clearance_for_alpha`
+  documents, and must not be checked with the fields instead. An inflated field
+  is a **disc**, so at `u = 0` it sees terrain *behind* the takeoff that the
+  reference's corridor never samples. On `slope_crest`'s 0.35 ramp the ground
+  0.24 m uphill sits 0.084 m above the foot, so an endpoint test rejected every
+  hop off every ramp cell and `plan()` returned `None` from the start state.
+
+### Added — `test/test_inflated_field.py`
+
+Pins the inflated-field check to the reference capsule check it replaced, in the
+repo's assertion style (PASS/FAIL prints, `sys.exit(1)`). Also asserts the
+equivalence `standable_mask == (inflated_field(com_radius+gate) <= grid +
+leg_length)`, which holds exactly on the whole deck and is why the two remain
+separate implementations rather than being merged.
+
+### Changed — trimmed redundant checks from `_validate_and_cost` / `feasible_alpha_interval`
+
+Two checks in the hottest path of the planner were provably redundant given how
+the planner actually calls them, and were removed to cut per-edge cost:
+
+- **The landing-obstacle check** in `_validate_and_cost` (`if neighbor_z ==
+  Map2D5.OBSTACLE: return None`) duplicated the stance gate right after it:
+  `Map2D5.standable_mask` already ANDs in `grid != OBSTACLE` unconditionally, so
+  every OBSTACLE cell was already rejected by the stance check. Removed outright.
+  Note this also removes the obstacle guard from the `disable_clearance=True`
+  path (which skips the stance gate) — that A/B-baseline knob is no longer
+  relied upon, so it is no longer obstacle-safe on a map with real OBSTACLE
+  cells.
+- **`feasible_alpha_interval`'s Eq. 4 validity check and its takeoff-speed bound
+  (`v_s <= V_max`)** are algebraically implied once the energy band (E1
+  energy floor / E2 injection ceiling) is supplied: `_speed_tan_interval`'s
+  `tan(alpha)` roots always satisfy `X*tan(alpha) - Z > 0` (Eq. 4's condition)
+  on their own, since the equation they solve has a strictly positive left
+  side; and E2's own ceiling already takes `min(..., V_max^2)`, which is at
+  least as tight as the takeoff-speed bound everywhere. Both checks are
+  deleted rather than special-cased away, which makes `v_s_min`,
+  `e_inject_max`, and `mass` **required** arguments now — there is no more
+  bare-BEAM fallback mode (`feasible_alpha_interval(X, Z, V_max, g)` with no
+  energy state). `test/test_friction_cone.py` and part of
+  `test/test_clearance_rejection.py` exercised that bare mode directly and are
+  expected to fail until rewritten for the new algorithm.
+
+### Changed — `HOP_RADIUS` raised 1.0 m -> 4.0 m (the ring, not the physics, was limiting hop length)
+
+`test/demo_hop_radius_headroom.py` (new) tests, per hop, whether a landing
+farther than `HOP_RADIUS` along the same heading would still pass
+`_validate_and_cost` unmodified, and separately replans the same start/goal
+across a radius sweep. At `HOP_RADIUS = 1.0`, every hop on `flat` and most on
+`stairs` saturated the ring exactly (`X_taken == hop_radius`) while the
+physics gates tolerated 2-4x more — confirmed by hand against
+`feasible_alpha_interval` for the first hop (feasible out to ~3.8-4.0 m,
+against a 1.0 m ring). The ring, not the robot's energy/friction/clearance
+limits, was choosing hop length.
+
+- Raised to 4.0 m, the safe ceiling under `config.py`'s own asserts (4.0
+  passes, 4.2 fails on the first-hop energy floor — see the assert block
+  below `V_MAX`). Re-running the same diagnostic at 4.0 m flips the verdict
+  to physics-bound: per-hop headroom past the ring goes to ~0 (stopped by an
+  actual physics/clearance/map-edge gate, not the ring), and the radius sweep
+  plateaus — 2.0 m, 3.0 m and 4.0 m all produce the identical path on both
+  scenarios tested (`flat`: 2 hops @ 2.0 m; `stairs`: 2 hops @ 2.0 m), where
+  1.0 m gave 4-5 short hops.
+- **Cost**: `_generate_hop_neighbors`'s ray-search scans `hop_radius /
+  hop_scan_step` radii per direction, so this ~4x's the candidates per
+  expansion (10 -> 40 radii at `HOP_SCAN_STEP = 0.1`) on top of the existing
+  energy-axis multiplier. Not re-tuned here; if planning time on larger maps
+  becomes a problem, `min_hop_radius` (skip the inner rungs of the ladder) or
+  `hop_scan_step` are the levers, not reverting `HOP_RADIUS`.
+
+### Changed — edge cost is energy, not elevation
+
+`_edge_cost` priced a hop as `xy_dist + alpha_uphill·dz`. It was added to make the planner
+weigh "hop over the obstacle" against "go around it", and it could not do that job: a hop
+that arcs **over** a wall and lands on the flat beyond has `dz = 0`, so it was charged
+nothing — for exactly the manoeuvre it existed to price. It was also blind to how the robot
+arrived, charging the same whether the hop was paid for with spare momentum or with thrust.
+
+```
+cost = xy_dist + W_ENERGY · (e_inject + max(0, KE_in − KE_out))
+```
+
+- **`e_inject` was already there.** Computed on every edge, already rising when the
+  clearance gate lifts `alpha` over terrain, and thrown away. Hooking it into cost makes
+  over-vs-around a physics question. It also prices climbing on its own (`Z = +0.4` needs
+  3.73 J against 1.20 J flat), which is what makes the elevation term redundant rather than
+  merely miscalibrated.
+
+- **The momentum term is not optional.** Charging `e_inject` alone is *worse* than the old
+  cost: short hops need no thrust at all — the robot already carries the speed — so they
+  price as free and A* chops paths into stubs. On `flat` at steady state over 3.0 m, the
+  path went from `[1.0, 1.0, 1.0]` to `[0.8, 1.0, 0.8, 0.4]`, arriving at 2.56 m/s instead
+  of 3.16. It did not save energy, it spent momentum; `Σe_inject` counts the battery but
+  not the bank account. Covering 1 m: one 1.0 m hop is 1.20 J + 0.00 J, two 0.5 m hops are
+  0.81 J + 1.23 J.
+
+- **This is also what regulates hop count**, which is why no per-hop energy constant was
+  added. Holding speed steady costs `½mv²(1−η)` = 1.197 J per hop — an expression with no
+  hop *length* in it — so N hops over the same ground cost N times as much.
+
+- **`W_ENERGY = 0.84` m/J is derived, not tuned**: `1 / 1.197` makes one flat steady-state
+  hop's energy cost equal its distance cost. Raise it to bias toward detouring, lower it to
+  bias toward hopping over. It is also a runtime dial — see below.
+
+- **`KE_out` uses the binned landing speed**, matching `KE_in` (already binned) and the
+  speed the successor state actually stores. Mixing binned-in with exact-out leaves ~0.32 J
+  of quantisation noise per hop against a ~1.2 J signal.
+
+**Removed:** `ALPHA_UPHILL`, `ALPHA_DOWNHILL`, and the `alpha_uphill` / `alpha_downhill`
+constructor arguments. `astar_planner.py` (the retained 8-connected reference planner) keeps
+its own copies and is untouched.
+
+**Cost: planning is 4–6× slower** (`flat` 9.3 → 44.6 s, `low_wall` 6.6 → 40.1 s; expansions
+~3.5–4.5×). Structural rather than a bug: `_heuristic` estimates distance only, so the whole
+energy term is cost it cannot anticipate and A* degrades toward Dijkstra. Scales with
+`W_ENERGY`. The known mitigation is a per-hop energy constant, which unlike the momentum
+charge can be lower-bounded from `ceil(dist / hop_radius)` and added to the heuristic; left
+undone as a search optimisation rather than a cost-model question.
+
+**Known conservatism:** a climb converts kinetic energy into height rather than wasting it,
+but the momentum term charges for it anyway — ~0.60 J on top of 3.72 J of real injection for
+a 0.4 m step.
+
+**Rejected alternatives**, recorded so they are not re-litigated: raw obstacle height
+(over-counts ~3×, because launching harder means landing harder and the next hop needs no
+injection — `[1.20, 2.86, 0.03, 1.20]` — a refund only a path sum can credit); `m·g·h` at the
+apex (charges for height the robot got free, counts only the vertical share); stance
+dissipation instead of injection (makes climbing *cheaper* than flat, 1.02 J vs 1.20 J);
+uncapped potential shaping `e_inject + KE_in − KE_out` (reaches −1.36 J on a 0.4 m drop, and
+negative edges break A*);
+a separate per-hop energy constant (tested at 0.2 J — changed neither path nor expansion count).
+
+- **New:** `test/test_edge_cost_energy.py`, 11 assertions, mostly regressions against the
+  above.
+- **New:** `charge_momentum` (default `True`), a third A/B knob alongside
+  `disable_clearance` and `mu=None`. `False` charges thrust but not the momentum term.
+  Unlike the other two it is not a weaker model but a **known-broken** one — worse than
+  having no energy term at all — and is documented as such so nobody reaches for it to
+  claw back planning time.
+- **New:** `test/demo_cost_model_ab.py` — three cost models (distance only / thrust only /
+  thrust + momentum) across three scenarios, producing `cost_model_ab.png` (top-down
+  paths) and `cost_model_ledger.png` (per-hop thrust-vs-momentum bars). Measured, every
+  scenario seeded at the flat steady state:
+
+  ```
+  scenario   model  hops  travel  thrust  moment  total E  exit v
+  flat       A         3   3.00    3.10    0.00     3.10    3.16
+  flat       B         4   3.00    2.45    2.35     4.80    2.56
+  flat       C         3   3.00    3.10    0.00     3.10    3.16
+  low_wall   A         4   3.00    3.90    3.23     7.13    2.72
+  low_wall   B         4   3.00    3.06    2.50     5.56    2.63
+  low_wall   C         4   3.16    3.55    1.30     4.85    2.92
+  bypass     A         4   4.00    6.79    3.68    10.47    3.76
+  bypass     B         5   4.00    6.45    4.83    11.27    2.93
+  bypass     C         6   5.44    5.44    0.62     6.06    2.89
+  ```
+
+  B burns less thrust than C on `flat` and `low_wall` while arriving slower every time —
+  it looks cheaper only because the meter is not running on momentum. On `bypass` the
+  models split on routing: A and B cross a 0.70 m wall, C walks 1.44 m further round the
+  end and spends **6.06 J against B's 11.27 J**.
+- **Seeding matters and is not cosmetic.** All three scenarios start at the flat steady
+  state (`h_initial ≈ 0.356 m`). At the shipped `H_INITIAL = 1.0` the robot opens with
+  5.29 m/s it cannot shed, injects nothing for three hops while stance losses burn the
+  surplus off, and ~8 J of forced momentum loss swamps the ledger — every model paying it
+  identically. A development A/B run showed no difference between models for exactly this
+  reason.
+- **Rewritten:** `test/demo_decision_sweep.py` — narrative was built entirely on
+  `ALPHA_UPHILL · h`. Now reports the travel/thrust/momentum split. Its `HEIGHTS` were
+  re-picked from `[0.15, 0.80, 1.20, 1.40]` to `[0.30, 0.60, 0.90, 1.20]`: the over/around
+  flip moved from h ∈ [1.20, 1.40] to h ∈ [0.90, 1.20] at `demo_common.HOP_RADIUS = 1.5`,
+  because arcing over is now paid for at all. Its `build_wall` also moved from a raw
+  `world_to_grid` slice to `paint_region`, so the physical wall no longer rescales with
+  `CELL_RESOLUTION` — which would have moved the flip point the demo exists to locate.
+- **Results:** `results/energy_based_edge_cost/`.
+
+### Changed — hops now carry energy between them (hopping, not jumping)
+
+Every hop was validated in isolation: `feasible_alpha_interval(X, Z, V_max, g)` asked only
+"does *some* takeoff angle exist within the leg's budget?", so a landing cell was equally
+reachable however the robot got there. That is a **jumping** robot — land, stop, jump again.
+
+The real robot hops in a three-phase cycle (descent with attitude control, an
+inverted-pendulum stance, then powered climbing thrust), so takeoff speed is a function of
+landing speed, which is a function of the hop before it. Two things the old model could not
+express:
+
+1. **The robot already has a takeoff speed when it leaves the ground**, and propellers can
+   only *add* energy. Every parabola shallower than the one that speed produces is
+   unreachable, not merely suboptimal — the planner used to pick those freely.
+2. **The mechanism needs a minimum drop.** Falling less than `MIN_APEX_HEIGHT` does not
+   compress the elastic leg enough for the controller to detect a stance phase at all.
+
+- **The chain** — bookkeeping is full CoM kinetic energy at touchdown, `½mv²`. The CoM sits
+  at `terrain + LEG_LENGTH` at touchdown *and* takeoff, so stance involves no net change in
+  gravitational PE and the whole 30 % loss is kinetic, with no PE term to track. `m·g·h_apex`
+  was rejected as the alternative: it counts only the vertical share and would leave the
+  horizontal speed — exactly what the inverted pendulum redirects — undamped.
+
+  ```
+  flight (lossless):   v_g² = v_s² − 2gZ
+  stance (η loss):     v_s_min′ = √η · v_g                    η = ETA_HOP = 0.7
+  thrust (injection):  v_s′ ∈ [v_s_min′, √(v_s_min′² + 2·E_INJECT_MAX/m)]
+  ```
+
+- **Three new α bounds**, applied *before* Eq. 4 validity and the friction cones, in
+  `feasible_alpha_interval` — all behind keyword args defaulting to `None`, so bare
+  `(X, Z, V_max, g)` calls keep their old behaviour and `test/test_friction_cone.py` still
+  exercises BEAM in isolation:
+  - **(E1) energy floor.** `_speed_tan_interval` already returns where `v_s² ≤ W`; the floor
+    is its complement, and the implementation keeps the upper branch (the higher parabola).
+    Vacuous when `v_s_min` cannot reach the target at all, where the bound falls back to
+    (E2)'s lower root.
+  - **(E2) injection ceiling**, `v_s ≤ √(v_s_min² + 2·E_INJECT_MAX/m)`.
+  - **(E3) minimum drop**, new free function `min_apex_tan`. Measured apex → landing, not
+    takeoff → apex: it is the fall that compresses the leg, and on an uphill hop the robot
+    can rise 0.3 m and still land while barely descending. `h_drop = (XT−2Z)²/(4(XT−Z))` is
+    monotone in `T = tan α` on the valid domain, so it inverts in closed form to
+    `T ≥ 2(Z + h + √(h(h+Z)))/X` — no bisection. It is `max`'d against (E1), making it a
+    pure fallback that changes nothing unless the incoming speed's parabola is too low.
+
+- **A\* state is now `(cell, speed_bin)`.** A cell reached two ways is two situations, and
+  one may have no feasible continuation. Neither more nor less energy dominates — more
+  raises the floor and shuts off shallow hops, less lowers the ceiling — so there is no
+  valid dominance pruning and the speed axis is quantised (`SPEED_BIN` = 0.25 m/s) instead.
+  Measured on `stairs`: 827 → 3285 expansions (~4 live bins per cell), 5.1 s → 11.2 s.
+  Most of that was clawed back with a new bounded `_profile_cache`: terrain profiles depend
+  only on the cell pair, not on energy, so the bins of one cell were re-sampling identical
+  terrain (21.6 s before the cache; 20k entries thrashes at 15.0 s, 60k reaches the
+  uncapped 11.2 s at ~170 MB peak RSS).
+
+- **Takeoff angle is chosen to minimise injected energy**, not to maximise clearance margin
+  — energy spent now is energy the next hop lacks. `alpha_for_clearance` loses
+  `margin_frac` and returns `clamp(α*, α_c, α_max)`, where `α_c` is the shallowest clearing
+  angle (clearance is monotone in `tan α`) and `α*` = `min_energy_tan(X, Z)` =
+  `(Z + hypot(Z,X))/X` is the argmin of required speed (U-shaped in α). Exact, not a search.
+  **The accept/reject verdict is unchanged** by the policy switch — both reject only when
+  even `α_max` fails — so only reported angles and clearances moved.
+  `ALPHA_MARGIN_FRAC` is deleted.
+
+- **`V_MAX` is now derived from the chain, and `V_G_MAX` replaces it as the real cap.**
+  `V_G_MAX` = `√(2g·MAX_LANDING_APEX)` = 7.00 m/s is the fastest touchdown the leg can
+  absorb (sized at a 2.5 m fall — hopping off a platform); since `v_s_min = √η·v_g` on the
+  next hop, bounding `v_g` recursively bounds every takeoff speed. `V_MAX` =
+  `√(η·V_G_MAX² + 2·E_INJECT_MAX/m)` = 7.35 m/s is what remains: the global worst case,
+  reachable only immediately after a max-height drop, and a never-binding backstop on
+  constraint (3). Constraint (4) now reads `v_g ≤ V_G_MAX`.
+
+  Knock-on: `MAX_APEX_HEIGHT` becomes derived (1.20 → 2.75 m) and **`OBSTACLE_WALL_EXTRA`
+  had to rise 1.5 → 3.1 m** to keep obstacles un-flyable for a robot fresh off a platform.
+  Its existing assert catches this.
+
+- **New config**: `ROBOT_MASS`, `ETA_HOP`, `H_INITIAL`, `MIN_APEX_HEIGHT`,
+  `INJECT_MAX_HEIGHT`/`E_INJECT_MAX`, `MAX_LANDING_APEX`/`V_G_MAX`, `SPEED_BIN`. The start
+  cell is seeded with a *virtual* landing speed `√(2g·H_INITIAL/η)` = 5.29 m/s, chosen so
+  the uniform stance rule reproduces a first takeoff speed of `√(2g·H_INITIAL)` = 4.43 m/s
+  — so the first hop needs no special case anywhere in the search. Two new asserts guard
+  the silent-`None`-everywhere failure mode: that some angle survives the first hop (the
+  tightest in any plan, because `H_INITIAL` hands the robot a surplus it cannot shed), and
+  that the seed speed is one the leg could have absorbed.
+
+- **`HoppingAStarPlanner.path_hops`** records per-hop `alpha_s`, `v_s`, `v_g`, `e_inject`,
+  `apex_drop`, `X`, `Z` for the returned path. Callers needing the takeoff angle must read
+  it from there: with the chain, the angle depends on the whole path leading up to the hop
+  and cannot be recovered from the endpoints. `main.py` prints the table.
+
+- **Diagnostics chain, and bin.** `demo_common.diagnose_path` now threads `v_g` forward
+  hop by hop instead of mapping `diagnose_edge` over the pairs; `planner_alpha_interval`,
+  `diagnose_edge`, `enumerate_ring_candidates` and `demo_decision_sweep.path_cost` take a
+  `v_g_in`. Scoring hops independently would judge every one of them against the
+  start-of-chain energy. It also *quantises* `v_g` between hops, because the search state
+  carries a binned speed and that — not the exact value — is what chose the angle;
+  chaining the exact value drifts by up to `SPEED_BIN/2` per hop, enough to move the
+  reported clearance across the gate. That defect was visible as `diagnose_path` accusing
+  the ballistic planner's own path of containing a hop the planner had accepted
+  (`stairs_with_curb`, mc 0.088 vs the 0.10 gate).
+
+- **Map recalibration: `maps/tall_narrow_wall.py` 0.70 → 1.40 m.** Its 0.70 m ridge was
+  sized against a tuned `V_MAX` and a max-margin angle; under the energy chain a forced-
+  steep arc clears it from every takeoff, and both planners returned the identical clean
+  path. At 1.40 m the original contrast is back — baseline takes off at x=2.05 and clips,
+  ballistic backs off to 1.95 and clears. Measured: 1.1–1.4 m shifts the takeoff, 1.6 m
+  and up makes the planner detour around the y-end instead (which is
+  `demo_planner_reroute`'s scenario, not this one). `demo_clearance_sweep`'s pillar moved
+  0.9 → 1.6 m to stay in step with `test_clearance_rejection`, and now passes the energy
+  band rather than a bare interval.
+
+- **Test recalibration.** `test/test_clearance_rejection.py`'s pillar sweep needed
+  `PILLAR_H` 0.45 → 1.6 m and its wall case 1.10 → 1.90 m: a robot that cannot shed energy
+  is forced steep on short hops (39.8° of floor at `X = 2.1`, 78.2° at `X = 0.8`) and clears
+  a low pillar trivially. Both files' hard-coded reach boundaries are now derived from
+  `V_MAX²/g` so they cannot silently encode a tuned value again. New
+  `test/test_hop_energy_chain.py` covers the closed forms, the interval bounds, and
+  end-to-end chain closure on a real plan.
+
+- Demo output moved to `results/energy_aware_planning/`. The code default had already
+  drifted to `results/with_leg_capsule_margin` while the docs still said
+  `results/after_LS_recs`; all now agree.
+
+### Added — friction cone at both contacts (Campana BEAM constraints 1–4)
+
+`feasible_alpha_interval` was pure and map-free: it saw only `X`, `Z`, `V_max` and
+`g`, and applied two constraints (Campana Eq. 4 validity + the takeoff leg-energy
+limit). Nothing about the terrain's surface normal reached it, so the interval
+admitted takeoff angles a real push-only leg cannot produce — most starkly on a
+downhill hop, where `alpha_min` went *negative*, i.e. thrust aimed into the ground.
+`docs/alpha_range_old.md` had flagged this as the largest open modelling gap.
+
+It now implements Campana & Laumond's full **BEAM**: five constraints intersected on
+`alpha`, of which four are physical and one is the pre-existing parabola-validity
+bound. See [docs/alpha_range_new.md](docs/alpha_range_new.md) for the derivations.
+
+- **Physics** — [hopping_astar_planner.py](hopping_astar_planner.py) gains three pure
+  free functions beside `feasible_alpha_interval`, kept unit-testable in isolation per
+  the repo convention:
+  - `inplane_friction_cone(n, theta, mu)` reduces the 3D Coulomb cone (half-angle
+    `beta = atan(mu)`) to the 2D wedge `(gamma, delta)` it cuts in the hop plane, with
+    `delta = acos(cos(beta)/A)`. The paper states this reduction (Sec. IV-A) but omits
+    the formula (its footnote 1); this is the standard cone/plane intersection and
+    reproduces the property the paper does state, `delta <= beta`. Returns `None` when
+    the plane meets the cone only at its apex — a cross-slope steeper than `mu`.
+  - `_speed_tan_interval(X, Z, W, g)` covers **both** velocity constraints, since
+    `v_g^2 = v_s^2 - 2 g Z` makes the landing bound the same quadratic in `tan(alpha)`
+    with `W = V_max^2 + 2 g Z`. Expanding that reproduces the paper's `Delta` and
+    `Lambda` exactly. It replaces the old `asin(K)/psi` formulation, which is
+    algebraically the same constraint (its `K < -1` "unbounded" branch was provably
+    unreachable for `X > 0`).
+  - `_landing_cone_alpha_s` maps the landing wedge back onto `alpha_s` through
+    `tan(alpha_s) = 2Z/X - tan(alpha_g)`. Replaces the paper's Algorithm 1 case split
+    on `sign(gamma_g)` with a single branch: heightmap normals always give
+    `gamma_g in (0, pi)`, so only one branch can occur, and clamping `alpha_g` to what
+    a real descending parabola produces subsumes the algorithm's `no_solution` and
+    `undefined` flags.
+- **Surface normals** — [map2d5.py](map2d5.py) gains `surface_normals()` (memoised
+  alongside the existing fill cache, which `_invalidate_fill_cache` was renamed to
+  `_invalidate_caches` to cover). It uses **min-|slope| one-sided differences**, not a
+  central difference, and that is a correctness requirement: a central difference
+  straddles a discontinuity and invents a ramp, reading grade 2.0 at the foot of
+  `tall_stairs`' 0.4 m riser. That makes `cos(beta)/A = 1.43 > 1` — a degenerate cone
+  at exactly the cell the planner needs to take off from, which would have made the
+  stair maps unplannable. The one-sided rule picks the flat tread the foot actually
+  rests on, while recovering a uniform grade exactly (`slope_crest`'s ramp reads 0.35).
+- **Config** — `MU = 1.2` (the paper benchmarks 0.5 and 1.2). Asserted `> 0`, and
+  asserted that the flat-ground cone floor `pi/2 - atan(MU)` stays below the leg-energy
+  ceiling at `HOP_RADIUS` — otherwise the interval is empty for *every* flat hop and
+  `plan()` returns None everywhere with no other symptom, the same silent-failure class
+  the `MIN_CLEARANCE` assert already guards.
+- **What it changes.** On flat ground both cones collapse to `alpha >= atan(1/MU)` =
+  39.81°, up from 12.31° for a 1 m hop; the chosen angle moves 45.0° → 58.7°. On uphill
+  landings the *landing* cone binds hardest (stair hop `X=0.6, Z=0.4`: `[41.7°, 82.0°]`
+  → `[65.2°, 82.0°]`, chosen 61.9° → 73.6°). Because clearance is monotone in
+  `tan(alpha)`, steeper arcs mean clearance only improves. Constraint (4) is
+  implemented for correctness but never binds on current maps (`Lambda >= 0` needs
+  `Z >= -7.2 m` at `X = 1.5`).
+- **What it deliberately does not change.** The cone cannot make a standable slope
+  impassable — standing requires grade `<= MU`, and the fall-line floor
+  `pi/2 + atan(grade) - atan(MU)` stays under `pi/2` exactly when `grade < MU`, while
+  the energy ceiling tends to `pi/2` as hops shorten. It caps hop *length* by heading,
+  not reachability. `alpha_for_clearance` is untouched: its monotonicity argument
+  depends only on `_arc_z`, not on where the interval came from.
+- **Threaded through**: `mu=config.MU` into all four `HoppingAStarPlanner`
+  construction sites — [main.py](main.py),
+  [test/demo_common.py](test/demo_common.py) `make_planner` (which every other demo
+  goes through), [test/benchmark_tall_stairs.py](test/benchmark_tall_stairs.py) and
+  [test/demo_planner_reroute.py](test/demo_planner_reroute.py).
+
+  Separately, every diagnostic that re-scores an edge outside the planner now goes
+  through a new `demo_common.planner_alpha_interval` helper. The cone needs the two
+  surface normals and the heading, none of which are recoverable from `X` and `Z`, so
+  a bare `feasible_alpha_interval(X, Z, V_max, g)` call silently falls back to level
+  ground — meaning every diagnostic on sloped terrain would quietly disagree with the
+  planner it exists to explain. Fixed in `diagnose_edge` and
+  `enumerate_ring_candidates` ([test/demo_common.py](test/demo_common.py)),
+  `enumerate_ring_candidates` ([test/demo_planner_reroute.py](test/demo_planner_reroute.py),
+  its own copy) and `classify` ([test/calibrate_geometry.py](test/calibrate_geometry.py)).
+- **New scenario**: [maps/cross_slope.py](maps/cross_slope.py), a grade-0.9 side-hill —
+  the only map here traversed in enough directions for the cone to decide anything.
+  [test/demo_friction_cone.py](test/demo_friction_cone.py) plots the result: at
+  mid-hillside the longest feasible hop is 1.50 m across the fall line but only 0.55 m
+  along it, and the planned path takes 7 waypoints with the cone against 5 without,
+  with the extra hops landing on the grade — the effect the paper reports in Table I.
+- **Tests**: [test/test_friction_cone.py](test/test_friction_cone.py) implements the
+  validation checklist that `docs/alpha_range_campana.md` Section 6 asks for, and it
+  earned its keep (see errata below). For each of 14 geometries it samples the returned
+  interval, reconstructs the takeoff and landing velocity **vectors** from Eq. 2/4, and
+  confirms each lies inside its contact's cone and under `V_max` — ground truth that
+  reuses none of the interval formulas. A tightness pass checks just outside each
+  endpoint to catch over-conservatism.
+  [test/test_clearance_rejection.py](test/test_clearance_rejection.py) sections (2) and
+  (4) were rewritten for the new physics; case (4) used to assert "downhill widens the
+  interval", which is no longer true, and its old geometry (`X=2.0, Z=-0.5, V_max=4.5`)
+  is now rejected outright because landing would need 5.01 m/s.
+- **Errata found in [docs/alpha_range_campana.md](docs/alpha_range_campana.md)** (noted
+  in a banner at the top of that file, since it was reconstructed from an OCR'd PDF):
+  1. the landing-cone mapping's `2*Z/X_theta` term is **positive**, not negative — the
+     two agree only when `Z = 0`, so a flat-ground test would not have caught it. For
+     `X=1, Z=1, alpha_s=80°` the flown arc lands at −74.76°; the correct sign gives
+     −74.76°, the document's gives −82.57°;
+  2. that file's suspicion about the missing `arctan()` on the velocity bounds was
+     correct — those fractions are `tan(alpha)` values.
+- **Measured on the existing deck** (`mu=None` vs `mu=1.2`, same map and endpoints):
+
+  | scenario | without cone | with cone |
+  |---|---|---|
+  | `stairs_with_curb` | 6 waypoints, α = [45 75 62 61 45]° | 6 waypoints, α = [59 78 74 61 62]° |
+  | `slope_crest` | 5 waypoints, α = [55 55 79 **29**]° | 5 waypoints, α = [68 63 52 61]°, **different waypoints** |
+  | `cross_slope` | 5 waypoints | 7 waypoints, extra hops on the grade |
+
+  `stairs_with_curb` keeps its route and only steepens. `slope_crest` genuinely
+  reroutes, and the reason is visible in the table: its old path contained a 29°
+  takeoff, below the flat-ground cone floor of 39.81°, so that hop is now illegal.
+- **Not yet revisited** (deferred): `test/test_clearance_rejection.py` case (1) and
+  cases (6b)/(6c) still fail on constants left stale by the capsule-radius split. That
+  failure predates this change and was verified unchanged against `HEAD` (same three
+  cases, same `mc` values).
+
+### Changed — split the capsule into three independent radii (CoM, leg, foot)
+
+The collision capsule previously used one shared `ROBOT_RADIUS` for the CoM
+sphere, the leg-cylinder sides, and the foot-tip hemisphere. It now has three
+independent radii, since a 0.2 m-thick leg and foot were unrealistically fat:
+`ROBOT_RADIUS = 0.15` m (CoM sphere, revised down from 0.2), new
+`LEG_CYLINDER_RADIUS = 0.01` m (leg sides), new `FOOT_TIP_RADIUS = 0.02` m
+(foot-tip hemisphere). `MIN_CLEARANCE` is unchanged.
+
+- **Flight** — [hopping_astar_planner.py](hopping_astar_planner.py)
+  `clearance_for_alpha` now selects both the axis distance *and* the radius
+  per terrain sample from three regions instead of one: below the foot uses
+  `FOOT_TIP_RADIUS` (bottom hemisphere, unchanged formula), at-or-above the
+  foot now splits by height into the leg segment (`LEG_CYLINDER_RADIUS`) vs.
+  above the CoM (`ROBOT_RADIUS`) — previously that whole region shared one
+  radius, which would have silently shrunk the CoM sphere to leg-radius
+  during flight for any terrain taller than the current arc height, exactly
+  the case that matters most for obstacle detection. `ArcProfile` and
+  `terrain_profile` carry `com_radius`/`leg_radius`/`foot_radius` instead of
+  one `robot_radius`; the endpoint-transition mask now sizes off
+  `foot_radius`. Monotonicity in `tan(alpha)` still holds except for a
+  sub-centimeter, single-crossing dip where the radius switches from
+  `LEG_CYLINDER_RADIUS` to the larger `FOOT_TIP_RADIUS` — well below
+  `MIN_CLEARANCE`, not worth correcting with exact nearest-point-on-cone
+  geometry.
+- **Stance** — [map2d5.py](map2d5.py) `standable_mask` takes `com_radius` and
+  `leg_radius` separately and combines them as
+  `min(sphere_dist - com_radius, leg_dist - leg_radius) >= clearance` instead
+  of subtracting one shared radius after the min. At `CELL_RESOLUTION = 0.1 m`,
+  `LEG_CYLINDER_RADIUS (0.01 m)` is smaller than a grid cell, so in practice
+  the leg-cylinder-sides check no longer binds before the CoM sphere does —
+  the max standable grade is now governed by the sphere ceiling
+  (`sqrt((LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE))^2 - 1) ≈ 1.25`, not the
+  leg-cylinder formula's ≈1.21), both now far steeper than any map in this
+  repo (steepest ships at 0.35).
+- **Config**: `OBSTACLE_WALL_EXTRA`'s assert is re-derived against
+  `FOOT_TIP_RADIUS` (the bottom-cap/obstacle-height concern) instead of
+  `ROBOT_RADIUS`; new assert that `ROBOT_RADIUS` is the largest of the three
+  radii, since `terrain_profile`'s lateral sampling corridor is sized off the
+  largest one.
+- **Threaded through**: [main.py](main.py), [visualizer.py](visualizer.py)
+  (`draw_arc_side_view` gained keyword-only `leg_radius`/`foot_radius`
+  defaults so its "authoritative" clearance number stays correct without
+  updating every call site), and all `test/demo_*.py` scripts that construct
+  `HoppingAStarPlanner` or call `terrain_profile` directly.
+- **Tests**: [test/test_clearance_rejection.py](test/test_clearance_rejection.py)
+  call signatures updated for the new `standable_mask`/`terrain_profile`
+  params; case (6a)'s stance-ceiling comparison rewritten to reflect the
+  sphere-governs-in-practice finding above. Case (1)'s `PILLAR_H = 0.45`
+  calibration and cases (6b)/(6c) still assume the old, much larger foot-tip
+  radius and have **not** been re-tuned — the suite currently fails on case
+  (1) until those constants are re-derived against the new geometry.
+- **Not yet revisited** (deferred): the numeric constants in
+  `maps/barely_jumpable_wall.py`, `maps/slope_crest.py`, `maps/tall_stairs.py`,
+  `maps/stairs_with_curb.py`, and the demos built around them were calibrated
+  assuming a single 0.2 m radius everywhere; their margins loosen substantially
+  under the new geometry and have not been re-verified.
+
+### Changed — leg safety margin (stance leg-cylinder sides + flight capsule)
+
+The body's collision volume is now the full leg-to-CoM capsule of radius
+`ROBOT_RADIUS`, not just the sphere at the CoM. Stance and flight enforce it
+differently.
+
+- **Stance** — [map2d5.py](map2d5.py) `standable_mask` gains a leg-cylinder-
+  sides channel: the upper `(1 - LEG_CLEARANCE_START_FRAC) = 2/3` of a cylinder
+  of radius `ROBOT_RADIUS` from foot to CoM must clear terrain too. The bottom
+  `LEG_CLEARANCE_START_FRAC = 1/3` is exempt so graded slopes remain standable.
+  Max standable grade tightens from ~0.55 (sphere-only) to
+  `(LEG_LENGTH * frac) / (ROBOT_RADIUS + MIN_CLEARANCE) ≈ 0.38`.
+- **Flight** — [hopping_astar_planner.py](hopping_astar_planner.py)
+  `clearance_for_alpha` models the full capsule (top hemisphere at the CoM +
+  full cylinder + bottom hemisphere at the foot). Terrain directly under the
+  foot must clear the foot tip by `ROBOT_RADIUS + MIN_CLEARANCE = 0.35 m`, not
+  just `MIN_CLEARANCE`. The `terrain_profile` corridor is widened from
+  `[-R, R]` to `[-(R + gate), +(R + gate)]`, and per-sample terrain is stored
+  without max-collapse so the capsule distance can be computed cell-by-cell.
+- **Endpoint-transition mask** — samples where `terrain <= endpoint_max AND
+  foot_h < endpoint_max + R + gate` are masked to `+inf`. This suppresses the
+  rigid-vertical-leg model's spurious "foot skimming endpoint terrain" artifact
+  at near-endpoint samples, without ever masking wall samples (terrain above
+  endpoint height).
+- **Lateral samples**: `ARC_LATERAL_SAMPLES` bumped 3 → 5 so the inter-sample
+  gap stays ≤ 0.175 m under the widened corridor.
+- **Config**: new `LEG_CLEARANCE_START_FRAC = 1.0/3.0` in
+  [config.py](config.py). Threaded through `HoppingAStarPlanner.__init__`.
+- **Scenarios**: [maps/slope_crest.py](maps/slope_crest.py) regraded 0.50 →
+  0.35 to stay under the new 0.38 ceiling. [maps/tall_stairs.py](maps/tall_stairs.py)
+  docstring updated for the widened `R + MIN_CLEARANCE = 0.35 m` un-standable
+  band in front of each riser.
+- **Visualizer**: [visualizer.py](visualizer.py) `draw_arc_side_view` now plots
+  foot-tip trajectory and bottom-cap envelope; new
+  `Visualizer.draw_robot_pose()` overlays top-down body + envelope rings at
+  start/goal, wired up in [main.py](main.py).
+- **Tests**: [test/test_clearance_rejection.py](test/test_clearance_rejection.py)
+  gains case (6) covering capsule-specific stance and flight geometry
+  (grade-0.35 standable / grade-0.50 not, bump-clearing hop accepts,
+  wall-scraping hop rejects). Pillar height in case (1) recalibrated 0.9 → 0.45
+  m to match the new capsule reach.
+
+### Changed — revised robot model (denser map, leg, body radius, hard clearance gate)
+
+The robot is no longer a point mass on a coarse grid. It is a sphere of
+`ROBOT_RADIUS` whose centre — the point the ballistic arc actually tracks — sits
+`LEG_LENGTH` above the contact foot, moving over a grid at twice the previous
+density. Clearance became a hard feasibility gate rather than a cost penalty.
+
+- **Map density doubled**: `CELL_RESOLUTION` 0.2 → 0.1 m (25×25 → 50×50 cells).
+  - [map2d5.py](map2d5.py): new `paint_region()` sets cells by *world-metre*
+    bounds. Both previous idioms were resolution-dependent: raw column slices
+    (`grid[:, 10:13]`) hard-code a cell count, and `world_to_grid(...)` with an
+    inclusive `+1` overshoots by up to one cell. At 0.1 m the former halved the
+    staircases in `tall_stairs`/`stairs_with_curb` and left the map's right half
+    at z=0; the latter shrank every world-painted obstacle by 0.1 m per axis.
+    All seven maps now paint from world bounds and are resolution-invariant.
+- **Jump height is now a stated capability, not a tuned constant**:
+  `MAX_APEX_HEIGHT = 1.2 m` (the CoM rise on a vertical in-place hop) derives
+  `V_MAX = sqrt(2 g h) = 4.852 m/s`. The longest feasible flat hop is
+  `V_MAX^2 / g = 2.40 m`. `test/demo_common.py` no longer overrides `V_MAX`
+  (was 6.0), and `demo_clearance_sweep` / `demo_planner_reroute` no longer
+  hardcode 7.0 — their geometry was rescaled to spans the robot can reach.
+- **`LEG_LENGTH = 0.4 m`**: hop arcs start and end at `terrain_z + LEG_LENGTH`.
+  `Z = z_g - z_s` is unchanged, so `feasible_alpha_interval` is unaffected.
+  This retired two workarounds that only existed because the arc used to start
+  *on* the ground: the endpoint body-guard in `min_clearance`, and
+  `ARC_ENDPOINT_EPSILON`. Both are deleted. Dropping the epsilon also closed a
+  hole where hops shorter than `2 * epsilon` returned `+inf` and were accepted
+  with no clearance check at all.
+- **`ROBOT_RADIUS` 0.1 → 0.2 m, and the body now has lateral extent**: the
+  clearance check samples `ARC_LATERAL_SAMPLES` points across the body's width
+  perpendicular to travel and takes the maximum terrain, so a ridge *beside* the
+  centreline blocks the hop. New `Map2D5.standable_mask()` rejects landing cells
+  where the body could not rest, measuring true 3D distance to the terrain
+  rather than a vertical drop — a flat-underside test would condemn every graded
+  slope. There is a closed-form ceiling on traversable grade:
+  `sqrt((LEG_LENGTH / (ROBOT_RADIUS + MIN_CLEARANCE))^2 - 1)` = 0.553.
+- **Clearance is a hard gate**: `MIN_CLEARANCE = 0.15 m` rejects outright.
+  `CLEARANCE_MARGIN` and `CLEARANCE_WEIGHT` are deleted and the smooth proximity
+  penalty is gone — clearance no longer enters edge cost at all. This makes the
+  `disable_clearance=True` A/B a *feasibility* comparison ("which candidates
+  exist") rather than a cost-shaping one.
+- **Takeoff angle: minimum sufficient effort**. Clearance is monotone
+  nondecreasing in `tan(alpha)` (`dz/d tan a = u(X-u)/X >= 0` at every `u`), so
+  the max-clearance angle is *always* `alpha_max` — which is exactly where
+  `v_s = V_max`, the leg at 100% of its budget. Rather than always flying at the
+  limit, `alpha_for_clearance()` takes the max-margin midpoint when it already
+  clears, gives up only if `alpha_max` cannot, and otherwise bisects for the
+  shallowest angle that does. Typical hops cost one clearance evaluation.
+- **`min_hop_radius` default 0** (was `hop_radius / 2`). `HOP_SCAN_STEP` makes
+  the inward ray-search step an explicit parameter rather than reading
+  `map.resolution`. It is the dominant cost knob — the branching factor is
+  proportional to `1/step` — but coarsening it also quantizes how far a hop can
+  travel, which shows up as lateral doglegs where the straight-ahead ladder cannot
+  reach a wanted x. Shipped at 0.1 m (= `CELL_RESOLUTION`), i.e. the pre-change
+  behaviour, after 0.3 m was found to put a visible 0.30 m y-detour into the
+  `slope_crest` path.
+- **Performance**: a naive implementation of the above measured 13.7 s per
+  `plan()` (vs 284 ms before). Two-phase evaluation now separates the
+  alpha-independent terrain sampling (`terrain_profile`) from the cheap
+  per-angle arc evaluation (`clearance_for_alpha`), backed by a vectorized
+  `Map2D5.sample_bilinear()` and a memoised obstacle-substituted grid. The
+  cached grid lives on `Map2D5`, not the planner, so the six external callers of
+  `min_clearance` get it for free. Deck total: **2.46 s → 24.4 s** for 14 plans
+  (the full demo suite, which runs more than one plan per script, takes ~73 s).
+- **Obstacle maps recalibrated ~3×**. The leg offset lifts the arc 0.4 m, which
+  made every previously-tuned obstacle invisible. Heights re-derived empirically:
+  `tall_narrow_wall` 0.15 → 0.70 m, `barely_jumpable_wall` 0.22 → 1.00 m,
+  `stairs_with_curb` curb rise 0.10 → 0.60 m, `slope_crest` crest-above-shelf
+  0.25 → 0.85 m with the ramp regraded 0.75 → 0.50 to stay under the 0.553
+  standability ceiling. Map docstrings quote the fresh sweeps.
+- **`enumerate_ring_candidates` gained a `stance` gate**, and `n_bad_hops` now
+  counts a hop bad if its landing cell is un-standable. Several demos asserted
+  "the baseline path contains clipping hops"; under the new model the baseline
+  more often fails by *landing where the body cannot rest*, which the old
+  arc-only diagnosis missed entirely.
+- **Demo output moved** from `test/` to `results/after_LS_recs/`, via
+  `demo_common.out_dir()` with a `$PLANNER_OUT_DIR` override (relative paths
+  resolve against the repo root). All ten demos now route through `out_path()`.
+- [test/time_deck.py](test/time_deck.py): new timing harness recording
+  wall-clock, expansions, edge checks, hop count and leg-energy utilisation per
+  scenario. Written against `make_planner`'s default interface so the same file
+  runs against both old and new code; baselines are in
+  `results/before_LS_recs/timings.md`.
+- `test/benchmark_tall_stairs.py`: `N_TRIALS` 30 → 5, since a `tall_stairs` plan
+  is now ~6.5 s (the benchmark itself takes ~40 s).
+
+### Added
+- **Presentation demo suite** — six scenarios covering go-around, hop-over,
+  takeoff readjustment, stair climbing and slope climbing, all sharing one set
+  of physics parameters so a single cost model visibly produces every behaviour.
+  - [test/demo_common.py](test/demo_common.py): shared scaffolding for the
+    `demo_*.py` scripts. `make_planner`, `diagnose_edge` and
+    `enumerate_ring_candidates` were previously copy-pasted byte-identically
+    across five demos; all demos now import them. Also holds the deck-wide
+    constants (`HOP_RADIUS = 1.5`, `V_MAX = 6.0`, `N_ANGLES = 16`), the colour
+    vocabulary, `param_caption()` for stamping physics on every figure, and
+    `draw_topdown_compact()` for multi-panel figures where per-cell elevation
+    text would be illegible.
+  - `enumerate_ring_candidates` now records a `gate` field naming which check
+    rejected each candidate (`bounds` / `obstacle` / `physics` / `clearance`),
+    so a figure can state which gate did the work instead of assuming.
+  - [maps/slope_crest.py](maps/slope_crest.py): the first map with continuously
+    varying elevation rather than constant-z blocks — a 0.75-grade ramp rising
+    to a crest at z=1.05 m, then a summit plateau at z=0.80 m.
+  - [maps/stairs_with_curb.py](maps/stairs_with_curb.py): `tall_stairs` with a
+    raised curb at each tread edge, standing 0.10 m proud of its tread.
+  - [test/calibrate_geometry.py](test/calibrate_geometry.py): sweeps candidate
+    map geometries and reports which produce a genuine clearance-driven
+    accept/reject contrast. Both new maps' constants come from its output.
+  - New demos: [test/demo_slope_crest.py](test/demo_slope_crest.py),
+    [test/demo_stairs_curb.py](test/demo_stairs_curb.py),
+    [test/demo_decision_sweep.py](test/demo_decision_sweep.py) (identical
+    geometry, wall height swept 0.15 → 1.40 m, strategy flips from crossing to
+    detouring between 1.20 m and 1.40 m with no per-panel tuning), and
+    [test/demo_overview.py](test/demo_overview.py) (contact sheet).
+
+### Fixed
+- **Documented that neither rejection gate fires on `tall_stairs`.** Its
+  docstring claimed hops skipping two or more steps are rejected as Campana-
+  infeasible. Enumerating the full-radius ring at all 625 cells gives
+  `accept 6518 · off-map 3482 · physics 0 · clearance 0`: 0.4 m risers sit well
+  inside the leg's budget, and the `min_clearance` body-guard (which discards
+  samples that have not risen `robot_radius` above *both* endpoints) skips
+  nearly every interior sample on a steep ascent, returning `+inf`. The
+  baseline/ballistic path difference there comes from the clearance *penalty*
+  shaping cost, not from any candidate being ruled out.
+  [maps/stairs_with_curb.py](maps/stairs_with_curb.py) exists to give a stair
+  scenario where the clearance gate genuinely rejects hops.
+- `maps/tall_narrow_wall.py` docstring claimed the ballistic planner shifts its
+  takeoff 0.2 m (one grid cell); the demo actually shifts it 0.60 m (three
+  cells), from x=2.10 to x=1.50.
+- `maps/tall_narrow_wall.py` and `maps/barely_jumpable_wall.py` docstrings quoted
+  `HOP_RADIUS = 1.5` / `V_MAX = 6.0` as though from `config.py`, which ships
+  `1.0` / `4.5`. Both now say the values are demo-local.
+- `test/demo_tall_stairs.py` docstring described a 1.8 m top platform and three
+  0.6 m risers; the map has a 1.2 m platform and 0.4 m risers.
+- Removed a dead `_add_wall_markings` stub from
+  [test/demo_barely_jumpable.py](test/demo_barely_jumpable.py) whose body was
+  `pass` and whose markings were already drawn by its caller.
+
+- **Variable-radius neighbor generation** in
+  [hopping_astar_planner.py](hopping_astar_planner.py): replaces the
+  fixed-radius ring sampler with a per-direction ray search.
+  - For each of the `n_angles` directions, the planner scans radii from
+    `hop_radius` down to `min_hop_radius` (default `hop_radius / 2`) in
+    steps of `map.resolution`, adding **every** valid (ballistically
+    feasible, clearance-passing) landing cell it finds.
+  - Generating all valid radii per direction — not just the farthest —
+    allows A* to consider shorter landings in the same direction. A
+    full-radius hop may deposit the robot too close to an obstacle for the
+    next arc to clear it, while a shorter hop along the same ray gives
+    sufficient launch distance.
+  - Two deduplication sets (`attempted`, `in_results`) prevent redundant
+    validation calls and duplicate result entries while allowing different
+    directions to scan past a previously-failed cell to shorter radii.
+  - `min_hop_radius` constructor parameter (default `hop_radius / 2`)
+    prevents degenerate sub-cell hops that would make perimeter-walking
+    artificially cheap relative to direct wall-crossing arcs.
+  - Admissibility of the Euclidean heuristic is preserved: shorter hops
+    only add valid candidates with higher-or-equal g-cost per unit
+    distance, so the heuristic never over-estimates.
+
+- `HoppingAStarPlanner` in [hopping_astar_planner.py](hopping_astar_planner.py):
+  a new A*-based planner tailored for a hopping robot. Instead of stepping to
+  one of 8 adjacent grid cells, the robot hops to points sampled on a circle
+  of radius `hop_radius` around its current position.
+  - Ring-based neighbor generation: `n_angles` evenly spaced directions are
+    sampled on the reachable circle each expansion and snapped to grid cells.
+  - Goal-snap edge: when the goal lies within `hop_radius` of the current
+    cell, an explicit direct-hop-to-goal edge is added so the planner can
+    land exactly on the goal without requiring angular alignment.
+  - Only the landing cell is validated (bounds, non-obstacle, `|Δz| ≤
+    max_jump_height`); the robot flies over intermediate terrain and
+    obstacles.
+  - Cost model unchanged from the original planner: Euclidean xy-distance
+    between takeoff and landing plus an asymmetric elevation penalty
+    (`alpha_uphill` for climbing, `alpha_downhill` for descending).
+  - Heuristic unchanged: Euclidean distance to the goal (still admissible).
+- Hopping-robot parameters in [config.py](config.py):
+  - `HOP_RADIUS = 1.0` — hop distance in meters.
+  - `HOP_N_ANGLES = 16` — number of candidate hop directions per expansion.
+
+### Changed
+- [main.py](main.py) now instantiates `HoppingAStarPlanner` (with
+  `hop_radius` and `n_angles` from config) instead of `AStarPlanner`.
+
+### Retained
+- [astar_planner.py](astar_planner.py) is kept unchanged as a reference
+  implementation for comparison against the hopping variant.
+
+---
+
+## [0.2.0] – 2026-05-28
+
+### Added
+- Initial A* planner implementation ([astar_planner.py](astar_planner.py))
+  with 8-connected grid neighbors, height-aware edge costs, and an
+  admissible Euclidean heuristic.
+- Configuration tuning for cost weights (`ALPHA_UPHILL`, `ALPHA_DOWNHILL`)
+  and the `MAX_JUMP_HEIGHT` hard constraint.
+
+## [0.1.0] – 2026-05-25
+
+### Added
+- Initial project scaffold: 2.5D map representation
+  ([map2d5.py](map2d5.py)), visualizer ([visualizer.py](visualizer.py)),
+  and RRT*-based prototype.
+- Stair-like elevation regions for testing height-aware planning.
+- README with project overview.

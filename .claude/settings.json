@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source .venv/bin/activate)",
+      "Bash(export MPLBACKEND=Agg)",
+      "Bash(python test/test_clearance_rejection.py)",
+      "Bash(python test/test_friction_cone.py)",
+      "Bash(python test/test_hop_energy_chain.py)",
+      "Bash(python test/test_edge_cost_energy.py)",
+      "Bash(.venv/bin/python test/test_clearance_rejection.py)",
+      "Bash(.venv/bin/python test/test_friction_cone.py)",
+      "Bash(.venv/bin/python test/test_hop_energy_chain.py)",
+      "Bash(.venv/bin/python test/test_edge_cost_energy.py)"
+    ]
+  }
+}

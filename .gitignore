@@ -20,3 +20,9 @@ build/
 # IDE
 .vscode/
 .idea/
+
+# Generated demo/test output
+*.png
+
+# Claude Code personal settings (machine-local)
+.claude/settings.local.json
